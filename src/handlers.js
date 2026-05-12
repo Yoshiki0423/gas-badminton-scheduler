@@ -128,6 +128,12 @@ function handleUnfollow(event) {
  */
 var SURVEY_FLEX_MAX_PER_BUBBLE = 3;
 
+/** 質問配信・リマインドで送るスケジュールの対象期間(今日から N 日以内) */
+var SURVEY_SCHEDULE_DAYS = 14;
+
+/** LINE Carousel の最大バブル数(API 仕様上の上限) */
+var SURVEY_FLEX_MAX_BUBBLES = 12;
+
 /**
  * 質問配信 — F-1-3 の本体
  *
@@ -150,10 +156,11 @@ function handleDistributeSurvey() {
   // これにより、今回の配信に対して全員が回答した時点で _checkAllRespondedAndNotify が再び動く。
   PropertiesService.getScriptProperties().deleteProperty('RESULTS_NOTIFIED');
 
-  // (1) スケジュール取得
-  var schedules = getSchedules();
+  // (1) スケジュール取得 → 直近 SURVEY_SCHEDULE_DAYS 日以内に絞り込む
+  var schedules = _filterUpcomingSchedules(getSchedules(), SURVEY_SCHEDULE_DAYS);
+  console.log('[INFO] distributeSurvey: 絞り込み後スケジュール件数=' + schedules.length + ' (直近' + SURVEY_SCHEDULE_DAYS + '日以内)');
   if (schedules.length === 0) {
-    console.log('[INFO] distributeSurvey: schedules シートが空です。配信をスキップします。');
+    console.log('[INFO] distributeSurvey: 直近 ' + SURVEY_SCHEDULE_DAYS + ' 日以内のスケジュールがありません。配信をスキップします。');
     return { sent: 0, skipped: 0 };
   }
 
@@ -205,9 +212,12 @@ function _buildSurveyFlex(schedules) {
     return _buildSurveyBubble(schedules);
   }
 
-  // 3 件超: 3 件ずつ Bubble に分割して Carousel に束ねる
+  // 3 件ずつ Bubble に分割して Carousel に束ねる(LINE 上限の 12 バブルで打ち切り)
   var bubbles = [];
   for (var i = 0; i < schedules.length; i += SURVEY_FLEX_MAX_PER_BUBBLE) {
+    if (bubbles.length >= SURVEY_FLEX_MAX_BUBBLES) {
+      break;
+    }
     var chunk = schedules.slice(i, Math.min(i + SURVEY_FLEX_MAX_PER_BUBBLE, schedules.length));
     bubbles.push(_buildSurveyBubble(chunk));
   }
@@ -422,9 +432,9 @@ function handleVote(event) {
  * @returns {{sent: number, skipped: number, unresponded: number}}
  */
 function handleSendReminders() {
-  var schedules = getSchedules();
+  var schedules = _filterUpcomingSchedules(getSchedules(), SURVEY_SCHEDULE_DAYS);
   if (schedules.length === 0) {
-    console.log('[INFO] sendReminders: schedules シートが空です。リマインドをスキップします。');
+    console.log('[INFO] sendReminders: 直近 ' + SURVEY_SCHEDULE_DAYS + ' 日以内のスケジュールがありません。リマインドをスキップします。');
     return { sent: 0, skipped: 0, unresponded: 0 };
   }
 
@@ -669,6 +679,28 @@ function _formatDateTimeLabel(schedule) {
   var d = date.getDate();
   var w = weekdays[date.getDay()];
   return m + '/' + d + '(' + w + ') ' + schedule.startTime + '〜' + schedule.endTime;
+}
+
+/**
+ * スケジュール配列を今日から N 日以内のものだけに絞り込む(内部用)
+ *
+ * schedule.date は 'YYYY-MM-DD' 形式なので文字列比較でそのまま大小比較できる。
+ * 今日の日付は Asia/Tokyo で取得する。
+ *
+ * @param {Array<Object>} schedules - getSchedules() が返す配列
+ * @param {number} days - 今日から何日先まで含めるか(例: 14 なら今日〜14日後)
+ * @returns {Array<Object>}
+ * @private
+ */
+function _filterUpcomingSchedules(schedules, days) {
+  var todayStr = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM-dd');
+  var limitDate = new Date(todayStr + 'T00:00:00+09:00');
+  limitDate.setDate(limitDate.getDate() + days);
+  var limitStr = Utilities.formatDate(limitDate, 'Asia/Tokyo', 'yyyy-MM-dd');
+
+  return schedules.filter(function (s) {
+    return s.date >= todayStr && s.date <= limitStr;
+  });
 }
 
 /**

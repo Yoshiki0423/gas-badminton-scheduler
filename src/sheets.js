@@ -398,15 +398,25 @@ function addSchedule(scheduleData) {
     throw new Error('addSchedule: date / startTime / endTime / facilityName は必須です');
   }
 
-  var scheduleId = _generateScheduleId();
   var nowIso = _toIsoTokyo(new Date());
   var note = scheduleData.note || '';
-
   var sheet = getSchedulesSheet();
-  var newRow = sheet.getLastRow() + 1;
 
-  // 1 行分を一括書き込み(setValues は getRange の往復が 1 回で済むため高速)
-  var rowValues = [[
+  // 同じ date + facilityName の行があれば上書き(upsert)、なければ追加
+  var existingRow = _findScheduleRow(sheet, scheduleData.date, scheduleData.facilityName);
+  if (existingRow > 0) {
+    sheet.getRange(existingRow, SCOL_START_TIME).setValue(scheduleData.startTime);
+    sheet.getRange(existingRow, SCOL_END_TIME).setValue(scheduleData.endTime);
+    sheet.getRange(existingRow, SCOL_NOTE).setValue(note);
+    sheet.getRange(existingRow, SCOL_LAST_UPDATED).setValue(nowIso);
+    SpreadsheetApp.flush();
+    var existingId = String(sheet.getRange(existingRow, SCOL_SCHEDULE_ID).getValue());
+    return { scheduleId: existingId, row: existingRow };
+  }
+
+  var scheduleId = _generateScheduleId();
+  var newRow = sheet.getLastRow() + 1;
+  sheet.getRange(newRow, 1, 1, SCHEDULES_HEADER.length).setValues([[
     scheduleId,
     scheduleData.date,
     scheduleData.startTime,
@@ -414,8 +424,7 @@ function addSchedule(scheduleData) {
     scheduleData.facilityName,
     note,
     nowIso
-  ]];
-  sheet.getRange(newRow, 1, 1, SCHEDULES_HEADER.length).setValues(rowValues);
+  ]]);
   SpreadsheetApp.flush();
 
   return { scheduleId: scheduleId, row: newRow };
@@ -507,6 +516,82 @@ function getActiveMembers() {
         lastUpdatedAt: row[COL_LAST_UPDATED_AT - 1]
       };
     });
+}
+
+/**
+ * date + facilityName が一致する既存スケジュール行を探す(内部用)
+ *
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet
+ * @param {string} date - "YYYY-MM-DD" 形式
+ * @param {string} facilityName - 体育館名
+ * @returns {number} 1-based の行番号。見つからなければ -1。
+ * @private
+ */
+function _findScheduleRow(sheet, date, facilityName) {
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return -1;
+
+  var numRows = lastRow - 1;
+  var dates      = sheet.getRange(2, SCOL_DATE,          numRows, 1).getValues();
+  var facilities = sheet.getRange(2, SCOL_FACILITY_NAME, numRows, 1).getValues();
+
+  for (var i = 0; i < numRows; i++) {
+    if (String(dates[i][0]) === date && String(facilities[i][0]) === facilityName) {
+      return i + 2;
+    }
+  }
+  return -1;
+}
+
+/**
+ * schedules シートの重複行を除去して整理する(1 回だけ手動実行する初期化関数)
+ *
+ * 同じ date + facilityName の組み合わせが複数行ある場合、最後に追加された行だけを残す。
+ * 残したデータは日付昇順・体育館名順に並び替えて書き直す。
+ *
+ * GAS エディタから手動で 1 回だけ実行してください。
+ *
+ * @returns {void}
+ */
+function cleanupSchedulesDuplicates() {
+  var sheet = getSchedulesSheet();
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) {
+    console.log('[INFO] cleanupSchedulesDuplicates: データがありません。スキップします。');
+    return;
+  }
+
+  var values = sheet.getRange(2, 1, lastRow - 1, SCHEDULES_HEADER.length).getValues();
+
+  // 後ろから走査して「最後に追加された行」を優先して残す
+  var seen = {};
+  var unique = [];
+  for (var i = values.length - 1; i >= 0; i--) {
+    var date         = String(values[i][SCOL_DATE          - 1]);
+    var facilityName = String(values[i][SCOL_FACILITY_NAME - 1]);
+    var key = date + '|' + facilityName;
+    if (date && !seen[key]) {
+      seen[key] = true;
+      unique.push(values[i]);
+    }
+  }
+
+  // 日付昇順・体育館名昇順でソート
+  unique.sort(function (a, b) {
+    var dateA = String(a[SCOL_DATE - 1]);
+    var dateB = String(b[SCOL_DATE - 1]);
+    if (dateA !== dateB) return dateA < dateB ? -1 : 1;
+    return String(a[SCOL_FACILITY_NAME - 1]) < String(b[SCOL_FACILITY_NAME - 1]) ? -1 : 1;
+  });
+
+  // 既存データ行をクリアして書き直す
+  sheet.getRange(2, 1, lastRow - 1, SCHEDULES_HEADER.length).clearContent();
+  if (unique.length > 0) {
+    sheet.getRange(2, 1, unique.length, SCHEDULES_HEADER.length).setValues(unique);
+  }
+  SpreadsheetApp.flush();
+
+  console.log('[INFO] cleanupSchedulesDuplicates: ' + values.length + '行 → ' + unique.length + '行に整理しました。');
 }
 
 /**
