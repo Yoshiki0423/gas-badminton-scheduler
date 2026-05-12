@@ -1,0 +1,41 @@
+# .claspignore — clasp push で GAS にアップロードしないファイル一覧
+# (構文は .gitignore と同じ・1 行 1 パターン)
+#
+# このファイルは「ローカル専用ファイル」を GAS に送らないために重要です。
+# 特に「必要情報.txt」のような認証情報や、package.json のような Node.js 用
+# 設定は GAS に置く意味がないので除外します。
+
+# === Node.js / npm 関連 ===
+node_modules/**
+package.json
+package-lock.json
+yarn.lock
+
+# === ドキュメント類(全 .md ファイル) ===
+**/*.md
+
+# === Git 関連 ===
+.git/**
+.gitignore
+
+# === 環境変数・認証情報(漏洩したら致命的) ===
+.env
+.env.*
+必要情報.txt
+
+# === ローカル開発支援ファイル ===
+**/*.bak
+.vscode/**
+.idea/**
+
+# === OS 固有ファイル ===
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# === QR コード・画像等のローカル資料 ===
+QRコード/**
+
+# === clasp 自身の設定(自動的に除外されるが念のため) ===
+.clasp.json
+.claspignore

@@ -1,0 +1,29 @@
+{
+  "name": "gas-badminton-scheduler",
+  "version": "0.0.1",
+  "description": "新潟市の市民体育館の個人開放(バドミントン)について、LINE 上で日程調整を全自動化する Bot。GAS + clasp + LINE Messaging API で構築。",
+  "private": true,
+  "scripts": {
+    "push": "clasp push",
+    "pull": "clasp pull",
+    "open": "clasp open",
+    "logs": "clasp logs",
+    "status": "clasp status"
+  },
+  "devDependencies": {
+    "@google/clasp": "^2.4.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "gas",
+    "google-apps-script",
+    "line-bot",
+    "messaging-api",
+    "scheduler",
+    "badminton"
+  ],
+  "author": "Yoshiki",
+  "license": "UNLICENSED"
+}
