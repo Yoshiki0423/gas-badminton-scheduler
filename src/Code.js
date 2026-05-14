@@ -389,13 +389,13 @@ function _handleLiffApi(e, action) {
     }
 
     if (action === 'getSchedules') {
-      var data = handleLiffGetData(identity.userId);
-      return _jsonResponse({ ok: true, data: data });
+      var scheduleData = handleLiffGetData(identity.userId);
+      return _jsonResponse({ ok: true, data: scheduleData });
     }
 
     if (action === 'getAllResponses') {
-      var data = handleLiffGetAllResponses();
-      return _jsonResponse({ ok: true, data: data });
+      var allResponseData = handleLiffGetAllResponses();
+      return _jsonResponse({ ok: true, data: allResponseData });
     }
 
     if (action === 'submit') {
