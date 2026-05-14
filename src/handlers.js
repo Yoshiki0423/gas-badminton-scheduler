@@ -516,29 +516,36 @@ function handleAggregateAndNotify() {
     return { viable: 0, sent: 0, skipped: 0 };
   }
 
-  // (date, slotStart) ごとに can の票数を集計
+  // (date, slotStart) ごとに can / undecided の票数を集計(△も参加候補として含める)
   var responses = getAllSlotResponses();
-  var voteCounts = {};  // key: 'YYYY-MM-DD|HH:mm'
+  var canCounts = {};       // key: 'YYYY-MM-DD|HH:mm' → can 票数
+  var undecidedCounts = {}; // key: 'YYYY-MM-DD|HH:mm' → undecided 票数
 
   for (var i = 0; i < responses.length; i++) {
     var r = responses[i];
+    var key = r.date + '|' + r.slotStart;
     if (r.answer === 'can') {
-      var key = r.date + '|' + r.slotStart;
-      voteCounts[key] = (voteCounts[key] || 0) + 1;
+      canCounts[key] = (canCounts[key] || 0) + 1;
+    } else if (r.answer === 'undecided') {
+      undecidedCounts[key] = (undecidedCounts[key] || 0) + 1;
     }
   }
 
-  // MIN_ATTENDEES 人以上集まるスロットを抽出
+  // ○＋△の合計が MIN_ATTENDEES 人以上のスロットを抽出
   var viableSlots = [];
-  var slotKeys = Object.keys(voteCounts);
-  for (var k = 0; k < slotKeys.length; k++) {
-    if (voteCounts[slotKeys[k]] >= MIN_ATTENDEES) {
-      viableSlots.push(slotKeys[k]);
+  var keySet = {};
+  var allKeys = Object.keys(canCounts).concat(Object.keys(undecidedCounts));
+  for (var ki = 0; ki < allKeys.length; ki++) { keySet[allKeys[ki]] = true; }
+  var allSlotKeys = Object.keys(keySet);
+  for (var k = 0; k < allSlotKeys.length; k++) {
+    var total = (canCounts[allSlotKeys[k]] || 0) + (undecidedCounts[allSlotKeys[k]] || 0);
+    if (total >= MIN_ATTENDEES) {
+      viableSlots.push(allSlotKeys[k]);
     }
   }
   viableSlots.sort();  // 日付・時刻順でソート
 
-  var message = _buildSlotResultMessage(viableSlots, voteCounts);
+  var message = _buildSlotResultMessage(viableSlots, canCounts, undecidedCounts);
 
   var sent = 0;
   var skipped = 0;
@@ -605,12 +612,13 @@ function _checkAllRespondedAndNotify() {
 /**
  * スロット単位の結果通知メッセージを組み立てる(内部用・F-4 対応)
  *
- * @param {Array<string>} viableSlots - 成立スロットのキー配列 ('YYYY-MM-DD|HH:mm')
- * @param {Object} voteCounts - スロットキー → can 票数 のマップ
+ * @param {Array<string>} viableSlots    - 成立スロットのキー配列 ('YYYY-MM-DD|HH:mm')
+ * @param {Object}        canCounts      - スロットキー → can 票数 のマップ
+ * @param {Object}        undecidedCounts - スロットキー → undecided 票数 のマップ
  * @returns {string}
  * @private
  */
-function _buildSlotResultMessage(viableSlots, voteCounts) {
+function _buildSlotResultMessage(viableSlots, canCounts, undecidedCounts) {
   var lines = ['【日程調整 結果】'];
   var SLOT_ENDS = {
     '09:00': '11:00', '11:00': '13:00', '13:00': '15:00',
@@ -632,7 +640,9 @@ function _buildSlotResultMessage(viableSlots, voteCounts) {
       var date = parts[0];
       var slotStart = parts[1];
       var slotEnd = SLOT_ENDS[slotStart] || '?';
-      var count = voteCounts[viableSlots[i]] || 0;
+      var canCount = canCounts[viableSlots[i]] || 0;
+      var undecidedCount = undecidedCounts[viableSlots[i]] || 0;
+      var total = canCount + undecidedCount;
 
       var weekdays = ['日', '月', '火', '水', '木', '金', '土'];
       var d = new Date(date + 'T00:00:00+09:00');
@@ -640,7 +650,10 @@ function _buildSlotResultMessage(viableSlots, voteCounts) {
       var day = d.getDate();
       var w = weekdays[d.getDay()];
 
-      lines.push('・' + m + '/' + day + '(' + w + ') ' + slotStart + '〜' + slotEnd + ' (' + count + '人)');
+      var countStr = total + '人: ○' + canCount;
+      if (undecidedCount > 0) { countStr += ' △' + undecidedCount; }
+
+      lines.push('・' + m + '/' + day + '(' + w + ') ' + slotStart + '〜' + slotEnd + ' (' + countStr + ')');
     }
 
     lines.push('');
@@ -770,6 +783,105 @@ function _maskUserId(userId) {
     return '(short)';
   }
   return userId.substring(0, 6) + '...' + userId.substring(userId.length - 4);
+}
+
+// ─────────────────────────────────────────────
+// 管理者テキストコマンド
+// ─────────────────────────────────────────────
+
+/**
+ * LINE テキストメッセージを管理者コマンドとして処理する
+ *
+ * ADMIN_USER_ID と一致する送信者のみコマンドを受け付ける。
+ * 対応コマンド: /配信 /リマインド /状況 /集計 /ヘルプ
+ *
+ * @param {Object} event - LINE message イベント
+ */
+function handleTextMessage(event) {
+  var userId = event.source && event.source.userId;
+  var replyToken = event.replyToken;
+  var text = event.message && event.message.text;
+  if (!userId || !text || !replyToken) return;
+
+  var adminUserId = getProperty('ADMIN_USER_ID');
+  if (!adminUserId || userId !== adminUserId) return;
+
+  var cmd = text.trim();
+
+  try {
+    if (cmd === '/配信') {
+      var distResult = handleDistributeSurvey();
+      replyText(replyToken, 'アンケートを配信しました ✅\n送信: ' + distResult.sent + '人');
+
+    } else if (cmd === '/リマインド') {
+      var remResult = handleSendReminders();
+      replyText(replyToken, 'リマインドを送信しました ✅\n対象: ' + remResult.unresponded + '人 / 送信: ' + remResult.sent + '人');
+
+    } else if (cmd === '/状況') {
+      replyText(replyToken, _buildStatusMessage());
+
+    } else if (cmd === '/集計') {
+      PropertiesService.getScriptProperties().deleteProperty('RESULTS_NOTIFIED');
+      var aggResult = handleAggregateAndNotify();
+      replyText(replyToken, '集計・通知を実行しました ✅\n成立スロット: ' + aggResult.viable + '件 / 送信: ' + aggResult.sent + '人');
+
+    } else if (cmd === '/ヘルプ') {
+      replyText(replyToken,
+        '【管理者コマンド一覧】\n' +
+        '/配信 — アンケートを全員に送る\n' +
+        '/リマインド — 未回答の人にリマインド\n' +
+        '/状況 — 回答状況を確認\n' +
+        '/集計 — 集計して全員に結果通知\n' +
+        '/ヘルプ — このヘルプを表示'
+      );
+    }
+  } catch (err) {
+    logError(err, { phase: 'handleTextMessage', cmd: cmd });
+    try {
+      replyText(replyToken, '❌ エラーが発生しました: ' + err.message);
+    } catch (_) {}
+  }
+}
+
+/**
+ * 回答状況メッセージを組み立てる(内部用)
+ * @returns {string}
+ * @private
+ */
+function _buildStatusMessage() {
+  var members = getActiveMembers();
+  if (members.length === 0) {
+    return '【回答状況】\nメンバーが登録されていません。';
+  }
+
+  var respondedIds = getRespondedUserIds();
+  var respondedSet = {};
+  for (var i = 0; i < respondedIds.length; i++) {
+    respondedSet[respondedIds[i]] = true;
+  }
+
+  var responded = [];
+  var notResponded = [];
+  for (var j = 0; j < members.length; j++) {
+    var m = members[j];
+    if (respondedSet[m.userId]) {
+      responded.push(m.displayName);
+    } else {
+      notResponded.push(m.displayName);
+    }
+  }
+
+  var lines = [
+    '【回答状況】',
+    '',
+    '✅ 回答済み (' + responded.length + '人)'
+  ];
+  if (responded.length > 0) lines.push(responded.join('、'));
+  lines.push('');
+  lines.push('⏳ 未回答 (' + notResponded.length + '人)');
+  if (notResponded.length > 0) lines.push(notResponded.join('、'));
+
+  return lines.join('\n');
 }
 
 // ─────────────────────────────────────────────

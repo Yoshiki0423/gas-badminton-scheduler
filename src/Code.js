@@ -356,6 +356,9 @@ function _routeEvent(event) {
       case 'postback':
         handleVote(event);
         break;
+      case 'message':
+        handleTextMessage(event);
+        break;
       default:
         console.log('[INFO] Unhandled event type: ' + event.type);
         break;
