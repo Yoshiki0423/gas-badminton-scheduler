@@ -18,6 +18,18 @@
  *   ── メンバーシート追加(F-1-3 / D-008) ──
  *   - getActiveMembers()   : status が "active" のメンバーだけをオブジェクト配列で返す
  *
+ *   ── responses シート(F-1-4 / F-3 / F-4) ──
+ *   【F-4 新API】
+ *   - upsertSlotResponse(userId, date, slotStart, answer)  : 1スロット分を upsert(ロック付き)
+ *   - clearSlotResponsesByUserId(userId)                   : ユーザーの全スロット回答を一括削除
+ *   - getAllSlotResponses()                                 : 全レコードを返す(集計用)
+ *   - getSlotResponsesByUserId(userId)                     : ユーザーの回答を { 'YYYY-MM-DD|HH:mm': 'can'|'undecided' } 形式で返す
+ *   - resetResponsesSheet()                                : シートをリセットして新ヘッダーを設定
+ *   【後方互換(F-1-4 / F-3 用・内部からは呼ばれなくなる)】
+ *   - upsertResponse(userId, scheduleId, canAttend) : 回答を登録(あれば上書き・なければ追加)
+ *   - getResponsesByUserId(userId)                  : 指定ユーザーの全回答を返す(LIFF 前回答復元用)
+ *   - clearResponsesByUserId(userId)                : 指定ユーザーの全回答行を削除(LIFF 一括送信用)
+ *
  * メンバーシート構造(D-007 で確定):
  *   A: userId       (LINE ユーザー ID・主キー・テキスト書式)
  *   B: displayName  (LINE 表示名)
@@ -33,6 +45,15 @@
  *   E: facilityName (体育館名)
  *   F: note         (備考・任意)
  *   G: lastUpdatedAt(最終更新日時 ISO 8601 + Asia/Tokyo)
+ *
+ * responses シート構造(F-4 で変更):
+ *   A: responseId   (主キー・"RES_" + タイムスタンプ + ランダム4桁 形式)
+ *   B: userId       (LINE ユーザー ID)
+ *   C: date         (回答対象日・"YYYY-MM-DD" 文字列)
+ *   D: slotStart    (スロット開始時刻・"HH:mm" 文字列)
+ *   E: answer       ("can"=行ける / "undecided"=未定・行けない場合は行なし)
+ *   F: createdAt    (初回回答日時 ISO 8601 + Asia/Tokyo)
+ *   G: updatedAt    (最終更新日時 ISO 8601 + Asia/Tokyo)
  *
  * 命名規則(D-011):
  *   - シート名は全小文字 + ハイフン区切り or 単一単語(`members`, `schedules` 等)
@@ -613,7 +634,7 @@ function _generateScheduleId() {
 }
 
 // ─────────────────────────────────────────────
-// responses シート 定数・関数(F-1-4 回答収集)
+// responses シート 定数(F-4 で変更)
 // ─────────────────────────────────────────────
 
 /**
@@ -624,15 +645,42 @@ function _generateScheduleId() {
 var RESPONSES_SHEET_NAME = 'responses';
 
 /**
- * responses シートのヘッダー行(D-011 命名規則:lowerCamelCase)
+ * F-4 新 responses シートのヘッダー行
  *
- * 列構造(F-1-4 / D-011):
- *   A: responseId    — 主キー(RES_yyyyMMddHHmmss_XXXX 形式)
- *   B: userId        — LINE ユーザー ID
- *   C: scheduleId    — 回答対象スケジュールの ID
- *   D: canAttend     — 参加可否(ボタンタップ = 参加できる = true)
- *   E: respondedAt   — 初回回答日時(ISO 8601 + Asia/Tokyo)
- *   F: lastUpdatedAt — 最終更新日時(ISO 8601 + Asia/Tokyo)
+ * F-4 でデータモデルを変更:
+ *   A: responseId  — 主キー(RES_yyyyMMddHHmmss_XXXX 形式)
+ *   B: userId      — LINE ユーザー ID
+ *   C: date        — 回答対象日(YYYY-MM-DD)
+ *   D: slotStart   — スロット開始時刻(HH:mm)
+ *   E: answer      — "can"(行ける) / "undecided"(未定)・行けない場合は行なし
+ *   F: createdAt   — 初回回答日時(ISO 8601 + Asia/Tokyo)
+ *   G: updatedAt   — 最終更新日時(ISO 8601 + Asia/Tokyo)
+ */
+var SLOT_RESPONSES_HEADER = [
+  'responseId',  // A
+  'userId',      // B
+  'date',        // C
+  'slotStart',   // D
+  'answer',      // E
+  'createdAt',   // F
+  'updatedAt'    // G
+];
+
+/** F-4 responses シート列インデックス(1-based・getRange 用) */
+var SRCOL_RESPONSE_ID = 1;
+var SRCOL_USER_ID     = 2;
+var SRCOL_DATE        = 3;
+var SRCOL_SLOT_START  = 4;
+var SRCOL_ANSWER      = 5;
+var SRCOL_CREATED_AT  = 6;
+var SRCOL_UPDATED_AT  = 7;
+
+/**
+ * 後方互換用の旧 responses シートヘッダー(F-1-4 / F-3 の旧関数が使う)
+ *
+ * @deprecated F-4 以降は SLOT_RESPONSES_HEADER を使う。
+ *   旧関数(upsertResponse / clearResponsesByUserId / getResponsesByUserId)は
+ *   後方互換のために残しているが、内部からは呼ばれなくなる。
  */
 var RESPONSES_HEADER = [
   'responseId',
@@ -643,7 +691,7 @@ var RESPONSES_HEADER = [
   'lastUpdatedAt'
 ];
 
-/** responses シート列インデックス(1-based・getRange 用) */
+/** 後方互換用の旧 responses シート列インデックス */
 var RCOL_RESPONSE_ID  = 1;
 var RCOL_USER_ID      = 2;
 var RCOL_SCHEDULE_ID  = 3;
@@ -651,11 +699,15 @@ var RCOL_CAN_ATTEND   = 4;
 var RCOL_RESPONDED_AT = 5;
 var RCOL_LAST_UPDATED = 6;
 
+// ─────────────────────────────────────────────
+// F-4 responses シート 関数(新API)
+// ─────────────────────────────────────────────
+
 /**
- * responses シートを取得し、初回起動時はヘッダー行を自動生成する
+ * F-4 responses シートを取得し、存在しない場合はヘッダー付きで作成する
  *
- * getMembersSheet / getSchedulesSheet と同じパターン。
- * シートが存在しない場合は自動作成するため、管理者が手動でシートを作る必要はない。
+ * F-4 の新ヘッダー(SLOT_RESPONSES_HEADER)を使う。
+ * resetResponsesSheet() を実行した後は必ず新ヘッダーになっている前提。
  *
  * @returns {GoogleAppsScript.Spreadsheet.Sheet}
  * @throws {Error} スプレッドシート ID 未設定 or シートが開けない場合
@@ -676,58 +728,291 @@ function getResponsesSheet() {
   var sheet = ss.getSheetByName(RESPONSES_SHEET_NAME);
   if (!sheet) {
     sheet = ss.insertSheet(RESPONSES_SHEET_NAME);
-    _initializeResponsesSheet(sheet);
+    _initializeSlotResponsesSheet(sheet);
   } else if (sheet.getLastRow() === 0) {
-    _initializeResponsesSheet(sheet);
+    _initializeSlotResponsesSheet(sheet);
   }
 
   return sheet;
 }
 
 /**
- * responses シートの初期化(ヘッダー + 列フォーマット)
- *
- * userId / scheduleId 列はテキスト書式に固定し、数値変換を防ぐ。
+ * F-4 responses シートの初期化(ヘッダー + 列フォーマット)
  *
  * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet
  * @private
  */
-function _initializeResponsesSheet(sheet) {
-  sheet.getRange(1, 1, 1, RESPONSES_HEADER.length).setValues([RESPONSES_HEADER]);
-  sheet.getRange(1, 1, 1, RESPONSES_HEADER.length).setFontWeight('bold');
+function _initializeSlotResponsesSheet(sheet) {
+  sheet.getRange(1, 1, 1, SLOT_RESPONSES_HEADER.length).setValues([SLOT_RESPONSES_HEADER]);
+  sheet.getRange(1, 1, 1, SLOT_RESPONSES_HEADER.length).setFontWeight('bold');
   sheet.setFrozenRows(1);
 
-  sheet.getRange(1, RCOL_USER_ID,     sheet.getMaxRows(), 1).setNumberFormat('@');
-  sheet.getRange(1, RCOL_SCHEDULE_ID, sheet.getMaxRows(), 1).setNumberFormat('@');
+  // userId / date / slotStart 列はテキスト書式に固定(数値・日付変換防止)
+  sheet.getRange(1, SRCOL_USER_ID,    sheet.getMaxRows(), 1).setNumberFormat('@');
+  sheet.getRange(1, SRCOL_DATE,       sheet.getMaxRows(), 1).setNumberFormat('@');
+  sheet.getRange(1, SRCOL_SLOT_START, sheet.getMaxRows(), 1).setNumberFormat('@');
 
-  sheet.setColumnWidth(RCOL_RESPONSE_ID,  200);
-  sheet.setColumnWidth(RCOL_USER_ID,      280);
-  sheet.setColumnWidth(RCOL_SCHEDULE_ID,  200);
-  sheet.setColumnWidth(RCOL_CAN_ATTEND,    80);
-  sheet.setColumnWidth(RCOL_RESPONDED_AT, 200);
-  sheet.setColumnWidth(RCOL_LAST_UPDATED, 200);
+  sheet.setColumnWidth(SRCOL_RESPONSE_ID, 200);
+  sheet.setColumnWidth(SRCOL_USER_ID,     280);
+  sheet.setColumnWidth(SRCOL_DATE,        120);
+  sheet.setColumnWidth(SRCOL_SLOT_START,   80);
+  sheet.setColumnWidth(SRCOL_ANSWER,       80);
+  sheet.setColumnWidth(SRCOL_CREATED_AT,  200);
+  sheet.setColumnWidth(SRCOL_UPDATED_AT,  200);
 }
+
+/**
+ * responses シートをリセットし、F-4 新ヘッダーで再初期化する
+ *
+ * 既存データ(旧形式・テスト用)はすべて削除する。
+ * GAS エディタから resetResponsesSheetForF4() 経由で手動実行してください。
+ *
+ * @returns {void}
+ */
+function resetResponsesSheet() {
+  var spreadsheetId = getProperty('MEMBERS_SPREADSHEET_ID');
+  if (!spreadsheetId) {
+    throw new Error('MEMBERS_SPREADSHEET_ID is not set in Script Properties');
+  }
+
+  var ss = SpreadsheetApp.openById(spreadsheetId);
+  var sheet = ss.getSheetByName(RESPONSES_SHEET_NAME);
+
+  if (sheet) {
+    // 既存シートを完全削除してから再作成(ヘッダー・書式含めてリセット)
+    ss.deleteSheet(sheet);
+  }
+
+  var newSheet = ss.insertSheet(RESPONSES_SHEET_NAME);
+  _initializeSlotResponsesSheet(newSheet);
+  SpreadsheetApp.flush();
+
+  console.log('[INFO] resetResponsesSheet: responses シートを F-4 新ヘッダーでリセットしました。');
+}
+
+/**
+ * 1スロット分の回答を upsert する(F-4 新API)
+ *
+ * 同一 (userId, date, slotStart) の組み合わせがあれば answer を上書きし、
+ * なければ新規行を末尾に追加します。
+ *
+ * スロット固定値(F-4-5 不変制約):
+ *   '09:00' / '11:00' / '13:00' / '15:00' / '17:00' / '19:00' の6種のみ
+ *
+ * @param {string} userId    - LINE ユーザー ID
+ * @param {string} date      - "YYYY-MM-DD" 形式
+ * @param {string} slotStart - "HH:mm" 形式(上記6種のいずれか)
+ * @param {string} answer    - "can"(行ける) / "undecided"(未定)
+ * @returns {{action: 'inserted' | 'updated', row: number, responseId: string}}
+ */
+function upsertSlotResponse(userId, date, slotStart, answer) {
+  if (!userId) throw new Error('upsertSlotResponse: userId is required');
+  if (!date)   throw new Error('upsertSlotResponse: date is required');
+  if (!slotStart) throw new Error('upsertSlotResponse: slotStart is required');
+  if (answer !== 'can' && answer !== 'undecided') {
+    throw new Error('upsertSlotResponse: answer must be "can" or "undecided", got: ' + answer);
+  }
+
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(10 * 1000)) {
+    throw new Error('upsertSlotResponse: could not acquire lock');
+  }
+
+  try {
+    return withRetry(function () {
+      var sheet = getResponsesSheet();
+      var nowIso = _toIsoTokyo(new Date());
+      var foundRow = _findSlotResponseRow(sheet, userId, date, slotStart);
+
+      if (foundRow > 0) {
+        sheet.getRange(foundRow, SRCOL_ANSWER).setValue(answer);
+        sheet.getRange(foundRow, SRCOL_UPDATED_AT).setValue(nowIso);
+        SpreadsheetApp.flush();
+        var existingId = String(sheet.getRange(foundRow, SRCOL_RESPONSE_ID).getValue());
+        return { action: 'updated', row: foundRow, responseId: existingId };
+      }
+
+      var responseId = _generateResponseId();
+      var newRow = sheet.getLastRow() + 1;
+      sheet.getRange(newRow, 1, 1, SLOT_RESPONSES_HEADER.length).setValues([[
+        responseId, userId, date, slotStart, answer, nowIso, nowIso
+      ]]);
+      SpreadsheetApp.flush();
+      return { action: 'inserted', row: newRow, responseId: responseId };
+    }, { maxAttempts: DEFAULT_MAX_ATTEMPTS, baseDelayMs: 1000, label: 'upsertSlotResponse' });
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * (userId, date, slotStart) の組み合わせで既存行を探す(内部用)
+ *
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet
+ * @param {string} userId
+ * @param {string} date
+ * @param {string} slotStart
+ * @returns {number} 1-based の行番号。見つからなければ -1。
+ * @private
+ */
+function _findSlotResponseRow(sheet, userId, date, slotStart) {
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return -1;
+
+  // B(userId)〜D(slotStart) 列を一括取得して比較
+  var values = sheet.getRange(2, SRCOL_USER_ID, lastRow - 1, 3).getValues();
+  for (var i = 0; i < values.length; i++) {
+    if (String(values[i][0]) === userId &&
+        String(values[i][1]) === date &&
+        String(values[i][2]) === slotStart) {
+      return i + 2;
+    }
+  }
+  return -1;
+}
+
+/**
+ * 指定ユーザーの全スロット回答行を削除する(F-4 新API)
+ *
+ * LIFF 送信時の「全削除→再挿入」パターン用。
+ * Lock 付きで後ろから削除して行番号のズレを防ぐ。
+ *
+ * @param {string} userId - LINE ユーザー ID
+ * @returns {number} 削除した行数
+ */
+function clearSlotResponsesByUserId(userId) {
+  if (!userId) return 0;
+
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(10 * 1000)) {
+    throw new Error('clearSlotResponsesByUserId: could not acquire lock');
+  }
+
+  try {
+    var sheet = getResponsesSheet();
+    var lastRow = sheet.getLastRow();
+
+    if (lastRow < 2) return 0;
+
+    // B 列(userId)を一括取得して対象行番号を収集
+    var userIdValues = sheet.getRange(2, SRCOL_USER_ID, lastRow - 1, 1).getValues();
+    var rowsToDelete = [];
+
+    for (var i = 0; i < userIdValues.length; i++) {
+      if (String(userIdValues[i][0]) === userId) {
+        rowsToDelete.push(i + 2);
+      }
+    }
+
+    if (rowsToDelete.length === 0) return 0;
+
+    // 後ろから削除(行番号のズレ防止)
+    rowsToDelete.sort(function (a, b) { return b - a; });
+    for (var j = 0; j < rowsToDelete.length; j++) {
+      sheet.deleteRow(rowsToDelete[j]);
+    }
+
+    SpreadsheetApp.flush();
+    console.log('[INFO] clearSlotResponsesByUserId: userId=' + userId.substring(0, 6) +
+                '... deleted=' + rowsToDelete.length + '行');
+    return rowsToDelete.length;
+
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * 全スロット回答レコードを返す(F-4 集計用)
+ *
+ * 返却するオブジェクトの形:
+ *   [{
+ *     responseId: "RES_xxx",
+ *     userId: "Uxxxx",
+ *     date: "2026-05-14",
+ *     slotStart: "13:00",
+ *     answer: "can",
+ *     createdAt: "...",
+ *     updatedAt: "..."
+ *   }, ...]
+ *
+ * @returns {Array<Object>}
+ */
+function getAllSlotResponses() {
+  var sheet = getResponsesSheet();
+  var lastRow = sheet.getLastRow();
+
+  if (lastRow < 2) return [];
+
+  var values = sheet.getRange(2, 1, lastRow - 1, SLOT_RESPONSES_HEADER.length).getValues();
+
+  return values.map(function (row) {
+    return {
+      responseId: String(row[SRCOL_RESPONSE_ID - 1]),
+      userId:     String(row[SRCOL_USER_ID     - 1]),
+      date:       String(row[SRCOL_DATE        - 1]),
+      slotStart:  String(row[SRCOL_SLOT_START  - 1]),
+      answer:     String(row[SRCOL_ANSWER      - 1]),
+      createdAt:  String(row[SRCOL_CREATED_AT  - 1]),
+      updatedAt:  String(row[SRCOL_UPDATED_AT  - 1])
+    };
+  });
+}
+
+/**
+ * 指定ユーザーの回答を { 'YYYY-MM-DD|HH:mm': 'can'|'undecided' } 形式で返す(F-4 LIFF 前回答復元用)
+ *
+ * キー形式: date + '|' + slotStart (例: '2026-05-14|13:00')
+ *
+ * @param {string} userId - LINE ユーザー ID
+ * @returns {Object} { 'YYYY-MM-DD|HH:mm': 'can'|'undecided' }
+ */
+function getSlotResponsesByUserId(userId) {
+  if (!userId) return {};
+
+  var sheet = getResponsesSheet();
+  var lastRow = sheet.getLastRow();
+
+  if (lastRow < 2) return {};
+
+  // B(userId)〜E(answer) を一括取得
+  var values = sheet.getRange(2, SRCOL_USER_ID, lastRow - 1, 4).getValues();
+  var result = {};
+
+  for (var i = 0; i < values.length; i++) {
+    if (String(values[i][0]) === userId) {
+      var date      = String(values[i][1]);
+      var slotStart = String(values[i][2]);
+      var answer    = String(values[i][3]);
+      if (date && slotStart && (answer === 'can' || answer === 'undecided')) {
+        result[date + '|' + slotStart] = answer;
+      }
+    }
+  }
+
+  return result;
+}
+
+// ─────────────────────────────────────────────
+// responses シート 後方互換関数(F-1-4 / F-3)
+// ─────────────────────────────────────────────
 
 /**
  * 回答を登録する(同一 userId + scheduleId があれば上書き、なければ新規追加)
  *
- * upsert とは「あれば更新、なければ挿入」の略称。
- * 同じ人が同じ日程に何度もボタンを押しても、行が増殖せず最新の状態に上書きされる。
- *
- * ボタンをタップした = 参加できる、なので canAttend は常に true を書き込む。
- * (参加不可の取り消しは Phase 2 以降の TBD として将来拡張予定)
+ * @deprecated F-4 以降は upsertSlotResponse を使うこと。
+ *   本関数は後方互換のために残す。内部ロジックからは呼ばれなくなる。
  *
  * @param {string} userId    - LINE ユーザー ID
  * @param {string} scheduleId - 回答対象のスケジュール ID
+ * @param {boolean|string} [canAttend=true] - 参加可否
  * @returns {{action: 'inserted' | 'updated', row: number, responseId: string}}
  */
-function upsertResponse(userId, scheduleId) {
-  if (!userId) {
-    throw new Error('upsertResponse: userId is required');
-  }
-  if (!scheduleId) {
-    throw new Error('upsertResponse: scheduleId is required');
-  }
+function upsertResponse(userId, scheduleId, canAttend) {
+  if (!userId) throw new Error('upsertResponse: userId is required');
+  if (!scheduleId) throw new Error('upsertResponse: scheduleId is required');
+
+  var attendValue = (canAttend === undefined) ? true : canAttend;
 
   var lock = LockService.getScriptLock();
   if (!lock.tryLock(10 * 1000)) {
@@ -738,23 +1023,28 @@ function upsertResponse(userId, scheduleId) {
     return withRetry(function () {
       var sheet = getResponsesSheet();
       var nowIso = _toIsoTokyo(new Date());
-      var foundRow = _findResponseRow(sheet, userId, scheduleId);
+      var lastRow = sheet.getLastRow();
 
-      if (foundRow > 0) {
-        // 既存行を上書き
-        sheet.getRange(foundRow, RCOL_CAN_ATTEND).setValue(true);
-        sheet.getRange(foundRow, RCOL_LAST_UPDATED).setValue(nowIso);
-        SpreadsheetApp.flush();
-        var existingId = sheet.getRange(foundRow, RCOL_RESPONSE_ID).getValue();
-        return { action: 'updated', row: foundRow, responseId: existingId };
+      // 旧形式(userId + scheduleId)で検索 — F-4 移行後はヒットしない想定
+      if (lastRow >= 2) {
+        var vals = sheet.getRange(2, SRCOL_USER_ID, lastRow - 1, 3).getValues();
+        for (var i = 0; i < vals.length; i++) {
+          if (String(vals[i][0]) === userId && String(vals[i][1]) === scheduleId) {
+            var foundRow = i + 2;
+            sheet.getRange(foundRow, SRCOL_ANSWER).setValue(attendValue);
+            sheet.getRange(foundRow, SRCOL_UPDATED_AT).setValue(nowIso);
+            SpreadsheetApp.flush();
+            var existingId = String(sheet.getRange(foundRow, SRCOL_RESPONSE_ID).getValue());
+            return { action: 'updated', row: foundRow, responseId: existingId };
+          }
+        }
       }
 
-      // 新規行 — 6 列を 1 回の setValues で一括書き込み(API 呼び出し 6→1 回に削減)
-      // userId・scheduleId 列のテキスト書式は _initializeResponsesSheet で列ごと設定済み
       var responseId = _generateResponseId();
       var newRow = sheet.getLastRow() + 1;
-      sheet.getRange(newRow, 1, 1, RESPONSES_HEADER.length).setValues([[
-        responseId, userId, scheduleId, true, nowIso, nowIso
+      // 旧形式を新シート構造に書く場合: date=scheduleId, slotStart='', answer=attendValue
+      sheet.getRange(newRow, 1, 1, SLOT_RESPONSES_HEADER.length).setValues([[
+        responseId, userId, scheduleId, '', attendValue, nowIso, nowIso
       ]]);
       SpreadsheetApp.flush();
       return { action: 'inserted', row: newRow, responseId: responseId };
@@ -765,30 +1055,100 @@ function upsertResponse(userId, scheduleId) {
 }
 
 /**
- * userId + scheduleId の組み合わせで既存行を探す(内部用)
+ * 指定ユーザーの全回答を返す(旧 LIFF フォームの前回答復元用)
  *
- * B 列(userId)と C 列(scheduleId)を一括取得して両方一致する行を返す。
+ * @deprecated F-4 以降は getSlotResponsesByUserId を使うこと。
  *
- * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet
- * @param {string} userId
- * @param {string} scheduleId
- * @returns {number} 1-based の行番号。見つからなければ -1。
- * @private
+ * @param {string} userId - LINE ユーザー ID
+ * @returns {Array<{scheduleId: string, canAttend: boolean|string}>}
  */
-function _findResponseRow(sheet, userId, scheduleId) {
+function getResponsesByUserId(userId) {
+  if (!userId) return [];
+
+  var sheet = getResponsesSheet();
   var lastRow = sheet.getLastRow();
-  if (lastRow < 2) {
-    return -1;
-  }
-  // B〜C 列(userId, scheduleId)を一括取得して比較
-  var values = sheet.getRange(2, RCOL_USER_ID, lastRow - 1, 2).getValues();
+  if (lastRow < 2) return [];
+
+  var values = sheet.getRange(2, SRCOL_USER_ID, lastRow - 1, 3).getValues();
+  var result = [];
+
   for (var i = 0; i < values.length; i++) {
-    if (values[i][0] === userId && values[i][1] === scheduleId) {
-      return i + 2;
+    if (String(values[i][0]) === userId) {
+      result.push({
+        scheduleId: String(values[i][1]),
+        canAttend:  values[i][2]
+      });
     }
   }
-  return -1;
+
+  return result;
 }
+
+/**
+ * 指定ユーザーの全回答行を削除する(旧 LIFF 一括送信用)
+ *
+ * @deprecated F-4 以降は clearSlotResponsesByUserId を使うこと。
+ *
+ * @param {string} userId - LINE ユーザー ID
+ * @returns {number} 削除した行数
+ */
+function clearResponsesByUserId(userId) {
+  // F-4 の新関数に委譲(ロジックは同じ)
+  return clearSlotResponsesByUserId(userId);
+}
+
+// ─────────────────────────────────────────────
+// responses シート 読み取り関数(F-1-5 / F-1-6 用・後方互換)
+// ─────────────────────────────────────────────
+
+/**
+ * responses シートの全行をオブジェクト配列で返す(後方互換)
+ *
+ * F-1-6(集計判定)が scheduleId ごとの票数を計算するために使う。
+ * F-4 移行後は getAllSlotResponses() を直接使うほうが望ましい。
+ *
+ * @returns {Array<Object>} response オブジェクトの配列
+ */
+function getAllResponses() {
+  // F-4 の新形式データをそのまま返す
+  // canAttend フィールドは answer='can' の場合に true として互換マッピングする
+  var rows = getAllSlotResponses();
+  return rows.map(function (r) {
+    return {
+      responseId:    r.responseId,
+      userId:        r.userId,
+      scheduleId:    r.date + '|' + r.slotStart,  // 旧 scheduleId の代替キー
+      canAttend:     r.answer === 'can' ? true : r.answer,
+      respondedAt:   r.createdAt,
+      lastUpdatedAt: r.updatedAt
+    };
+  });
+}
+
+/**
+ * responses シートに 1 件以上回答のある userId を重複なしで返す
+ *
+ * F-1-5(リマインド)/ F-1-6(集計判定)用。
+ *
+ * @returns {Array<string>} userId の配列(重複なし)
+ */
+function getRespondedUserIds() {
+  var responses = getAllSlotResponses();
+  var seen = {};
+  var result = [];
+  for (var i = 0; i < responses.length; i++) {
+    var uid = responses[i].userId;
+    if (uid && !seen[uid]) {
+      seen[uid] = true;
+      result.push(uid);
+    }
+  }
+  return result;
+}
+
+// ─────────────────────────────────────────────
+// 内部ユーティリティ
+// ─────────────────────────────────────────────
 
 /**
  * responseId を採番する(内部用)
@@ -805,62 +1165,4 @@ function _generateResponseId() {
   var rand = Math.floor(Math.random() * 10000);
   var randPadded = ('0000' + rand).slice(-4);
   return 'RES_' + timestamp + '_' + randPadded;
-}
-
-// ─────────────────────────────────────────────
-// responses シート 読み取り関数(F-1-5 / F-1-6 用)
-// ─────────────────────────────────────────────
-
-/**
- * responses シートの全行をオブジェクト配列で返す
- *
- * getSchedules() と同じパターン。
- * F-1-6(集計判定)が scheduleId ごとの票数を計算するために使う。
- *
- * データが 1 件もない場合は空配列を返す(エラーにしない)。
- *
- * @returns {Array<Object>} response オブジェクトの配列
- */
-function getAllResponses() {
-  var sheet = getResponsesSheet();
-  var lastRow = sheet.getLastRow();
-
-  if (lastRow < 2) {
-    return [];
-  }
-
-  var values = sheet.getRange(2, 1, lastRow - 1, RESPONSES_HEADER.length).getValues();
-
-  return values.map(function (row) {
-    return {
-      responseId:    row[RCOL_RESPONSE_ID  - 1],
-      userId:        row[RCOL_USER_ID      - 1],
-      scheduleId:    row[RCOL_SCHEDULE_ID  - 1],
-      canAttend:     row[RCOL_CAN_ATTEND   - 1],
-      respondedAt:   row[RCOL_RESPONDED_AT - 1],
-      lastUpdatedAt: row[RCOL_LAST_UPDATED - 1]
-    };
-  });
-}
-
-/**
- * responses シートに 1 件以上回答のある userId を重複なしで返す
- *
- * F-1-5(リマインド)が「まだ誰も回答していないメンバー」を割り出すために使う。
- * F-1-6(集計判定)が「全員回答したか」を判定するためにも使う。
- *
- * @returns {Array<string>} userId の配列(重複なし)
- */
-function getRespondedUserIds() {
-  var responses = getAllResponses();
-  var seen = {};
-  var result = [];
-  for (var i = 0; i < responses.length; i++) {
-    var uid = responses[i].userId;
-    if (uid && !seen[uid]) {
-      seen[uid] = true;
-      result.push(uid);
-    }
-  }
-  return result;
 }

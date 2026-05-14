@@ -191,12 +191,12 @@ function _serveLiffResultsPage() {
 // ─────────────────────────────────────────────
 
 /**
- * LIFF 回答フォーム用: スケジュール一覧 + このユーザーの前回答を返す(F-3-4)
+ * LIFF 回答フォーム用: スケジュール一覧 + このユーザーの前回答を返す(F-3-4 / F-4)
  *
  * liff.html から google.script.run.liffGetSchedulesAndResponses(idToken) で呼ばれる。
  *
  * @param {string} idToken - liff.getIDToken() で取得した ID Token
- * @returns {{ schedules: Array, userAnswers: Object } | null}
+ * @returns {{ dates: Array, userAnswers: Object } | null}
  *   検証失敗時は null(HTML 側でエラーメッセージを表示する)
  */
 function liffGetSchedulesAndResponses(idToken) {
@@ -214,12 +214,12 @@ function liffGetSchedulesAndResponses(idToken) {
 }
 
 /**
- * LIFF 回答フォーム用: 回答を一括送信する(F-3-4)
+ * LIFF 回答フォーム用: 回答を一括送信する(F-3-4 / F-4)
  *
  * liff.html から google.script.run.liffSubmitResponses(idToken, answers) で呼ばれる。
  *
  * @param {string} idToken - liff.getIDToken() で取得した ID Token
- * @param {Object} answers - { scheduleId: 'can' | 'undecided' } のオブジェクト
+ * @param {Object} answers - { 'YYYY-MM-DD|HH:mm': 'can' | 'undecided' } のオブジェクト
  * @returns {{ deleted: number, inserted: number } | null}
  *   検証失敗時は null
  */
@@ -230,7 +230,7 @@ function liffSubmitResponses(idToken, answers) {
       console.warn('[WARN] liffSubmitResponses: ID Token verification failed');
       return null;
     }
-    return handleLiffSubmit(identity.userId, answers);
+    return handleLiffSubmitFast(identity.userId, answers);
   } catch (err) {
     logError(err, { phase: 'liffSubmitResponses' });
     return null;
@@ -238,12 +238,12 @@ function liffSubmitResponses(idToken, answers) {
 }
 
 /**
- * LIFF 回答状況確認ページ用: 全員の回答状況を返す(F-3-5)
+ * LIFF 回答状況確認ページ用: 全員の回答状況を返す(F-3-5 / F-4)
  *
  * liffResults.html から google.script.run.liffGetAllResponses(idToken) で呼ばれる。
  *
  * @param {string} idToken - liff.getIDToken() で取得した ID Token
- * @returns {{ schedules: Array, responses: Object } | null}
+ * @returns {{ dates: Array, responses: Object } | null}
  *   検証失敗時は null
  */
 function liffGetAllResponses(idToken) {
@@ -317,6 +317,23 @@ function aggregateAndNotify() {
 }
 
 /**
+ * responses シートを F-4 新データモデルにリセットする(手動実行用)
+ *
+ * F-4 移行時に GAS エディタから 1 回だけ実行してください。
+ * 既存の responses シートのデータ(旧形式・テスト用)をすべて削除し、
+ * 新しい列構造(responseId / userId / date / slotStart / answer / createdAt / updatedAt)で
+ * シートを作り直します。
+ *
+ * 注意: 実行すると responses シートの中身がすべて消えます。
+ *
+ * @returns {void}
+ */
+function resetResponsesSheetForF4() {
+  resetResponsesSheet();
+  console.log('[INFO] responses シートをリセットしました（F-4 移行）');
+}
+
+/**
  * 1 イベントを正しい担当関数へ振り分ける(内部用)
  *
  * @param {Object} event - LINE Webhook イベントオブジェクト 1 件
@@ -365,11 +382,11 @@ function _ok() {
  * GitHub Pages からの LIFF API リクエストを処理する(内部用)
  *
  * GET パラメータ:
- *   liff=getSchedules   → スケジュール一覧 + このユーザーの前回答を返す
- *   liff=getAllResponses → 全員の回答状況を返す
+ *   liff=getSchedules   → スケジュール一覧 + このユーザーの前回答を返す(F-4 グリッド形式)
+ *   liff=getAllResponses → 全員の回答状況を返す(F-4 形式)
  *   liff=submit         → answers パラメータの回答を保存する
  *   idToken             → LIFF の ID Token(全アクションで必須)
- *   answers             → JSON 文字列 { scheduleId: 'can'|'undecided' }(submit のみ)
+ *   answers             → JSON 文字列 { 'YYYY-MM-DD|HH:mm': 'can'|'undecided' }(submit のみ)
  *
  * @param {Object} e - doGet のイベントオブジェクト
  * @param {string} action - liff パラメータの値

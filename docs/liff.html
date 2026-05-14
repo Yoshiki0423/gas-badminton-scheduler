@@ -12,6 +12,8 @@
       color: #333;
       min-height: 100vh;
     }
+
+    /* ヘッダー */
     .header {
       background-color: #06C755;
       color: #fff;
@@ -19,7 +21,11 @@
       text-align: center;
     }
     .header h1 { font-size: 18px; font-weight: bold; }
-    .content { padding: 16px; max-width: 480px; margin: 0 auto; }
+
+    /* コンテンツエリア */
+    .content { padding: 16px; max-width: 520px; margin: 0 auto; padding-bottom: max(100px, calc(env(safe-area-inset-bottom) + 80px)); }
+
+    /* 読み込み中 */
     .loading { text-align: center; padding: 40px 16px; color: #666; }
     .spinner {
       width: 40px; height: 40px;
@@ -30,6 +36,8 @@
       margin: 0 auto 16px;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* エラー */
     .error {
       background-color: #fff3f3;
       border: 1px solid #ffcccc;
@@ -40,55 +48,126 @@
       text-align: center;
       line-height: 1.6;
     }
+
+    /* 空のとき */
     .empty { text-align: center; padding: 40px 16px; color: #666; line-height: 1.6; }
-    .schedule-list { display: flex; flex-direction: column; gap: 12px; margin-bottom: 24px; }
-    .schedule-card {
+
+    /* 説明テキスト */
+    .guide-text { font-size: 13px; color: #666; margin-bottom: 16px; line-height: 1.6; }
+
+    /* 日付ブロック一覧 */
+    .date-list { display: flex; flex-direction: column; gap: 12px; }
+
+    /* 日付ブロック */
+    .date-block {
       background-color: #fff;
       border-radius: 8px;
-      padding: 14px;
+      padding: 12px 14px;
       box-shadow: 0 1px 4px rgba(0,0,0,0.1);
     }
-    .schedule-date { font-size: 15px; font-weight: bold; margin-bottom: 4px; color: #222; }
-    .schedule-facility { font-size: 13px; color: #666; margin-bottom: 12px; }
-    .answer-buttons { display: flex; gap: 8px; }
-    .btn-answer {
-      flex: 1; padding: 10px 8px;
+
+    /* 日付見出し */
+    .date-label {
+      font-size: 15px;
+      font-weight: bold;
+      color: #222;
+      margin-bottom: 4px;
+    }
+
+    /* 施設情報行 */
+    .facility-info {
+      font-size: 12px;
+      color: #666;
+      margin-bottom: 10px;
+      line-height: 1.4;
+    }
+
+    /* スロットボタン群(6列横並び) */
+    .slot-row {
+      display: flex;
+      gap: 5px;
+      flex-wrap: nowrap;
+    }
+
+    /* スロットボタン */
+    .btn-slot {
+      flex: 1;
+      min-width: 0;
+      padding: 7px 2px;
       border: 2px solid #ddd;
       border-radius: 6px;
-      background-color: #f9f9f9;
-      color: #555;
-      font-size: 14px; font-weight: bold;
+      background-color: #fff;
+      color: #333;
+      font-size: 11px;
+      font-weight: bold;
       cursor: pointer;
-      transition: all 0.15s ease;
       text-align: center;
+      line-height: 1.3;
+      transition: all 0.1s ease;
+      word-break: keep-all;
     }
-    .btn-answer:active { opacity: 0.7; }
-    .btn-answer.selected-can { background-color: #06C755; border-color: #06C755; color: #fff; }
-    .btn-answer.selected-undecided { background-color: #757575; border-color: #757575; color: #fff; }
+    .btn-slot:active { opacity: 0.7; }
+
+    /* グレーアウト(施設が開いていないスロット) */
+    .btn-slot.grayed {
+      background-color: #e0e0e0;
+      border-color: #e0e0e0;
+      color: #aaa;
+      cursor: not-allowed;
+      pointer-events: none;
+    }
+
+    /* ○ 選択済み */
+    .btn-slot.selected-can {
+      background-color: #06C755;
+      border-color: #06C755;
+      color: #fff;
+    }
+
+    /* △ 選択済み */
+    .btn-slot.selected-undecided {
+      background-color: #757575;
+      border-color: #757575;
+      color: #fff;
+    }
+
+    /* 送信ボタン(画面下部に固定) */
     .submit-area {
-      position: sticky; bottom: 0;
-      background-color: #f5f5f5;
-      padding: 12px 0 24px;
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      background-color: rgba(245,245,245,0.96);
+      padding: 12px 16px 24px;
+      box-shadow: 0 -2px 8px rgba(0,0,0,0.08);
     }
     .btn-submit {
-      display: block; width: 100%; padding: 16px;
+      display: block;
+      width: 100%;
+      max-width: 520px;
+      margin: 0 auto;
+      padding: 16px;
       background-color: #06C755;
-      color: #fff; border: none;
+      color: #fff;
+      border: none;
       border-radius: 8px;
-      font-size: 16px; font-weight: bold;
+      font-size: 16px;
+      font-weight: bold;
       cursor: pointer;
       transition: opacity 0.15s ease;
     }
     .btn-submit:disabled { background-color: #aaa; cursor: not-allowed; }
     .btn-submit:not(:disabled):active { opacity: 0.8; }
-    .success { text-align: center; padding: 40px 16px; color: #06C755; }
-    .success-icon { font-size: 48px; margin-bottom: 16px; }
+
+    /* 送信完了 */
+    .success { text-align: center; padding: 40px 16px; }
+    .success-icon { font-size: 48px; color: #06C755; margin-bottom: 16px; }
     .success-text { font-size: 16px; font-weight: bold; color: #333; line-height: 1.6; }
-    .guide-text { font-size: 13px; color: #666; margin-bottom: 16px; line-height: 1.6; }
   </style>
 </head>
 <body>
   <div class="header"><h1>バドミントン 日程回答</h1></div>
+
   <div class="content" id="app">
     <div class="loading" id="loading">
       <div class="spinner"></div>
@@ -99,20 +178,26 @@
   <script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
   <script>
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // ★ 設定値 — 自分の値に書き換えてください
+    // 設定値(F-4)
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     var LIFF_ID     = '2010067159-goZKGxNN';
     var GAS_API_URL = 'https://script.google.com/macros/s/AKfycbz0gRzFCoweztAOeYg5u5Y7TNOfFGhBXApUV59neZgtiVF_UZxUO7uC1BWdy3rUGrMjSw/exec';
 
+    // ─── 現在の回答を保持するオブジェクト ───
+    // キー: 'YYYY-MM-DD|HH:mm'  値: 'can' / 'undecided'
     var answers = {};
 
-    // ─── 初期化 ───
+    // ─── タップサイクル: 空欄 → can → undecided → 空欄 ───
+    var CYCLE = [null, 'can', 'undecided'];
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 初期化
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     window.onload = function () {
-      if (!LIFF_ID || LIFF_ID === 'REPLACE_WITH_LIFF_FORM_ID') {
-        showError('LIFF_ID が設定されていません。docs/liff.html を編集してください。');
+      if (!LIFF_ID) {
+        showError('LIFF_ID が設定されていません。');
         return;
       }
-
       var timeoutId = setTimeout(function () {
         showError('初期化がタイムアウトしました。ページを閉じて再度お試しください。');
       }, 15000);
@@ -129,7 +214,9 @@
         });
     };
 
-    // ─── スケジュール取得 ───
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // データ取得
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     function loadSchedules() {
       var idToken = liff.getIDToken();
       if (!idToken) { showError('ログイン情報の取得に失敗しました。'); return; }
@@ -137,60 +224,132 @@
       fetch(GAS_API_URL + '?liff=getSchedules&idToken=' + encodeURIComponent(idToken))
         .then(function (r) { return r.json(); })
         .then(function (res) {
-          if (!res.ok) { showError('データの取得に失敗しました。(' + (res.error || '') + ')'); return; }
-          renderForm(res.data.schedules, res.data.userAnswers);
+          if (!res.ok) {
+            showError('データの取得に失敗しました。(' + (res.error || '') + ')');
+            return;
+          }
+          // F-4 形式: { dates: [...], userAnswers: {...} }
+          renderForm(res.data.dates, res.data.userAnswers);
         })
-        .catch(function () { showError('通信エラーが発生しました。ページを閉じて再度お試しください。'); });
+        .catch(function () {
+          showError('通信エラーが発生しました。ページを閉じて再度お試しください。');
+        });
     }
 
-    // ─── フォーム描画 ───
-    function renderForm(schedules, userAnswers) {
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // グリッドフォーム描画
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    function renderForm(dates, userAnswers) {
+      // 前回の回答を読み込む(AC-18: 前回答復元)
       answers = {};
       if (userAnswers) {
-        for (var key in userAnswers) { answers[key] = userAnswers[key]; }
+        for (var k in userAnswers) {
+          if (userAnswers.hasOwnProperty(k)) answers[k] = userAnswers[k];
+        }
       }
 
       var app = document.getElementById('app');
-      if (!schedules || schedules.length === 0) {
+
+      if (!dates || dates.length === 0) {
         app.innerHTML = '<div class="empty"><p>現在、回答できる日程がありません。<br>またの機会にご利用ください。</p></div>';
         return;
       }
 
-      var html = '<p class="guide-text">参加できる日程に「行ける」、未定の場合は「未定」を選んでください。<br>選ばなかった日程は「行けない」として扱います。</p>';
-      html += '<div class="schedule-list" id="scheduleList">';
+      var html = '<p class="guide-text">';
+      html += 'ボタンをタップするたびに ○(行ける) → △(未定) → 空欄(行けない) と切り替わります。<br>';
+      html += '灰色のボタンは体育館が閉まっている時間帯です。';
+      html += '</p>';
+      html += '<div class="date-list">';
 
-      for (var i = 0; i < schedules.length; i++) {
-        var s = schedules[i];
-        var dateLabel = formatDateLabel(s.date, s.startTime, s.endTime);
-        var cur = answers[s.scheduleId] || '';
-        html += '<div class="schedule-card" data-id="' + esc(s.scheduleId) + '">';
-        html += '<div class="schedule-date">' + esc(dateLabel) + '</div>';
-        html += '<div class="schedule-facility">' + esc(s.facilityName) + '</div>';
-        html += '<div class="answer-buttons">';
-        html += '<button class="btn-answer' + (cur === 'can' ? ' selected-can' : '') + '" onclick="select(\'' + esc(s.scheduleId) + '\',\'can\')">行ける</button>';
-        html += '<button class="btn-answer' + (cur === 'undecided' ? ' selected-undecided' : '') + '" onclick="select(\'' + esc(s.scheduleId) + '\',\'undecided\')">未定</button>';
-        html += '</div></div>';
+      for (var i = 0; i < dates.length; i++) {
+        var dateInfo = dates[i];
+        html += '<div class="date-block">';
+        html += '<div class="date-label">' + esc(dateInfo.dateLabel) + '</div>';
+        if (dateInfo.facilityInfo) {
+          html += '<div class="facility-info">' + esc(dateInfo.facilityInfo) + '</div>';
+        }
+        html += '<div class="slot-row">';
+
+        for (var j = 0; j < dateInfo.slots.length; j++) {
+          var slot = dateInfo.slots[j];
+          var slotKey = dateInfo.date + '|' + slot.slotStart;
+          var currentAnswer = answers[slotKey] || null;
+          var btnClass = 'btn-slot';
+          var btnText = formatSlotLabel(slot.slotStart, null);
+
+          if (!slot.available) {
+            // グレーアウト(AC-15)
+            btnClass += ' grayed';
+            btnText = formatSlotLabel(slot.slotStart, null);
+          } else if (currentAnswer === 'can') {
+            btnClass += ' selected-can';
+            btnText = '○ ' + formatSlotLabel(slot.slotStart, null);
+          } else if (currentAnswer === 'undecided') {
+            btnClass += ' selected-undecided';
+            btnText = '△ ' + formatSlotLabel(slot.slotStart, null);
+          }
+
+          if (slot.available) {
+            // タップ可能(data 属性でキーを渡す)
+            html += '<button class="' + btnClass + '" data-key="' + esc(slotKey) + '" onclick="tapSlot(this)">' + esc(btnText) + '</button>';
+          } else {
+            html += '<button class="' + btnClass + '" disabled aria-disabled="true">' + esc(btnText) + '</button>';
+          }
+        }
+
+        html += '</div>'; // slot-row
+        html += '</div>'; // date-block
       }
 
-      html += '</div><div class="submit-area"><button class="btn-submit" id="submitBtn" onclick="submit()">送信する</button></div>';
+      html += '</div>'; // date-list
+      html += '<div class="submit-area"><button class="btn-submit" id="submitBtn" onclick="submitAnswers()">送信する</button></div>';
+
       app.innerHTML = html;
     }
 
-    // ─── 回答選択 ───
-    function select(scheduleId, value) {
-      if (answers[scheduleId] === value) { delete answers[scheduleId]; }
-      else { answers[scheduleId] = value; }
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // スロットボタンタップ処理(AC-16: 空欄→○→△→空欄 サイクル)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    function tapSlot(btn) {
+      var slotKey = btn.getAttribute('data-key');
+      if (!slotKey) return;
 
-      var card = document.querySelector('.schedule-card[data-id="' + scheduleId + '"]');
-      if (!card) return;
-      var btns = card.querySelectorAll('.btn-answer');
-      var cur = answers[scheduleId] || '';
-      btns[0].className = 'btn-answer' + (cur === 'can' ? ' selected-can' : '');
-      btns[1].className = 'btn-answer' + (cur === 'undecided' ? ' selected-undecided' : '');
+      var current = answers[slotKey] || null;
+
+      // サイクル: null → 'can' → 'undecided' → null
+      var next;
+      if (current === null) {
+        next = 'can';
+      } else if (current === 'can') {
+        next = 'undecided';
+      } else {
+        next = null;
+      }
+
+      if (next === null) {
+        delete answers[slotKey];
+      } else {
+        answers[slotKey] = next;
+      }
+
+      // ボタン表示を更新
+      var slotStart = slotKey.split('|')[1] || '';
+      if (next === 'can') {
+        btn.className = 'btn-slot selected-can';
+        btn.textContent = '○ ' + formatSlotLabel(slotStart, null);
+      } else if (next === 'undecided') {
+        btn.className = 'btn-slot selected-undecided';
+        btn.textContent = '△ ' + formatSlotLabel(slotStart, null);
+      } else {
+        btn.className = 'btn-slot';
+        btn.textContent = formatSlotLabel(slotStart, null);
+      }
     }
 
-    // ─── 送信 ───
-    function submit() {
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 送信処理
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    function submitAnswers() {
       var idToken = liff.getIDToken();
       if (!idToken) { showError('ログイン情報の取得に失敗しました。'); return; }
 
@@ -219,20 +378,35 @@
         });
     }
 
-    // ─── ユーティリティ ───
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // ユーティリティ
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    /**
+     * スロット開始時刻を短い表示用文字列に変換する
+     * 例: '09:00' → '9時'
+     * @param {string} slotStart - 'HH:mm' 形式
+     * @param {*} _unused
+     * @returns {string}
+     */
+    function formatSlotLabel(slotStart, _unused) {
+      if (!slotStart) return '';
+      var h = parseInt(slotStart.split(':')[0], 10);
+      return h + '時';
+    }
+
     function showError(msg) {
       document.getElementById('app').innerHTML = '<div class="error">' + esc(msg) + '</div>';
     }
 
-    function formatDateLabel(date, startTime, endTime) {
-      var w = ['日','月','火','水','木','金','土'];
-      var d = new Date(date + 'T00:00:00+09:00');
-      return (d.getMonth()+1) + '/' + d.getDate() + '(' + w[d.getDay()] + ') ' + startTime + '〜' + endTime;
-    }
-
     function esc(s) {
-      if (typeof s !== 'string') return '';
-      return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+      if (typeof s !== 'string') return String(s || '');
+      return s
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
     }
   </script>
 </body>

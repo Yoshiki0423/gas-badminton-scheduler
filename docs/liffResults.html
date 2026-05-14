@@ -12,9 +12,15 @@
       color: #333;
       min-height: 100vh;
     }
+
+    /* ヘッダー */
     .header { background-color: #06C755; color: #fff; padding: 16px; text-align: center; }
     .header h1 { font-size: 18px; font-weight: bold; }
-    .content { padding: 16px; max-width: 480px; margin: 0 auto; }
+
+    /* コンテンツ */
+    .content { padding: 16px; max-width: 520px; margin: 0 auto; }
+
+    /* 読み込み中 */
     .loading { text-align: center; padding: 40px 16px; color: #666; }
     .spinner {
       width: 40px; height: 40px;
@@ -25,6 +31,8 @@
       margin: 0 auto 16px;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* エラー */
     .error {
       background-color: #fff3f3;
       border: 1px solid #ffcccc;
@@ -33,40 +41,94 @@
       color: #c0392b;
       text-align: center; line-height: 1.6;
     }
+
     .empty { text-align: center; padding: 40px 16px; color: #666; line-height: 1.6; }
     .guide-text { font-size: 13px; color: #666; margin-bottom: 16px; line-height: 1.6; }
-    .schedule-list { display: flex; flex-direction: column; gap: 12px; }
-    .schedule-card {
+
+    /* 日付ブロック一覧 */
+    .date-list { display: flex; flex-direction: column; gap: 16px; }
+
+    /* 日付ブロック */
+    .date-block {
       background-color: #fff;
       border-radius: 8px;
-      padding: 14px;
+      padding: 12px 14px;
       box-shadow: 0 1px 4px rgba(0,0,0,0.1);
     }
-    .schedule-date { font-size: 15px; font-weight: bold; margin-bottom: 4px; color: #222; }
-    .schedule-facility { font-size: 13px; color: #666; margin-bottom: 12px; }
-    .response-summary { display: flex; flex-direction: column; gap: 8px; }
-    .response-row { display: flex; align-items: flex-start; gap: 8px; font-size: 13px; line-height: 1.5; }
+
+    /* 日付見出し */
+    .date-label {
+      font-size: 15px;
+      font-weight: bold;
+      color: #222;
+      margin-bottom: 4px;
+    }
+
+    /* 施設情報行 */
+    .facility-info {
+      font-size: 12px;
+      color: #666;
+      margin-bottom: 10px;
+      line-height: 1.4;
+    }
+
+    /* スロット一覧 */
+    .slot-list { display: flex; flex-direction: column; gap: 8px; }
+
+    /* 1スロット行 */
+    .slot-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+    }
+
+    /* スロット時間ラベル */
+    .slot-time {
+      flex-shrink: 0;
+      font-size: 12px;
+      font-weight: bold;
+      color: #555;
+      min-width: 56px;
+      padding-top: 2px;
+    }
+
+    /* 回答詳細エリア */
+    .slot-detail { flex: 1; display: flex; flex-direction: column; gap: 4px; }
+
+    /* 回答行(○行・△行) */
+    .resp-row { display: flex; align-items: flex-start; gap: 6px; font-size: 12px; line-height: 1.5; }
+
+    /* ○バッジ */
     .badge-can {
       flex-shrink: 0;
-      display: inline-block; padding: 2px 8px;
+      display: inline-block; padding: 1px 7px;
       background-color: #06C755; color: #fff;
-      border-radius: 12px; font-size: 12px; font-weight: bold;
-      min-width: 56px; text-align: center;
+      border-radius: 10px; font-size: 11px; font-weight: bold;
+      min-width: 44px; text-align: center;
     }
+
+    /* △バッジ */
     .badge-undecided {
       flex-shrink: 0;
-      display: inline-block; padding: 2px 8px;
+      display: inline-block; padding: 1px 7px;
       background-color: #757575; color: #fff;
-      border-radius: 12px; font-size: 12px; font-weight: bold;
-      min-width: 56px; text-align: center;
+      border-radius: 10px; font-size: 11px; font-weight: bold;
+      min-width: 44px; text-align: center;
     }
-    .response-names { color: #444; }
-    .response-count { font-size: 12px; color: #999; margin-left: 4px; }
-    .no-response { font-size: 13px; color: #aaa; }
+
+    .resp-names { color: #444; font-size: 12px; }
+    .resp-count { font-size: 11px; color: #999; margin-left: 2px; }
+    .no-resp { font-size: 12px; color: #aaa; }
+
+    /* グレーアウトスロット(施設が閉まっている) */
+    .slot-row.grayed .slot-time { color: #bbb; }
+    .slot-row.grayed .slot-detail { color: #bbb; }
+    .grayed-label { font-size: 11px; color: #bbb; }
   </style>
 </head>
 <body>
   <div class="header"><h1>回答状況確認</h1></div>
+
   <div class="content" id="app">
     <div class="loading" id="loading">
       <div class="spinner"></div>
@@ -77,18 +139,19 @@
   <script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
   <script>
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // ★ 設定値 — 自分の値に書き換えてください
+    // 設定値(F-4)
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     var LIFF_ID     = '2010067159-k09pLDMl';
     var GAS_API_URL = 'https://script.google.com/macros/s/AKfycbz0gRzFCoweztAOeYg5u5Y7TNOfFGhBXApUV59neZgtiVF_UZxUO7uC1BWdy3rUGrMjSw/exec';
 
-    // ─── 初期化 ───
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 初期化
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     window.onload = function () {
-      if (!LIFF_ID || LIFF_ID === 'REPLACE_WITH_LIFF_RESULTS_ID') {
-        showError('LIFF_ID が設定されていません。docs/liffResults.html を編集してください。');
+      if (!LIFF_ID) {
+        showError('LIFF_ID が設定されていません。');
         return;
       }
-
       var timeoutId = setTimeout(function () {
         showError('初期化がタイムアウトしました。ページを閉じて再度お試しください。');
       }, 15000);
@@ -105,7 +168,9 @@
         });
     };
 
-    // ─── 回答状況取得 ───
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // データ取得
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     function loadResponses() {
       var idToken = liff.getIDToken();
       if (!idToken) { showError('ログイン情報の取得に失敗しました。'); return; }
@@ -113,73 +178,126 @@
       fetch(GAS_API_URL + '?liff=getAllResponses&idToken=' + encodeURIComponent(idToken))
         .then(function (r) { return r.json(); })
         .then(function (res) {
-          if (!res.ok) { showError('データの取得に失敗しました。(' + (res.error || '') + ')'); return; }
-          renderResults(res.data.schedules, res.data.responses);
+          if (!res.ok) {
+            showError('データの取得に失敗しました。(' + (res.error || '') + ')');
+            return;
+          }
+          // F-4 形式: { dates: [...], responses: { 'YYYY-MM-DD|HH:mm': { can: [...], undecided: [...] } } }
+          renderResults(res.data.dates, res.data.responses);
         })
-        .catch(function () { showError('通信エラーが発生しました。ページを閉じて再度お試しください。'); });
+        .catch(function () {
+          showError('通信エラーが発生しました。ページを閉じて再度お試しください。');
+        });
     }
 
-    // ─── 回答状況描画 ───
-    function renderResults(schedules, responses) {
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 回答状況描画(F-4 グリッド形式)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    function renderResults(dates, responses) {
       var app = document.getElementById('app');
-      if (!schedules || schedules.length === 0) {
+
+      if (!dates || dates.length === 0) {
         app.innerHTML = '<div class="empty"><p>現在、確認できる日程がありません。</p></div>';
         return;
       }
 
-      var html = '<p class="guide-text">直近のスケジュールに対する回答状況です。</p>';
-      html += '<div class="schedule-list">';
+      var SLOT_END_MAP = {
+        '09:00': '11:00', '11:00': '13:00', '13:00': '15:00',
+        '15:00': '17:00', '17:00': '19:00', '19:00': '21:00'
+      };
 
-      for (var i = 0; i < schedules.length; i++) {
-        var s = schedules[i];
-        var dateLabel = formatDateLabel(s.date, s.startTime, s.endTime);
-        var resp = (responses && responses[s.scheduleId]) || { can: [], undecided: [] };
-        var canList = resp.can || [];
-        var undecidedList = resp.undecided || [];
+      var html = '<p class="guide-text">直近のスケジュールに対する回答状況です。<br>各時間帯ごとに行ける人・未定の人を表示しています。</p>';
+      html += '<div class="date-list">';
 
-        html += '<div class="schedule-card">';
-        html += '<div class="schedule-date">' + esc(dateLabel) + '</div>';
-        html += '<div class="schedule-facility">' + esc(s.facilityName) + '</div>';
-        html += '<div class="response-summary">';
-
-        html += '<div class="response-row"><span class="badge-can">行ける</span>';
-        if (canList.length > 0) {
-          html += '<span class="response-names">' + esc(canList.join('・')) + '</span>';
-          html += '<span class="response-count">(' + canList.length + '人)</span>';
-        } else {
-          html += '<span class="no-response">まだ誰もいません</span>';
+      for (var i = 0; i < dates.length; i++) {
+        var dateInfo = dates[i];
+        html += '<div class="date-block">';
+        html += '<div class="date-label">' + esc(dateInfo.dateLabel) + '</div>';
+        if (dateInfo.facilityInfo) {
+          html += '<div class="facility-info">' + esc(dateInfo.facilityInfo) + '</div>';
         }
-        html += '</div>';
+        html += '<div class="slot-list">';
 
-        html += '<div class="response-row"><span class="badge-undecided">未定</span>';
-        if (undecidedList.length > 0) {
-          html += '<span class="response-names">' + esc(undecidedList.join('・')) + '</span>';
-          html += '<span class="response-count">(' + undecidedList.length + '人)</span>';
-        } else {
-          html += '<span class="no-response">なし</span>';
+        for (var j = 0; j < dateInfo.slots.length; j++) {
+          var slot = dateInfo.slots[j];
+          var slotKey = dateInfo.date + '|' + slot.slotStart;
+          var slotEndTime = SLOT_END_MAP[slot.slotStart] || '';
+          var timeLabel = formatHour(slot.slotStart) + '〜' + formatHour(slotEndTime);
+
+          var resp = (responses && responses[slotKey]) || { can: [], undecided: [] };
+          var canList = resp.can || [];
+          var undecidedList = resp.undecided || [];
+
+          if (!slot.available) {
+            // グレーアウトスロット — 体育館が閉まっている時間帯
+            html += '<div class="slot-row grayed">';
+            html += '<div class="slot-time">' + esc(timeLabel) + '</div>';
+            html += '<div class="slot-detail"><span class="grayed-label">施設利用不可</span></div>';
+            html += '</div>';
+          } else {
+            html += '<div class="slot-row">';
+            html += '<div class="slot-time">' + esc(timeLabel) + '</div>';
+            html += '<div class="slot-detail">';
+
+            // ○ 行ける
+            html += '<div class="resp-row"><span class="badge-can">○</span>';
+            if (canList.length > 0) {
+              html += '<span class="resp-names">' + esc(canList.join('・')) + '</span>';
+              html += '<span class="resp-count">(' + canList.length + '人)</span>';
+            } else {
+              html += '<span class="no-resp">なし</span>';
+            }
+            html += '</div>';
+
+            // △ 未定
+            html += '<div class="resp-row"><span class="badge-undecided">△</span>';
+            if (undecidedList.length > 0) {
+              html += '<span class="resp-names">' + esc(undecidedList.join('・')) + '</span>';
+              html += '<span class="resp-count">(' + undecidedList.length + '人)</span>';
+            } else {
+              html += '<span class="no-resp">なし</span>';
+            }
+            html += '</div>';
+
+            html += '</div>'; // slot-detail
+            html += '</div>'; // slot-row
+          }
         }
-        html += '</div>';
 
-        html += '</div></div>';
+        html += '</div>'; // slot-list
+        html += '</div>'; // date-block
       }
 
-      html += '</div>';
+      html += '</div>'; // date-list
       app.innerHTML = html;
+    }
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // ユーティリティ
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    /**
+     * 'HH:mm' → 'H時' 形式に変換する(先頭ゼロを除去)
+     * 例: '09:00' → '9時', '13:00' → '13時'
+     */
+    function formatHour(hhmm) {
+      if (!hhmm) return '';
+      var h = parseInt(hhmm.split(':')[0], 10);
+      return h + '時';
     }
 
     function showError(msg) {
       document.getElementById('app').innerHTML = '<div class="error">' + esc(msg) + '</div>';
     }
 
-    function formatDateLabel(date, startTime, endTime) {
-      var w = ['日','月','火','水','木','金','土'];
-      var d = new Date(date + 'T00:00:00+09:00');
-      return (d.getMonth()+1) + '/' + d.getDate() + '(' + w[d.getDay()] + ') ' + startTime + '〜' + endTime;
-    }
-
     function esc(s) {
-      if (typeof s !== 'string') return '';
-      return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+      if (typeof s !== 'string') return String(s || '');
+      return s
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
     }
   </script>
 </body>

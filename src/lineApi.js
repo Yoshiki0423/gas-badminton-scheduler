@@ -10,6 +10,7 @@
  *   - pushFlexMessage(userId, altText, flex)  : Push API で Flex Message を 1 件送信(F-1-3)
  *   - getLineProfile(userId)                  : プロフィール API で displayName を取得
  *   - computeLineSignature(secret, body)      : HMAC-SHA256 + Base64 で署名を計算
+ *   - verifyLineIdToken(idToken)              : LIFF の ID Token を検証して userId / displayName を返す(F-3)
  *
  * すべての API 呼び出しは UrlFetchApp.fetch を使い、`muteHttpExceptions: true` を付けて
  * HTTP エラーでも例外で死なずに、レスポンスコードで判定する設計にしています(=リトライ制御を明示化)。
@@ -19,6 +20,9 @@
 var LINE_API_REPLY_URL          = 'https://api.line.me/v2/bot/message/reply';
 var LINE_API_PUSH_URL           = 'https://api.line.me/v2/bot/message/push';
 var LINE_API_PROFILE_URL_PREFIX = 'https://api.line.me/v2/bot/profile/';
+
+/** LINE ID Token 検証エンドポイント(LIFF 用・F-3) */
+var LINE_API_VERIFY_TOKEN_URL = 'https://api.line.me/oauth2/v2.1/verify';
 
 /**
  * Reply API で平文メッセージを 1 件返信する
@@ -244,4 +248,96 @@ function computeLineSignature(secret, body) {
 
   var hmacBytes = Utilities.computeHmacSha256Signature(body, secret);
   return Utilities.base64Encode(hmacBytes);
+}
+
+// ─────────────────────────────────────────────
+// F-3: LIFF 用 ID Token 検証
+// ─────────────────────────────────────────────
+
+/**
+ * LINE ID Token を検証して userId / displayName を返す(F-3-4 / F-3-5 用)
+ *
+ * LIFF(LINE Internal Front-end Framework)から送られてきた ID Token を
+ * LINE のサーバーで検証し、誰のトークンかを確認します。
+ *
+ * 用語補足:
+ *   - ID Token(アイディー・トークン) = LIFF がログイン済みユーザーに発行する
+ *     「この人は本物ですよ」という証明書のような文字列。
+ *     GAS 側でこれを LINE サーバーに送って検証することで、
+ *     「本当にこのユーザーが送ってきた」ことを確かめられます。
+ *   - client_id = LINE Developers コンソールで確認できる「チャネル ID」。
+ *     スクリプトプロパティ `LINE_CHANNEL_ID` に設定します。
+ *
+ * 処理の流れ:
+ *   1. スクリプトプロパティから LINE_CHANNEL_ID を取得
+ *   2. LINE の検証エンドポイントに id_token と client_id を POST
+ *   3. 成功(200)なら { userId, displayName } を返す
+ *   4. 失敗(400 など)または例外 → null を返す(例外にしない)
+ *
+ * 注意: 検証失敗時は null を返します。呼び出し元は null チェックを必ず行ってください。
+ *
+ * @param {string} idToken - liff.getIDToken() で取得した ID Token 文字列
+ * @returns {{ userId: string, displayName: string } | null}
+ *   成功なら { userId, displayName }、失敗なら null
+ */
+function verifyLineIdToken(idToken) {
+  if (!idToken) {
+    console.warn('[WARN] verifyLineIdToken: idToken is empty');
+    return null;
+  }
+
+  var channelId = getProperty('LINE_CHANNEL_ID');
+  if (!channelId) {
+    console.warn('[WARN] verifyLineIdToken: LINE_CHANNEL_ID is not set in Script Properties');
+    return null;
+  }
+
+  try {
+    // application/x-www-form-urlencoded 形式でリクエストボディを組み立てる
+    // (= 「キー=値&キー=値」のようなシンプルな形式。JSON ではない)
+    var formBody = 'id_token=' + encodeURIComponent(idToken) +
+                   '&client_id=' + encodeURIComponent(channelId);
+
+    var response = UrlFetchApp.fetch(LINE_API_VERIFY_TOKEN_URL, {
+      method: 'post',
+      contentType: 'application/x-www-form-urlencoded',
+      payload: formBody,
+      muteHttpExceptions: true
+    });
+
+    var statusCode = response.getResponseCode();
+    var body = response.getContentText();
+
+    if (statusCode < 200 || statusCode >= 300) {
+      // 検証失敗(期限切れ・改ざんなど)は null で返す(例外にしない)
+      console.warn('[WARN] verifyLineIdToken: verification failed status=' + statusCode +
+                   ' body=' + body.substring(0, 200));
+      return null;
+    }
+
+    var parsed;
+    try {
+      parsed = JSON.parse(body);
+    } catch (parseError) {
+      console.warn('[WARN] verifyLineIdToken: failed to parse response body');
+      return null;
+    }
+
+    // 成功レスポンスの "sub" フィールドが userId
+    // "name" フィールドが displayName
+    if (!parsed || !parsed.sub) {
+      console.warn('[WARN] verifyLineIdToken: response missing "sub" field');
+      return null;
+    }
+
+    return {
+      userId: parsed.sub,
+      displayName: parsed.name || '(名前不明)'
+    };
+
+  } catch (fetchError) {
+    // ネットワークエラー等 → null で返す(ログは残す)
+    logError(fetchError, { phase: 'verifyLineIdToken.fetch' });
+    return null;
+  }
 }

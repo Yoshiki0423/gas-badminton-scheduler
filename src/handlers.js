@@ -7,11 +7,12 @@
  * 各関数の役割を 1 行で:
  *   - handleFollow(event)               : 新メンバー登録 + 歓迎メッセージ
  *   - handleUnfollow(event)             : メンバーを inactive に変更(削除はしない)
+ *   - handleVote(event)                 : D-018 でカルーセル廃止済み・no-op
  *   - handleDistributeSurvey()          : 全 active メンバーに 2 ボタン Flex Message を Push 配信(F-1-3 / F-3-6)
  *   - handleSendReminders()             : 未回答メンバーに 2 ボタン Flex Message を再送(F-1-5 / F-3-6)
- *   - handleLiffGetData(userId)         : LIFF 回答フォーム用データ取得(F-3-4)
- *   - handleLiffSubmit(userId, answers) : LIFF 回答送信・全削除→再挿入(F-3-4)
- *   - handleLiffGetAllResponses()       : LIFF 回答状況確認ページ用データ取得(F-3-5)
+ *   - handleLiffGetData(userId)         : F-4 グリッドフォーム用データ取得(日付×スロット構造)
+ *   - handleLiffSubmitFast(userId, answers) : F-4 回答一括送信(新データモデル)
+ *   - handleLiffGetAllResponses()       : F-4 LIFF 回答状況確認ページ用データ取得
  */
 
 /**
@@ -401,72 +402,22 @@ function _buildWelcomeMessage(displayName) {
 }
 
 // ─────────────────────────────────────────────
-// F-1-4: 回答収集機能
+// F-1-4: 回答収集機能(postback)
 // ─────────────────────────────────────────────
 
 /**
- * postback イベント処理 — F-1-4 の本体
+ * postback イベント処理 — D-018 でカルーセル廃止済み・no-op
  *
- * 後方互換として残す。Phase 3 以降もポストバック経由の回答は引き続き受け付ける。
+ * D-018 でカルーセル(postback 経由の個別スケジュール投票)は廃止済み。
+ * F-4 以降の回答は LIFF グリッドフォーム経由のみ。
+ * postback が来た場合は無視してログだけ残す。
  *
  * @param {Object} event - LINE postback イベント
  * @returns {void}
  */
 function handleVote(event) {
-  var userId = (event && event.source && event.source.userId) ? event.source.userId : '';
-  var replyToken = (event && event.replyToken) ? event.replyToken : '';
-
-  if (!userId) {
-    logError(new Error('handleVote: userId is missing'), { phase: 'handleVote.validate' });
-    return;
-  }
-
-  // (1) postback.data を parse する
-  //     形式: "action=vote&scheduleId=SCH_20260510143022_4831"
-  var data = (event && event.postback && event.postback.data) ? event.postback.data : '';
-  var params = _parsePostbackData(data);
-
-  if (params.action !== 'vote') {
-    console.log('[INFO] handleVote: unknown action=' + (params.action || '(empty)') + ' data=' + data);
-    return;
-  }
-
-  var scheduleId = params.scheduleId || '';
-  if (!scheduleId) {
-    logError(new Error('handleVote: scheduleId is missing in postback data'), {
-      phase: 'handleVote.validate',
-      data: data
-    });
-    return;
-  }
-
-  // (2) responses シートに記録(第3引数なし → デフォルト canAttend=true)
-  try {
-    var result = upsertResponse(userId, scheduleId);
-    console.log('[INFO] vote recorded: userId=' + _maskUserId(userId) +
-      ' scheduleId=' + scheduleId + ' action=' + result.action);
-  } catch (sheetError) {
-    logError(sheetError, { phase: 'handleVote.upsert', userId: _maskUserId(userId), scheduleId: scheduleId });
-    // シート書き込み失敗でも返信は続行
-  }
-
-  // (3) 返信
-  if (replyToken) {
-    try {
-      withRetry(function () {
-        return replyText(replyToken, '回答ありがとうございます!\n参加希望を受け付けました。');
-      }, { maxAttempts: DEFAULT_MAX_ATTEMPTS, baseDelayMs: 1000, label: 'replyVote' });
-    } catch (replyError) {
-      logError(replyError, { phase: 'handleVote.reply', userId: _maskUserId(userId) });
-    }
-  }
-
-  // (4) 全員回答チェック → 自動集計・通知(F-1-6 / F-1-7)
-  try {
-    _checkAllRespondedAndNotify();
-  } catch (checkError) {
-    logError(checkError, { phase: 'handleVote.checkAllResponded' });
-  }
+  // D-018 でカルーセル廃止済み。postback は受け付けるが何もしない。
+  console.log('[INFO] handleVote: deprecated since D-018, ignoring.');
 }
 
 // ─────────────────────────────────────────────
@@ -543,42 +494,51 @@ function handleSendReminders() {
 }
 
 // ─────────────────────────────────────────────
-// F-1-6 / F-1-7: 集計・判定・結果通知機能
+// F-1-6 / F-1-7: 集計・判定・結果通知機能(F-4 対応版)
 // ─────────────────────────────────────────────
 
 /** 「成立」と見なす最小参加人数(REQUIREMENTS.md §2 より) */
 var MIN_ATTENDEES = 4;
 
 /**
- * 集計・結果通知 — F-1-6 / F-1-7 の本体
+ * 集計・結果通知 — F-1-6 / F-1-7 の本体(F-4 スロット単位対応版)
+ *
+ * F-4 以降は (date, slotStart) 単位で集計し、
+ * MIN_ATTENDEES(4) 人以上 can で回答したスロットをアナウンスする。
  *
  * @returns {{viable: number, sent: number, skipped: number}}
  */
 function handleAggregateAndNotify() {
-  var schedules = getSchedules();
   var members = getActiveMembers();
 
-  if (schedules.length === 0 || members.length === 0) {
-    console.log('[INFO] aggregateAndNotify: スケジュールまたはメンバーがいません。集計スキップ。');
+  if (members.length === 0) {
+    console.log('[INFO] aggregateAndNotify: メンバーがいません。集計スキップ。');
     return { viable: 0, sent: 0, skipped: 0 };
   }
 
-  // scheduleId ごとに canAttend=true の票数を集計
-  var responses = getAllResponses();
-  var voteCounts = {};
+  // (date, slotStart) ごとに can の票数を集計
+  var responses = getAllSlotResponses();
+  var voteCounts = {};  // key: 'YYYY-MM-DD|HH:mm'
+
   for (var i = 0; i < responses.length; i++) {
     var r = responses[i];
-    if (r.canAttend === true) {
-      voteCounts[r.scheduleId] = (voteCounts[r.scheduleId] || 0) + 1;
+    if (r.answer === 'can') {
+      var key = r.date + '|' + r.slotStart;
+      voteCounts[key] = (voteCounts[key] || 0) + 1;
     }
   }
 
-  // MIN_ATTENDEES 人以上集まるスケジュールを抽出
-  var viable = schedules.filter(function (s) {
-    return (voteCounts[s.scheduleId] || 0) >= MIN_ATTENDEES;
-  });
+  // MIN_ATTENDEES 人以上集まるスロットを抽出
+  var viableSlots = [];
+  var slotKeys = Object.keys(voteCounts);
+  for (var k = 0; k < slotKeys.length; k++) {
+    if (voteCounts[slotKeys[k]] >= MIN_ATTENDEES) {
+      viableSlots.push(slotKeys[k]);
+    }
+  }
+  viableSlots.sort();  // 日付・時刻順でソート
 
-  var message = _buildResultMessage(viable, voteCounts);
+  var message = _buildSlotResultMessage(viableSlots, voteCounts);
 
   var sent = 0;
   var skipped = 0;
@@ -602,9 +562,9 @@ function handleAggregateAndNotify() {
     }
   }
 
-  console.log('[INFO] aggregateAndNotify 完了: viable=' + viable.length +
+  console.log('[INFO] aggregateAndNotify 完了: viable=' + viableSlots.length +
               ' sent=' + sent + ' skipped=' + skipped);
-  return { viable: viable.length, sent: sent, skipped: skipped };
+  return { viable: viableSlots.length, sent: sent, skipped: skipped };
 }
 
 /**
@@ -643,12 +603,57 @@ function _checkAllRespondedAndNotify() {
 }
 
 /**
- * 結果通知メッセージを組み立てる(内部用)
+ * スロット単位の結果通知メッセージを組み立てる(内部用・F-4 対応)
  *
- * @param {Array<Object>} viable - 4 人以上が参加できるスケジュール配列
- * @param {Object} voteCounts - scheduleId → 票数 のマップ
+ * @param {Array<string>} viableSlots - 成立スロットのキー配列 ('YYYY-MM-DD|HH:mm')
+ * @param {Object} voteCounts - スロットキー → can 票数 のマップ
  * @returns {string}
  * @private
+ */
+function _buildSlotResultMessage(viableSlots, voteCounts) {
+  var lines = ['【日程調整 結果】'];
+  var SLOT_ENDS = {
+    '09:00': '11:00', '11:00': '13:00', '13:00': '15:00',
+    '15:00': '17:00', '17:00': '19:00', '19:00': '21:00'
+  };
+
+  if (viableSlots.length === 0) {
+    lines.push('');
+    lines.push('申し訳ありません。' + MIN_ATTENDEES + ' 人以上参加できる時間帯が見つかりませんでした。');
+    lines.push('');
+    lines.push('改めて日程を調整します。しばらくお待ちください。');
+  } else {
+    lines.push('');
+    lines.push(MIN_ATTENDEES + ' 人以上が参加できる時間帯です:');
+    lines.push('');
+
+    for (var i = 0; i < viableSlots.length; i++) {
+      var parts = viableSlots[i].split('|');
+      var date = parts[0];
+      var slotStart = parts[1];
+      var slotEnd = SLOT_ENDS[slotStart] || '?';
+      var count = voteCounts[viableSlots[i]] || 0;
+
+      var weekdays = ['日', '月', '火', '水', '木', '金', '土'];
+      var d = new Date(date + 'T00:00:00+09:00');
+      var m = d.getMonth() + 1;
+      var day = d.getDate();
+      var w = weekdays[d.getDay()];
+
+      lines.push('・' + m + '/' + day + '(' + w + ') ' + slotStart + '〜' + slotEnd + ' (' + count + '人)');
+    }
+
+    lines.push('');
+    lines.push('詳細は改めてご連絡します。');
+  }
+
+  return lines.join('\n');
+}
+
+/**
+ * 後方互換: 旧 _buildResultMessage(viable, voteCounts) を呼ぶ箇所のために残す
+ *
+ * @deprecated F-4 以降は _buildSlotResultMessage を使う
  */
 function _buildResultMessage(viable, voteCounts) {
   var lines = ['【日程調整 結果】'];
@@ -663,7 +668,6 @@ function _buildResultMessage(viable, voteCounts) {
     lines.push(MIN_ATTENDEES + ' 人以上が参加できる日時です:');
     lines.push('');
 
-    // F-2-3: 同じ日時(date+startTime+endTime)でグループ化して体育館名を集約する
     var groups = {};
     var groupOrder = [];
     for (var i = 0; i < viable.length; i++) {
@@ -769,130 +773,197 @@ function _maskUserId(userId) {
 }
 
 // ─────────────────────────────────────────────
-// F-3: LIFF ハンドラー
+// F-4: LIFF ハンドラー(グリッドフォーム対応版)
 // ─────────────────────────────────────────────
 
 /**
- * LIFF 回答フォーム用データを取得する(F-3-4)
+ * F-4 グリッドフォーム用データを取得する
  *
- * Code.js の `liffGetSchedulesAndResponses(idToken)` から呼ばれる。
- * 直近 14 日のスケジュール一覧と、このユーザーの前回答を返す。
+ * Code.js の `_handleLiffApi` から `liff=getSchedules` で呼ばれる。
+ * 直近 14 日のスケジュールを日付単位にまとめ、6スロットの available フラグと
+ * このユーザーの前回答を返す。
  *
- * 返却データのイメージ:
+ * 返却データの形:
  *   {
- *     schedules: [
- *       { scheduleId: "SCH_xxx", date: "2026-05-15", startTime: "18:00", endTime: "20:00", facilityName: "体育館A" },
+ *     dates: [
+ *       {
+ *         date: 'YYYY-MM-DD',
+ *         dateLabel: '5/14(木)',
+ *         facilityInfo: '📍東総合 13〜21 / 鳥屋野 終日',
+ *         slots: [
+ *           { slotStart: '09:00', available: false },
+ *           { slotStart: '11:00', available: false },
+ *           { slotStart: '13:00', available: true },
+ *           ...
+ *         ]
+ *       },
  *       ...
  *     ],
- *     userAnswers: {
- *       "SCH_xxx": "can",       // 行ける
- *       "SCH_yyy": "undecided"  // 未定
- *       // 未回答のスケジュールはキーなし
- *     }
+ *     userAnswers: { 'YYYY-MM-DD|HH:mm': 'can'|'undecided', ... }
  *   }
  *
  * @param {string} userId - 検証済み LINE ユーザー ID
- * @returns {{ schedules: Array<Object>, userAnswers: Object }}
+ * @returns {{ dates: Array<Object>, userAnswers: Object }}
  */
 function handleLiffGetData(userId) {
-  // 直近 SURVEY_SCHEDULE_DAYS 日のスケジュールを取得
   var allSchedules = getSchedules();
   var schedules = _filterUpcomingSchedules(allSchedules, SURVEY_SCHEDULE_DAYS);
 
-  // スケジュールオブジェクトは HTML 側で必要な項目のみに絞る
-  var scheduleList = schedules.map(function (s) {
+  // 日付ごとにスケジュールをグループ化
+  var dateMap = {};       // { 'YYYY-MM-DD': [schedule, ...] }
+  var dateOrder = [];     // 日付の順序を保持
+
+  for (var i = 0; i < schedules.length; i++) {
+    var s = schedules[i];
+    var dateStr = String(s.date);
+    if (!dateMap[dateStr]) {
+      dateMap[dateStr] = [];
+      dateOrder.push(dateStr);
+    }
+    dateMap[dateStr].push(s);
+  }
+
+  dateOrder.sort();  // 日付昇順
+
+  var SLOT_STARTS = ['09:00', '11:00', '13:00', '15:00', '17:00', '19:00'];
+  var weekdays = ['日', '月', '火', '水', '木', '金', '土'];
+
+  var dates = dateOrder.map(function (dateStr) {
+    var daySchedules = dateMap[dateStr];
+    var d = new Date(dateStr + 'T00:00:00+09:00');
+    var m = d.getMonth() + 1;
+    var day = d.getDate();
+    var w = weekdays[d.getDay()];
+    var dateLabel = m + '/' + day + '(' + w + ')';
+
+    // 施設情報1行: "📍東総合 13〜21 / 鳥屋野 終日"
+    var facilityInfo = _buildFacilityInfo(daySchedules);
+
+    // 6スロットの available 判定
+    var slots = SLOT_STARTS.map(function (slotStart) {
+      return {
+        slotStart: slotStart,
+        available: _isSlotAvailable(slotStart, daySchedules)
+      };
+    });
+
     return {
-      scheduleId:   s.scheduleId,
-      date:         s.date,
-      startTime:    s.startTime,
-      endTime:      s.endTime,
-      facilityName: s.facilityName
+      date: dateStr,
+      dateLabel: dateLabel,
+      facilityInfo: facilityInfo,
+      slots: slots
     };
   });
 
-  // このユーザーの前回答を取得して { scheduleId: 'can'|'undecided' } の形に変換
-  var prevResponses = getResponsesByUserId(userId);
-  var userAnswers = {};
-  for (var i = 0; i < prevResponses.length; i++) {
-    var r = prevResponses[i];
-    if (r.canAttend === true) {
-      userAnswers[r.scheduleId] = 'can';
-    } else if (r.canAttend === 'undecided') {
-      userAnswers[r.scheduleId] = 'undecided';
-    }
-    // それ以外(false 等)はスキップ
-  }
+  // このユーザーの前回答を取得
+  var userAnswers = getSlotResponsesByUserId(userId);
 
-  return {
-    schedules: scheduleList,
-    userAnswers: userAnswers
-  };
+  return { dates: dates, userAnswers: userAnswers };
 }
 
 /**
- * LIFF フォームの回答を一括送信する(F-3-4)
+ * スロットが利用可能かどうか判定する(内部用・F-4-5 グレーアウト判定ロジック)
  *
- * Code.js の `liffSubmitResponses(idToken, answers)` から呼ばれる。
+ * 判定ルール:
+ *   - スロットの2時間区間(例: 13:00〜15:00)が、その日のいずれかの施設開放時間に
+ *     「完全に含まれる」場合 true
+ *   - 施設の note に「終日」が含まれる場合は全スロット true
+ *   - 施設が1つもない日は全スロット false
  *
- * 処理フロー(D-020「全削除→再挿入」パターン):
- *   1. この userId の既存回答をすべて削除する
- *   2. answers の各エントリを upsertResponse で挿入する
+ * @param {string} slotStart - "HH:mm" 形式 (例: '13:00')
+ * @param {Array<Object>} daySchedules - その日のスケジュール一覧
+ * @returns {boolean}
+ * @private
+ */
+function _isSlotAvailable(slotStart, daySchedules) {
+  if (!daySchedules || daySchedules.length === 0) return false;
+
+  var SLOT_END_MAP = {
+    '09:00': '11:00', '11:00': '13:00', '13:00': '15:00',
+    '15:00': '17:00', '17:00': '19:00', '19:00': '21:00'
+  };
+  var slotEnd = SLOT_END_MAP[slotStart];
+  if (!slotEnd) return false;
+
+  for (var i = 0; i < daySchedules.length; i++) {
+    var sch = daySchedules[i];
+    var note = String(sch.note || '');
+    var startTime = String(sch.startTime || '');
+    var endTime   = String(sch.endTime   || '');
+
+    // 「終日」は全スロット available
+    if (note.indexOf('終日') !== -1 || startTime.indexOf('終日') !== -1 || endTime.indexOf('終日') !== -1) {
+      return true;
+    }
+
+    // "HH:mm" → 時間の数値比較
+    if (startTime && endTime) {
+      // スロット全体がこの施設の開放時間に完全に含まれるか判定
+      if (slotStart >= startTime && slotEnd <= endTime) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+/**
+ * 施設情報の1行テキストを組み立てる(内部用)
+ *
+ * 形式: 📍{facilityName} {startTime}〜{endTime} / ...
+ * 「終日」の施設は "終日" と表示。
+ * 施設がない日は空文字を返す。
+ *
+ * @param {Array<Object>} daySchedules
+ * @returns {string}
+ * @private
+ */
+function _buildFacilityInfo(daySchedules) {
+  if (!daySchedules || daySchedules.length === 0) return '';
+
+  var parts = [];
+  for (var i = 0; i < daySchedules.length; i++) {
+    var sch = daySchedules[i];
+    var name = String(sch.facilityName || '');
+    var note = String(sch.note || '');
+    var startTime = String(sch.startTime || '');
+    var endTime   = String(sch.endTime   || '');
+
+    var timeStr;
+    if (note.indexOf('終日') !== -1 || startTime.indexOf('終日') !== -1 || endTime.indexOf('終日') !== -1) {
+      timeStr = '終日';
+    } else if (startTime && endTime) {
+      // "HH:mm" → "H〜H" 形式(先頭ゼロを除去して時間部分のみ)
+      var startH = startTime.split(':')[0].replace(/^0/, '');
+      var endH   = endTime.split(':')[0].replace(/^0/, '');
+      timeStr = startH + '〜' + endH;
+    } else {
+      timeStr = '';
+    }
+
+    parts.push(name + (timeStr ? ' ' + timeStr : ''));
+  }
+
+  return '📍' + parts.join(' / ');
+}
+
+/**
+ * F-4 LIFF フォームの回答を一括送信する(高速版)
+ *
+ * Code.js の `_handleLiffApi` から `liff=submit` で呼ばれる。
+ *
+ * 処理フロー:
+ *   1. この userId の既存スロット回答をすべて削除
+ *   2. answers の各エントリを一括 setValues で挿入(高速化)
  *
  * answers の形:
- *   { 'SCH_xxx': 'can', 'SCH_yyy': 'undecided' }
- *   ※ 未選択のスケジュールは含まれない(= 削除後に挿入されない = 行けない扱い)
+ *   { 'YYYY-MM-DD|HH:mm': 'can', 'YYYY-MM-DD|HH:mm': 'undecided' }
+ *   キーを '|' で分割して date と slotStart を取り出す
  *
- * AC-11(送信後に Bot メッセージなし): LINE Push API は呼ばない。
- *
- * @param {string} userId - 検証済み LINE ユーザー ID
- * @param {Object} answers - { scheduleId: 'can' | 'undecided' } のオブジェクト
+ * @param {string} userId  - 検証済み LINE ユーザー ID
+ * @param {Object} answers - { 'YYYY-MM-DD|HH:mm': 'can'|'undecided' }
  * @returns {{ deleted: number, inserted: number }}
- */
-function handleLiffSubmit(userId, answers) {
-  if (!userId) {
-    throw new Error('handleLiffSubmit: userId is required');
-  }
-  if (!answers || typeof answers !== 'object') {
-    throw new Error('handleLiffSubmit: answers must be an object');
-  }
-
-  // (1) この userId の既存回答を全削除
-  var deleted = clearResponsesByUserId(userId);
-
-  // (2) answers の各エントリを挿入
-  var inserted = 0;
-  var scheduleIds = Object.keys(answers);
-  for (var i = 0; i < scheduleIds.length; i++) {
-    var scheduleId = scheduleIds[i];
-    var answerValue = answers[scheduleId];
-
-    // 'can' → true(行ける) / 'undecided' → 'undecided'(未定)
-    var canAttend;
-    if (answerValue === 'can') {
-      canAttend = true;
-    } else if (answerValue === 'undecided') {
-      canAttend = 'undecided';
-    } else {
-      // 想定外の値はスキップしてログを残す
-      console.warn('[WARN] handleLiffSubmit: unknown answer value="' + answerValue +
-                   '" for scheduleId=' + scheduleId + '. Skipping.');
-      continue;
-    }
-
-    upsertResponse(userId, scheduleId, canAttend);
-    inserted++;
-  }
-
-  console.log('[INFO] handleLiffSubmit: userId=' + _maskUserId(userId) +
-              ' deleted=' + deleted + ' inserted=' + inserted);
-  return { deleted: deleted, inserted: inserted };
-}
-
-/**
- * LIFF 回答送信 — 一括書き込み版(高速)
- *
- * handleLiffSubmit と同じ目的だが、ロック取得・シート読み書きをそれぞれ
- * 1 回にまとめることで実行時間を短縮する。LIFF API (_handleLiffApi) から呼ぶ。
  */
 function handleLiffSubmitFast(userId, answers) {
   if (!userId) throw new Error('handleLiffSubmitFast: userId is required');
@@ -906,12 +977,12 @@ function handleLiffSubmitFast(userId, answers) {
     var lastRow = sheet.getLastRow();
     var deleted = 0;
 
-    // (1) この userId の既存行を一括削除
+    // (1) この userId の既存スロット回答行を一括削除
     if (lastRow >= 2) {
-      var colB = sheet.getRange(2, RCOL_USER_ID, lastRow - 1, 1).getValues();
+      var colB = sheet.getRange(2, SRCOL_USER_ID, lastRow - 1, 1).getValues();
       var toDelete = [];
       for (var i = 0; i < colB.length; i++) {
-        if (colB[i][0] === userId) toDelete.push(i + 2);
+        if (String(colB[i][0]) === userId) toDelete.push(i + 2);
       }
       toDelete.sort(function (a, b) { return b - a; });
       for (var d = 0; d < toDelete.length; d++) sheet.deleteRow(toDelete[d]);
@@ -920,21 +991,32 @@ function handleLiffSubmitFast(userId, answers) {
 
     // (2) 新しい回答を一括挿入
     var nowIso = _toIsoTokyo(new Date());
-    var scheduleIds = Object.keys(answers);
+    var keys = Object.keys(answers);
     var newRows = [];
-    for (var k = 0; k < scheduleIds.length; k++) {
-      var sid = scheduleIds[k];
-      var val = answers[sid];
-      var canAttend;
-      if (val === 'can') canAttend = true;
-      else if (val === 'undecided') canAttend = 'undecided';
-      else continue;
-      newRows.push([_generateResponseId(), userId, sid, canAttend, nowIso, nowIso]);
+
+    for (var k = 0; k < keys.length; k++) {
+      var slotKey = keys[k];
+      var val = answers[slotKey];
+      if (val !== 'can' && val !== 'undecided') {
+        console.warn('[WARN] handleLiffSubmitFast: unknown answer="' + val + '" key=' + slotKey + '. Skipping.');
+        continue;
+      }
+
+      // キーを '|' で分割して date と slotStart を取り出す
+      var pipeIdx = slotKey.indexOf('|');
+      if (pipeIdx < 0) {
+        console.warn('[WARN] handleLiffSubmitFast: invalid key format="' + slotKey + '". Skipping.');
+        continue;
+      }
+      var date      = slotKey.substring(0, pipeIdx);
+      var slotStart = slotKey.substring(pipeIdx + 1);
+
+      newRows.push([_generateResponseId(), userId, date, slotStart, val, nowIso, nowIso]);
     }
 
     if (newRows.length > 0) {
       var startRow = sheet.getLastRow() + 1;
-      sheet.getRange(startRow, 1, newRows.length, RESPONSES_HEADER.length).setValues(newRows);
+      sheet.getRange(startRow, 1, newRows.length, SLOT_RESPONSES_HEADER.length).setValues(newRows);
     }
 
     SpreadsheetApp.flush();
@@ -948,46 +1030,25 @@ function handleLiffSubmitFast(userId, answers) {
 }
 
 /**
- * LIFF 回答状況確認ページ用データを取得する(F-3-5)
+ * F-4 LIFF 回答状況確認ページ用データを取得する
  *
- * Code.js の `liffGetAllResponses(idToken)` から呼ばれる。
- * 全スケジュールに対する全メンバーの回答状況を返す(AC-12 対応)。
+ * Code.js の `_handleLiffApi` から `liff=getAllResponses` で呼ばれる。
+ * 全スロットに対する全メンバーの回答状況を返す。
  *
- * 返却データのイメージ:
+ * 返却データの形:
  *   {
- *     schedules: [
- *       { scheduleId: "SCH_xxx", date: "2026-05-15", startTime: "18:00", endTime: "20:00", facilityName: "体育館A" },
- *       ...
- *     ],
+ *     dates: [ { date, dateLabel, facilityInfo, slots: [...] } ],  // handleLiffGetData と同じ構造
  *     responses: {
- *       "SCH_xxx": {
- *         can: ["田中", "佐藤"],       // 行ける人の displayName リスト
- *         undecided: ["山田"]           // 未定の人の displayName リスト
- *       },
+ *       'YYYY-MM-DD|HH:mm': { can: ['田中', '佐藤'], undecided: ['山田'] },
  *       ...
  *     }
  *   }
  *
- * 設計ポイント:
- *   - members シートの displayName を使う(LINE API を都度叩かない)
- *   - 直近 14 日のスケジュールに絞る(handleLiffGetData と同じ期間)
- *
- * @returns {{ schedules: Array<Object>, responses: Object }}
+ * @returns {{ dates: Array<Object>, responses: Object }}
  */
 function handleLiffGetAllResponses() {
-  // 直近 14 日のスケジュール
-  var allSchedules = getSchedules();
-  var schedules = _filterUpcomingSchedules(allSchedules, SURVEY_SCHEDULE_DAYS);
-
-  var scheduleList = schedules.map(function (s) {
-    return {
-      scheduleId:   s.scheduleId,
-      date:         s.date,
-      startTime:    s.startTime,
-      endTime:      s.endTime,
-      facilityName: s.facilityName
-    };
-  });
+  // 日付ごとのグリッド情報(handleLiffGetData と同じ構造・userId は不要なので空文字)
+  var gridData = handleLiffGetData('');
 
   // userId → displayName のマップを members シートから作る
   var members = getActiveMembers();
@@ -996,34 +1057,39 @@ function handleLiffGetAllResponses() {
     userNameMap[members[i].userId] = members[i].displayName || '(名前不明)';
   }
 
-  // 全回答を取得して scheduleId ごとに集計
-  var allResponses = getAllResponses();
-
-  // まず scheduleId ごとの空の集計オブジェクトを作る
+  // 全スロット回答を取得して 'YYYY-MM-DD|HH:mm' キーごとに集計
+  var allResponses = getAllSlotResponses();
   var responseMap = {};
-  for (var j = 0; j < scheduleList.length; j++) {
-    responseMap[scheduleList[j].scheduleId] = { can: [], undecided: [] };
-  }
 
-  // 回答を振り分ける
   for (var k = 0; k < allResponses.length; k++) {
     var resp = allResponses[k];
-    if (!responseMap[resp.scheduleId]) {
-      // 直近 14 日の範囲外のスケジュールの回答はスキップ
-      continue;
+    var slotKey = resp.date + '|' + resp.slotStart;
+    if (!responseMap[slotKey]) {
+      responseMap[slotKey] = { can: [], undecided: [] };
     }
-
     var name = userNameMap[resp.userId] || '(不明)';
-
-    if (resp.canAttend === true) {
-      responseMap[resp.scheduleId].can.push(name);
-    } else if (resp.canAttend === 'undecided') {
-      responseMap[resp.scheduleId].undecided.push(name);
+    if (resp.answer === 'can') {
+      responseMap[slotKey].can.push(name);
+    } else if (resp.answer === 'undecided') {
+      responseMap[slotKey].undecided.push(name);
     }
   }
 
   return {
-    schedules: scheduleList,
+    dates: gridData.dates,
     responses: responseMap
   };
+}
+
+/**
+ * 後方互換: 旧 handleLiffSubmit を呼ぶ箇所のために残す
+ *
+ * @deprecated F-4 以降は handleLiffSubmitFast を使う
+ *
+ * @param {string} userId
+ * @param {Object} answers - { 'YYYY-MM-DD|HH:mm': 'can'|'undecided' } または旧形式
+ * @returns {{ deleted: number, inserted: number }}
+ */
+function handleLiffSubmit(userId, answers) {
+  return handleLiffSubmitFast(userId, answers);
 }
