@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>回答状況確認</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Hiragino Sans', 'Noto Sans JP', sans-serif;
+      background-color: #f5f5f5;
+      color: #333;
+      min-height: 100vh;
+    }
+    .header { background-color: #06C755; color: #fff; padding: 16px; text-align: center; }
+    .header h1 { font-size: 18px; font-weight: bold; }
+    .content { padding: 16px; max-width: 480px; margin: 0 auto; }
+    .loading { text-align: center; padding: 40px 16px; color: #666; }
+    .spinner {
+      width: 40px; height: 40px;
+      border: 4px solid #e0e0e0;
+      border-top-color: #06C755;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      margin: 0 auto 16px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .error {
+      background-color: #fff3f3;
+      border: 1px solid #ffcccc;
+      border-radius: 8px;
+      padding: 16px; margin: 16px 0;
+      color: #c0392b;
+      text-align: center; line-height: 1.6;
+    }
+    .empty { text-align: center; padding: 40px 16px; color: #666; line-height: 1.6; }
+    .guide-text { font-size: 13px; color: #666; margin-bottom: 16px; line-height: 1.6; }
+    .schedule-list { display: flex; flex-direction: column; gap: 12px; }
+    .schedule-card {
+      background-color: #fff;
+      border-radius: 8px;
+      padding: 14px;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.1);
+    }
+    .schedule-date { font-size: 15px; font-weight: bold; margin-bottom: 4px; color: #222; }
+    .schedule-facility { font-size: 13px; color: #666; margin-bottom: 12px; }
+    .response-summary { display: flex; flex-direction: column; gap: 8px; }
+    .response-row { display: flex; align-items: flex-start; gap: 8px; font-size: 13px; line-height: 1.5; }
+    .badge-can {
+      flex-shrink: 0;
+      display: inline-block; padding: 2px 8px;
+      background-color: #06C755; color: #fff;
+      border-radius: 12px; font-size: 12px; font-weight: bold;
+      min-width: 56px; text-align: center;
+    }
+    .badge-undecided {
+      flex-shrink: 0;
+      display: inline-block; padding: 2px 8px;
+      background-color: #757575; color: #fff;
+      border-radius: 12px; font-size: 12px; font-weight: bold;
+      min-width: 56px; text-align: center;
+    }
+    .response-names { color: #444; }
+    .response-count { font-size: 12px; color: #999; margin-left: 4px; }
+    .no-response { font-size: 13px; color: #aaa; }
+  </style>
+</head>
+<body>
+  <div class="header"><h1>回答状況確認</h1></div>
+  <div class="content" id="app">
+    <div class="loading" id="loading">
+      <div class="spinner"></div>
+      <p>読み込み中...</p>
+    </div>
+  </div>
+
+  <script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
+  <script>
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // ★ 設定値 — 自分の値に書き換えてください
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    var LIFF_ID     = '2010067159-k09pLDMl';
+    var GAS_API_URL = 'https://script.google.com/macros/s/AKfycbz0gRzFCoweztAOeYg5u5Y7TNOfFGhBXApUV59neZgtiVF_UZxUO7uC1BWdy3rUGrMjSw/exec';
+
+    // ─── 初期化 ───
+    window.onload = function () {
+      if (!LIFF_ID || LIFF_ID === 'REPLACE_WITH_LIFF_RESULTS_ID') {
+        showError('LIFF_ID が設定されていません。docs/liffResults.html を編集してください。');
+        return;
+      }
+
+      var timeoutId = setTimeout(function () {
+        showError('初期化がタイムアウトしました。ページを閉じて再度お試しください。');
+      }, 15000);
+
+      liff.init({ liffId: LIFF_ID })
+        .then(function () {
+          clearTimeout(timeoutId);
+          if (!liff.isLoggedIn()) { liff.login(); return; }
+          loadResponses();
+        })
+        .catch(function (err) {
+          clearTimeout(timeoutId);
+          showError('初期化エラー: ' + (err && err.message ? err.message : String(err)));
+        });
+    };
+
+    // ─── 回答状況取得 ───
+    function loadResponses() {
+      var idToken = liff.getIDToken();
+      if (!idToken) { showError('ログイン情報の取得に失敗しました。'); return; }
+
+      fetch(GAS_API_URL + '?liff=getAllResponses&idToken=' + encodeURIComponent(idToken))
+        .then(function (r) { return r.json(); })
+        .then(function (res) {
+          if (!res.ok) { showError('データの取得に失敗しました。(' + (res.error || '') + ')'); return; }
+          renderResults(res.data.schedules, res.data.responses);
+        })
+        .catch(function () { showError('通信エラーが発生しました。ページを閉じて再度お試しください。'); });
+    }
+
+    // ─── 回答状況描画 ───
+    function renderResults(schedules, responses) {
+      var app = document.getElementById('app');
+      if (!schedules || schedules.length === 0) {
+        app.innerHTML = '<div class="empty"><p>現在、確認できる日程がありません。</p></div>';
+        return;
+      }
+
+      var html = '<p class="guide-text">直近のスケジュールに対する回答状況です。</p>';
+      html += '<div class="schedule-list">';
+
+      for (var i = 0; i < schedules.length; i++) {
+        var s = schedules[i];
+        var dateLabel = formatDateLabel(s.date, s.startTime, s.endTime);
+        var resp = (responses && responses[s.scheduleId]) || { can: [], undecided: [] };
+        var canList = resp.can || [];
+        var undecidedList = resp.undecided || [];
+
+        html += '<div class="schedule-card">';
+        html += '<div class="schedule-date">' + esc(dateLabel) + '</div>';
+        html += '<div class="schedule-facility">' + esc(s.facilityName) + '</div>';
+        html += '<div class="response-summary">';
+
+        html += '<div class="response-row"><span class="badge-can">行ける</span>';
+        if (canList.length > 0) {
+          html += '<span class="response-names">' + esc(canList.join('・')) + '</span>';
+          html += '<span class="response-count">(' + canList.length + '人)</span>';
+        } else {
+          html += '<span class="no-response">まだ誰もいません</span>';
+        }
+        html += '</div>';
+
+        html += '<div class="response-row"><span class="badge-undecided">未定</span>';
+        if (undecidedList.length > 0) {
+          html += '<span class="response-names">' + esc(undecidedList.join('・')) + '</span>';
+          html += '<span class="response-count">(' + undecidedList.length + '人)</span>';
+        } else {
+          html += '<span class="no-response">なし</span>';
+        }
+        html += '</div>';
+
+        html += '</div></div>';
+      }
+
+      html += '</div>';
+      app.innerHTML = html;
+    }
+
+    function showError(msg) {
+      document.getElementById('app').innerHTML = '<div class="error">' + esc(msg) + '</div>';
+    }
+
+    function formatDateLabel(date, startTime, endTime) {
+      var w = ['日','月','火','水','木','金','土'];
+      var d = new Date(date + 'T00:00:00+09:00');
+      return (d.getMonth()+1) + '/' + d.getDate() + '(' + w[d.getDay()] + ') ' + startTime + '〜' + endTime;
+    }
+
+    function esc(s) {
+      if (typeof s !== 'string') return '';
+      return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+    }
+  </script>
+</body>
+</html>
