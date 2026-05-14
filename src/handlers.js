@@ -1057,7 +1057,7 @@ function _buildFacilityInfo(daySchedules) {
     parts.push(name + (timeStr ? ' ' + timeStr : ''));
   }
 
-  return parts.map(function(p, i) { return (i === 0 ? '📍' : '　') + p; }).join('\n');
+  return parts.join('\n');
 }
 
 /**
