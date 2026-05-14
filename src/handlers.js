@@ -5,9 +5,13 @@
  * 歓迎メッセージ送信)を行うファイルです。
  *
  * 各関数の役割を 1 行で:
- *   - handleFollow(event)          : 新メンバー登録 + 歓迎メッセージ
- *   - handleUnfollow(event)        : メンバーを inactive に変更(削除はしない)
- *   - handleDistributeSurvey()     : 全 active メンバーに Flex Message を Push 配信(F-1-3)
+ *   - handleFollow(event)               : 新メンバー登録 + 歓迎メッセージ
+ *   - handleUnfollow(event)             : メンバーを inactive に変更(削除はしない)
+ *   - handleDistributeSurvey()          : 全 active メンバーに 2 ボタン Flex Message を Push 配信(F-1-3 / F-3-6)
+ *   - handleSendReminders()             : 未回答メンバーに 2 ボタン Flex Message を再送(F-1-5 / F-3-6)
+ *   - handleLiffGetData(userId)         : LIFF 回答フォーム用データ取得(F-3-4)
+ *   - handleLiffSubmit(userId, answers) : LIFF 回答送信・全削除→再挿入(F-3-4)
+ *   - handleLiffGetAllResponses()       : LIFF 回答状況確認ページ用データ取得(F-3-5)
  */
 
 /**
@@ -120,40 +124,34 @@ function handleUnfollow(event) {
 // ─────────────────────────────────────────────
 
 /**
- * 1 バブルに収めるボタンの最大数
- *
- * LINE 公式デザインガイドでは 1 バブルあたり最大 3 ボタンを推奨。
- * 3 件を超える場合は Carousel(= 横スワイプで複数バブルを切り替える形式)に自動分割する。
- * 5-7 件の候補なら 2〜3 枚に分かれてスワイプで選べる形になる。
+ * 質問配信・リマインドで送るスケジュールの対象期間(今日から N 日以内)
  */
-var SURVEY_FLEX_MAX_PER_BUBBLE = 3;
-
-/** 質問配信・リマインドで送るスケジュールの対象期間(今日から N 日以内) */
 var SURVEY_SCHEDULE_DAYS = 14;
 
-/** LINE Carousel の最大バブル数(API 仕様上の上限) */
+/**
+ * (Phase 1 互換・内部用) Flex Carousel を組み立てる関数群
+ * D-021: F-3-6 で配信・リマインドからは呼ばれなくなるが、デバッグ・将来復活用として残す
+ */
+var SURVEY_FLEX_MAX_PER_BUBBLE = 3;
 var SURVEY_FLEX_MAX_BUBBLES = 12;
 
 /**
- * 質問配信 — F-1-3 の本体
+ * 質問配信 — F-1-3 / F-3-6 の本体
+ *
+ * F-3-6 変更点:
+ *   従来の Flex Carousel(スケジュールごとのボタン)から
+ *   「2 ボタン Flex Message」(回答する / 回答状況を見る)に変更。
  *
  * 処理の流れ:
- *   1. schedules シートから全スケジュール行を取得
- *   2. members シートから active なメンバーだけを取得(D-008 の方針)
- *   3. schedules を元に Flex Message を組み立てる
- *   4. 全 active メンバーに Push API で 1 対 1(1on1)送信する
+ *   1. schedules シートから直近 14 日のスケジュールを取得
+ *   2. members シートから active なメンバーだけを取得
+ *   3. 2 ボタン Flex Message を組み立てる
+ *   4. 全 active メンバーに Push API で 1 対 1 送信する
  *
- * 設計上の注意:
- *   - Push API はリクエスト 1 件 = メンバー 1 人への送信。10 名いれば 10 回 API を呼ぶ。
- *     無料枠(月 200 通)を意識した運用が前提(REQUIREMENTS.md §4-4)。
- *   - 1 人への送信が失敗しても他のメンバーへの送信は続行する設計(全体停止しない)。
- *   - withRetry(最大 3 回・指数バックオフ)を全送信に適用する。
- *
- * @returns {{sent: number, skipped: number}} 送信成功数・スキップ(失敗)数
+ * @returns {{sent: number, skipped: number}}
  */
 function handleDistributeSurvey() {
   // 新アンケート配信のタイミングで自動集計フラグをリセットする。
-  // これにより、今回の配信に対して全員が回答した時点で _checkAllRespondedAndNotify が再び動く。
   PropertiesService.getScriptProperties().deleteProperty('RESULTS_NOTIFIED');
 
   // (1) スケジュール取得 → 直近 SURVEY_SCHEDULE_DAYS 日以内に絞り込む
@@ -171,9 +169,9 @@ function handleDistributeSurvey() {
     return { sent: 0, skipped: 0 };
   }
 
-  // (3) Flex Message 組み立て
-  var flexContents = _buildSurveyFlex(schedules);
-  var altText = '【日程調整】参加できる日時を選んでください(' + schedules.length + '件)';
+  // (3) 2 ボタン Flex Message 組み立て(F-3-6)
+  var flexContents = _buildTwoButtonFlex('直近のスケジュールが届きました！\n参加できる日時を回答してください。');
+  var altText = '【日程調整】参加できる日時を回答してください(' + schedules.length + '件)';
 
   // (4) 全メンバーに Push 送信(失敗しても次のメンバーへ続行)
   var sent = 0;
@@ -198,7 +196,84 @@ function handleDistributeSurvey() {
 }
 
 /**
- * Flex Message の中身(contents)を組み立てる(内部用)
+ * 2 ボタン Flex Message を組み立てる(F-3-6 用・内部関数)
+ *
+ * 「回答する」「回答状況を見る」の 2 ボタンを並べた 1 枚の Bubble を返す。
+ * LIFF URL はスクリプトプロパティ LIFF_FORM_ID / LIFF_RESULTS_ID から生成する。
+ *
+ * @param {string} bodyText - body に表示するテキスト
+ * @returns {Object} LINE Flex Message の bubble オブジェクト
+ * @private
+ */
+function _buildTwoButtonFlex(bodyText) {
+  var liffFormId    = getProperty('LIFF_FORM_ID');
+  var liffResultsId = getProperty('LIFF_RESULTS_ID');
+
+  // LIFF URL の形式: https://liff.line.me/{LIFF_ID}
+  var liffFormUrl    = liffFormId    ? 'https://liff.line.me/' + liffFormId    : '#';
+  var liffResultsUrl = liffResultsId ? 'https://liff.line.me/' + liffResultsId : '#';
+
+  return {
+    type: 'bubble',
+    header: {
+      type: 'box',
+      layout: 'vertical',
+      backgroundColor: '#06C755',
+      contents: [{
+        type: 'text',
+        text: 'バドミントン日程調整',
+        weight: 'bold',
+        size: 'xl',
+        color: '#FFFFFF'
+      }]
+    },
+    body: {
+      type: 'box',
+      layout: 'vertical',
+      contents: [{
+        type: 'text',
+        text: bodyText,
+        wrap: true,
+        size: 'sm',
+        color: '#555555'
+      }]
+    },
+    footer: {
+      type: 'box',
+      layout: 'horizontal',
+      spacing: 'sm',
+      contents: [
+        {
+          type: 'button',
+          style: 'primary',
+          color: '#06C755',
+          height: 'sm',
+          action: {
+            type: 'uri',
+            label: '回答する',
+            uri: liffFormUrl
+          }
+        },
+        {
+          type: 'button',
+          style: 'secondary',
+          height: 'sm',
+          action: {
+            type: 'uri',
+            label: '回答状況を見る',
+            uri: liffResultsUrl
+          }
+        }
+      ]
+    }
+  };
+}
+
+/**
+ * Flex Message の中身(contents)を組み立てる(内部用・Phase 1 互換)
+ *
+ * D-021: F-3-6 以降は _buildTwoButtonFlex が使われるが、
+ * デバッグや将来復活の可能性を考慮してコードは残す。
  *
  * 候補が SURVEY_FLEX_MAX_PER_BUBBLE(3) 件以下なら 1 つの Bubble を返す。
  * 超える場合は Carousel(= 複数 Bubble を横スワイプで切り替える形式)に分割する。
@@ -226,15 +301,9 @@ function _buildSurveyFlex(schedules) {
 }
 
 /**
- * 1 つの Bubble を組み立てる(内部用)
+ * 1 つの Bubble を組み立てる(内部用・Phase 1 互換)
  *
- * Bubble 構造:
- *   header: 緑背景 + 「バドミントン日程調整」タイトル
- *   body:   案内テキスト + 区切り線 + 各候補のボタン(postback アクション)
- *
- * ボタンのアクション形式(F-1-4 との連携を考慮):
- *   data: "action=vote&scheduleId=SCH_xxxxxxxxxxxxxxxx_xxxx"
- *   displayText: ラベルと同じ文字列(ユーザーのトークルームに表示されるテキスト)
+ * D-021: 将来復活用として残す。
  *
  * @param {Array<Object>} schedules
  * @returns {Object} Flex Message の bubble オブジェクト
@@ -313,10 +382,6 @@ function _formatScheduleLabel(schedule) {
 /**
  * 歓迎メッセージの本文を組み立てる(内部用)
  *
- * D-001 で「事務的トーンでよい」「絵文字は使ってもよい(過度でなければ)」と決まっているため、
- * シンプルかつ親しみやすい文面にする。文面は将来 TBD-2 / TBD-3 で改修予定のため、
- * 1 か所(この関数)だけ書き換えれば変えられる構造にしている。
- *
  * @param {string} displayName
  * @returns {string} LINE で送信する平文メッセージ
  * @private
@@ -329,7 +394,7 @@ function _buildWelcomeMessage(displayName) {
     '今後、バドミントンの日程調整(質問配信・回答収集・結果通知)は',
     'すべて、この Bot との 1 対 1 トークでやり取りします。',
     '',
-    '質問が届いたら、表示されたボタンをタップしてご回答ください。',
+    '質問が届いたら、ボタンをタップして回答フォームを開いてください。',
     'よろしくお願いします!'
   ];
   return lines.join('\n');
@@ -342,16 +407,7 @@ function _buildWelcomeMessage(displayName) {
 /**
  * postback イベント処理 — F-1-4 の本体
  *
- * 処理の流れ:
- *   1. userId / replyToken を取り出す
- *   2. event.postback.data を parse → action=vote&scheduleId=SCH_xxx を分解
- *   3. action が 'vote' 以外ならログのみ残してスルー
- *   4. responses シートに upsert(同一 userId + scheduleId は上書き)
- *   5. Reply API で「回答ありがとうございます」を返信
- *
- * 設計上の注意:
- *   - シート書き込みが失敗しても返信は行う(UX 優先・後で手動確認可能)
- *   - replyToken がない場合(= LINE Developers コンソールのテスト送信など)は返信をスキップ
+ * 後方互換として残す。Phase 3 以降もポストバック経由の回答は引き続き受け付ける。
  *
  * @param {Object} event - LINE postback イベント
  * @returns {void}
@@ -384,7 +440,7 @@ function handleVote(event) {
     return;
   }
 
-  // (2) responses シートに記録
+  // (2) responses シートに記録(第3引数なし → デフォルト canAttend=true)
   try {
     var result = upsertResponse(userId, scheduleId);
     console.log('[INFO] vote recorded: userId=' + _maskUserId(userId) +
@@ -418,16 +474,13 @@ function handleVote(event) {
 // ─────────────────────────────────────────────
 
 /**
- * リマインド送信 — F-1-5 の本体
+ * リマインド送信 — F-1-5 / F-3-6 の本体
+ *
+ * F-3-6 変更点:
+ *   従来の「テキスト + Flex Carousel」から「2 ボタン Flex Message」に変更。
  *
  * まだ 1 件も回答していない active メンバーだけを対象に、
- * 「リマインドテキスト + 質問 Flex Message の再送」を Push API で送信する。
- *
- * 処理の流れ:
- *   1. schedules / active メンバーを取得(どちらも空なら即終了)
- *   2. getRespondedUserIds() で回答済み userId を Set に変換
- *   3. active メンバーから未回答者だけを抽出
- *   4. 未回答者全員に「テキスト + Flex」を Push 送信
+ * リマインドテキスト + 2 ボタン Flex Message を Push API で送信する。
  *
  * @returns {{sent: number, skipped: number, unresponded: number}}
  */
@@ -458,9 +511,9 @@ function handleSendReminders() {
     return { sent: 0, skipped: 0, unresponded: 0 };
   }
 
-  var flexContents = _buildSurveyFlex(schedules);
-  var altText = '【リマインド】参加できる日時を選んでください(' + schedules.length + '件)';
-  var reminderText = 'リマインドです。\nまだ回答が届いていません。\n下のメッセージのボタンをタップしてご回答ください。';
+  // 2 ボタン Flex Message(F-3-6)
+  var flexContents = _buildTwoButtonFlex('リマインドです。\nまだ回答が届いていません。\n下のボタンから回答をお願いします。');
+  var altText = '【リマインド】まだ回答が届いていません。ご回答をお願いします。';
 
   var sent = 0;
   var skipped = 0;
@@ -468,9 +521,6 @@ function handleSendReminders() {
   for (var j = 0; j < unresponded.length; j++) {
     var member = unresponded[j];
     try {
-      withRetry(function () {
-        return pushText(member.userId, reminderText);
-      }, { maxAttempts: DEFAULT_MAX_ATTEMPTS, baseDelayMs: 1000, label: 'reminderText' });
       withRetry(function () {
         return pushFlexMessage(member.userId, altText, flexContents);
       }, { maxAttempts: DEFAULT_MAX_ATTEMPTS, baseDelayMs: 1000, label: 'reminderFlex' });
@@ -501,12 +551,6 @@ var MIN_ATTENDEES = 4;
 
 /**
  * 集計・結果通知 — F-1-6 / F-1-7 の本体
- *
- * 処理の流れ:
- *   1. schedules / active メンバー / 全 responses を取得
- *   2. scheduleId ごとに canAttend=true の票数を集計
- *   3. MIN_ATTENDEES(4) 人以上集まるスケジュールを抽出
- *   4. 結果メッセージを組み立てて全 active メンバーに Push 送信
  *
  * @returns {{viable: number, sent: number, skipped: number}}
  */
@@ -566,14 +610,9 @@ function handleAggregateAndNotify() {
 /**
  * 全員が回答済みかを確認し、済んでいれば 1 回だけ集計・通知を実行する(内部用)
  *
- * handleVote の末尾から呼ばれる。
- * スクリプトプロパティ `RESULTS_NOTIFIED` を使って 2 重通知を防ぐ。
- * 手動の aggregateAndNotify() 実行時はこのフラグをリセットする。
- *
  * @private
  */
 function _checkAllRespondedAndNotify() {
-  // 既に通知済みならスキップ
   var alreadyNotified = getProperty('RESULTS_NOTIFIED');
   if (alreadyNotified === 'true') {
     return;
@@ -606,9 +645,6 @@ function _checkAllRespondedAndNotify() {
 /**
  * 結果通知メッセージを組み立てる(内部用)
  *
- * viable が空なら「成立する日時なし」、あれば日程一覧を列挙する。
- * F-2-3: 同じ日時で複数体育館がある場合は「/」区切りで使える体育館を併記する。
- *
  * @param {Array<Object>} viable - 4 人以上が参加できるスケジュール配列
  * @param {Object} voteCounts - scheduleId → 票数 のマップ
  * @returns {string}
@@ -639,8 +675,6 @@ function _buildResultMessage(viable, voteCounts) {
       }
       groups[key].facilities.push(s.facilityName);
       var count = voteCounts[s.scheduleId] || 0;
-      // 同じ日時で複数体育館の票数が異なる場合は最大値を代表値として使う
-      // (TBD-3 で通知文面が確定したタイミングで集計方法も再検討予定)
       if (count > groups[key].maxCount) {
         groups[key].maxCount = count;
       }
@@ -663,10 +697,6 @@ function _buildResultMessage(viable, voteCounts) {
  * 体育館名を除いた日時部分のラベルを返す(内部用)
  *
  * 生成例: "5/15(金) 18:00〜20:00"
- * _buildResultMessage が体育館名を別行で表示するために使う。
- * _formatScheduleLabel の共通ベースでもある。
- *
- * 'YYYY-MM-DDT00:00:00+09:00' とすることで Asia/Tokyo の日付として正しく解釈させる
  *
  * @param {{date: string, startTime: string, endTime: string}} schedule
  * @returns {string}
@@ -675,7 +705,7 @@ function _buildResultMessage(viable, voteCounts) {
 function _formatDateTimeLabel(schedule) {
   var weekdays = ['日', '月', '火', '水', '木', '金', '土'];
   var date = new Date(schedule.date + 'T00:00:00+09:00');
-  var m = date.getMonth() + 1; // getMonth() は 0 始まり
+  var m = date.getMonth() + 1;
   var d = date.getDate();
   var w = weekdays[date.getDay()];
   return m + '/' + d + '(' + w + ') ' + schedule.startTime + '〜' + schedule.endTime;
@@ -684,11 +714,8 @@ function _formatDateTimeLabel(schedule) {
 /**
  * スケジュール配列を今日から N 日以内のものだけに絞り込む(内部用)
  *
- * schedule.date は 'YYYY-MM-DD' 形式なので文字列比較でそのまま大小比較できる。
- * 今日の日付は Asia/Tokyo で取得する。
- *
- * @param {Array<Object>} schedules - getSchedules() が返す配列
- * @param {number} days - 今日から何日先まで含めるか(例: 14 なら今日〜14日後)
+ * @param {Array<Object>} schedules
+ * @param {number} days
  * @returns {Array<Object>}
  * @private
  */
@@ -706,15 +733,8 @@ function _filterUpcomingSchedules(schedules, days) {
 /**
  * postback の data 文字列を key=value& 形式で parse する(内部用)
  *
- * 例: "action=vote&scheduleId=SCH_20260510143022_4831"
- *   → { action: 'vote', scheduleId: 'SCH_20260510143022_4831' }
- *
- * 用語補足:
- *   parse(パース) = 文字列を分解して、プログラムが使いやすい形に変換すること。
- *   ここでは "&" で区切り、さらに "=" で区切ることで key と value に分ける。
- *
- * @param {string} data - postback.data の文字列
- * @returns {Object} parse 結果(key-value のオブジェクト)
+ * @param {string} data
+ * @returns {Object}
  * @private
  */
 function _parsePostbackData(data) {
@@ -737,11 +757,8 @@ function _parsePostbackData(data) {
 /**
  * userId をログ出力時にマスクする(内部用)
  *
- * LINE の userId は秘匿情報ではないが、ログに長文が並ぶと視認性が下がるため
- * 先頭 6 + 末尾 4 文字のみ表示する慣行的なマスキング。
- *
  * @param {string} userId
- * @returns {string} 例: "U12345...abcd"
+ * @returns {string}
  * @private
  */
 function _maskUserId(userId) {
@@ -749,4 +766,264 @@ function _maskUserId(userId) {
     return '(short)';
   }
   return userId.substring(0, 6) + '...' + userId.substring(userId.length - 4);
+}
+
+// ─────────────────────────────────────────────
+// F-3: LIFF ハンドラー
+// ─────────────────────────────────────────────
+
+/**
+ * LIFF 回答フォーム用データを取得する(F-3-4)
+ *
+ * Code.js の `liffGetSchedulesAndResponses(idToken)` から呼ばれる。
+ * 直近 14 日のスケジュール一覧と、このユーザーの前回答を返す。
+ *
+ * 返却データのイメージ:
+ *   {
+ *     schedules: [
+ *       { scheduleId: "SCH_xxx", date: "2026-05-15", startTime: "18:00", endTime: "20:00", facilityName: "体育館A" },
+ *       ...
+ *     ],
+ *     userAnswers: {
+ *       "SCH_xxx": "can",       // 行ける
+ *       "SCH_yyy": "undecided"  // 未定
+ *       // 未回答のスケジュールはキーなし
+ *     }
+ *   }
+ *
+ * @param {string} userId - 検証済み LINE ユーザー ID
+ * @returns {{ schedules: Array<Object>, userAnswers: Object }}
+ */
+function handleLiffGetData(userId) {
+  // 直近 SURVEY_SCHEDULE_DAYS 日のスケジュールを取得
+  var allSchedules = getSchedules();
+  var schedules = _filterUpcomingSchedules(allSchedules, SURVEY_SCHEDULE_DAYS);
+
+  // スケジュールオブジェクトは HTML 側で必要な項目のみに絞る
+  var scheduleList = schedules.map(function (s) {
+    return {
+      scheduleId:   s.scheduleId,
+      date:         s.date,
+      startTime:    s.startTime,
+      endTime:      s.endTime,
+      facilityName: s.facilityName
+    };
+  });
+
+  // このユーザーの前回答を取得して { scheduleId: 'can'|'undecided' } の形に変換
+  var prevResponses = getResponsesByUserId(userId);
+  var userAnswers = {};
+  for (var i = 0; i < prevResponses.length; i++) {
+    var r = prevResponses[i];
+    if (r.canAttend === true) {
+      userAnswers[r.scheduleId] = 'can';
+    } else if (r.canAttend === 'undecided') {
+      userAnswers[r.scheduleId] = 'undecided';
+    }
+    // それ以外(false 等)はスキップ
+  }
+
+  return {
+    schedules: scheduleList,
+    userAnswers: userAnswers
+  };
+}
+
+/**
+ * LIFF フォームの回答を一括送信する(F-3-4)
+ *
+ * Code.js の `liffSubmitResponses(idToken, answers)` から呼ばれる。
+ *
+ * 処理フロー(D-020「全削除→再挿入」パターン):
+ *   1. この userId の既存回答をすべて削除する
+ *   2. answers の各エントリを upsertResponse で挿入する
+ *
+ * answers の形:
+ *   { 'SCH_xxx': 'can', 'SCH_yyy': 'undecided' }
+ *   ※ 未選択のスケジュールは含まれない(= 削除後に挿入されない = 行けない扱い)
+ *
+ * AC-11(送信後に Bot メッセージなし): LINE Push API は呼ばない。
+ *
+ * @param {string} userId - 検証済み LINE ユーザー ID
+ * @param {Object} answers - { scheduleId: 'can' | 'undecided' } のオブジェクト
+ * @returns {{ deleted: number, inserted: number }}
+ */
+function handleLiffSubmit(userId, answers) {
+  if (!userId) {
+    throw new Error('handleLiffSubmit: userId is required');
+  }
+  if (!answers || typeof answers !== 'object') {
+    throw new Error('handleLiffSubmit: answers must be an object');
+  }
+
+  // (1) この userId の既存回答を全削除
+  var deleted = clearResponsesByUserId(userId);
+
+  // (2) answers の各エントリを挿入
+  var inserted = 0;
+  var scheduleIds = Object.keys(answers);
+  for (var i = 0; i < scheduleIds.length; i++) {
+    var scheduleId = scheduleIds[i];
+    var answerValue = answers[scheduleId];
+
+    // 'can' → true(行ける) / 'undecided' → 'undecided'(未定)
+    var canAttend;
+    if (answerValue === 'can') {
+      canAttend = true;
+    } else if (answerValue === 'undecided') {
+      canAttend = 'undecided';
+    } else {
+      // 想定外の値はスキップしてログを残す
+      console.warn('[WARN] handleLiffSubmit: unknown answer value="' + answerValue +
+                   '" for scheduleId=' + scheduleId + '. Skipping.');
+      continue;
+    }
+
+    upsertResponse(userId, scheduleId, canAttend);
+    inserted++;
+  }
+
+  console.log('[INFO] handleLiffSubmit: userId=' + _maskUserId(userId) +
+              ' deleted=' + deleted + ' inserted=' + inserted);
+  return { deleted: deleted, inserted: inserted };
+}
+
+/**
+ * LIFF 回答送信 — 一括書き込み版(高速)
+ *
+ * handleLiffSubmit と同じ目的だが、ロック取得・シート読み書きをそれぞれ
+ * 1 回にまとめることで実行時間を短縮する。LIFF API (_handleLiffApi) から呼ぶ。
+ */
+function handleLiffSubmitFast(userId, answers) {
+  if (!userId) throw new Error('handleLiffSubmitFast: userId is required');
+  if (!answers || typeof answers !== 'object') throw new Error('handleLiffSubmitFast: answers must be an object');
+
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(15000)) throw new Error('handleLiffSubmitFast: could not acquire lock');
+
+  try {
+    var sheet = getResponsesSheet();
+    var lastRow = sheet.getLastRow();
+    var deleted = 0;
+
+    // (1) この userId の既存行を一括削除
+    if (lastRow >= 2) {
+      var colB = sheet.getRange(2, RCOL_USER_ID, lastRow - 1, 1).getValues();
+      var toDelete = [];
+      for (var i = 0; i < colB.length; i++) {
+        if (colB[i][0] === userId) toDelete.push(i + 2);
+      }
+      toDelete.sort(function (a, b) { return b - a; });
+      for (var d = 0; d < toDelete.length; d++) sheet.deleteRow(toDelete[d]);
+      deleted = toDelete.length;
+    }
+
+    // (2) 新しい回答を一括挿入
+    var nowIso = _toIsoTokyo(new Date());
+    var scheduleIds = Object.keys(answers);
+    var newRows = [];
+    for (var k = 0; k < scheduleIds.length; k++) {
+      var sid = scheduleIds[k];
+      var val = answers[sid];
+      var canAttend;
+      if (val === 'can') canAttend = true;
+      else if (val === 'undecided') canAttend = 'undecided';
+      else continue;
+      newRows.push([_generateResponseId(), userId, sid, canAttend, nowIso, nowIso]);
+    }
+
+    if (newRows.length > 0) {
+      var startRow = sheet.getLastRow() + 1;
+      sheet.getRange(startRow, 1, newRows.length, RESPONSES_HEADER.length).setValues(newRows);
+    }
+
+    SpreadsheetApp.flush();
+    console.log('[INFO] handleLiffSubmitFast: userId=' + _maskUserId(userId) +
+                ' deleted=' + deleted + ' inserted=' + newRows.length);
+    return { deleted: deleted, inserted: newRows.length };
+
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * LIFF 回答状況確認ページ用データを取得する(F-3-5)
+ *
+ * Code.js の `liffGetAllResponses(idToken)` から呼ばれる。
+ * 全スケジュールに対する全メンバーの回答状況を返す(AC-12 対応)。
+ *
+ * 返却データのイメージ:
+ *   {
+ *     schedules: [
+ *       { scheduleId: "SCH_xxx", date: "2026-05-15", startTime: "18:00", endTime: "20:00", facilityName: "体育館A" },
+ *       ...
+ *     ],
+ *     responses: {
+ *       "SCH_xxx": {
+ *         can: ["田中", "佐藤"],       // 行ける人の displayName リスト
+ *         undecided: ["山田"]           // 未定の人の displayName リスト
+ *       },
+ *       ...
+ *     }
+ *   }
+ *
+ * 設計ポイント:
+ *   - members シートの displayName を使う(LINE API を都度叩かない)
+ *   - 直近 14 日のスケジュールに絞る(handleLiffGetData と同じ期間)
+ *
+ * @returns {{ schedules: Array<Object>, responses: Object }}
+ */
+function handleLiffGetAllResponses() {
+  // 直近 14 日のスケジュール
+  var allSchedules = getSchedules();
+  var schedules = _filterUpcomingSchedules(allSchedules, SURVEY_SCHEDULE_DAYS);
+
+  var scheduleList = schedules.map(function (s) {
+    return {
+      scheduleId:   s.scheduleId,
+      date:         s.date,
+      startTime:    s.startTime,
+      endTime:      s.endTime,
+      facilityName: s.facilityName
+    };
+  });
+
+  // userId → displayName のマップを members シートから作る
+  var members = getActiveMembers();
+  var userNameMap = {};
+  for (var i = 0; i < members.length; i++) {
+    userNameMap[members[i].userId] = members[i].displayName || '(名前不明)';
+  }
+
+  // 全回答を取得して scheduleId ごとに集計
+  var allResponses = getAllResponses();
+
+  // まず scheduleId ごとの空の集計オブジェクトを作る
+  var responseMap = {};
+  for (var j = 0; j < scheduleList.length; j++) {
+    responseMap[scheduleList[j].scheduleId] = { can: [], undecided: [] };
+  }
+
+  // 回答を振り分ける
+  for (var k = 0; k < allResponses.length; k++) {
+    var resp = allResponses[k];
+    if (!responseMap[resp.scheduleId]) {
+      // 直近 14 日の範囲外のスケジュールの回答はスキップ
+      continue;
+    }
+
+    var name = userNameMap[resp.userId] || '(不明)';
+
+    if (resp.canAttend === true) {
+      responseMap[resp.scheduleId].can.push(name);
+    } else if (resp.canAttend === 'undecided') {
+      responseMap[resp.scheduleId].undecided.push(name);
+    }
+  }
+
+  return {
+    schedules: scheduleList,
+    responses: responseMap
+  };
 }

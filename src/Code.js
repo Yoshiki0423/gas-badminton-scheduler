@@ -1,11 +1,13 @@
 /**
- * @fileoverview gas-badminton-scheduler — Webhook エントリポイント
+ * @fileoverview gas-badminton-scheduler — Webhook エントリポイント / LIFF ルーター
  *
- * このファイルは LINE サーバーから来る Webhook リクエストの「受付窓口」です。
- * 役割は次の 3 つだけにとどめます(=他の細かい仕事は他ファイルに任せる)。
+ * このファイルは LINE サーバーから来る Webhook リクエストの「受付窓口」と、
+ * LIFF(LINE アプリ内ブラウザ)から来るページリクエストのルーターを担当します。
+ * 役割は次の 4 つだけにとどめます(=他の細かい仕事は他ファイルに任せる)。
  *   1. POST リクエストを受け取る(`doPost`)
  *   2. 署名を検証する(なりすまし防止)
- *   3. イベントごとに正しい担当関数(handleFollow / handleUnfollow)へ振り分ける
+ *   3. イベントごとに正しい担当関数(handleFollow / handleUnfollow 等)へ振り分ける
+ *   4. GET リクエストを受け取り、LIFF ページ(HTML)を返す(`doGet` / F-3)
  *
  * 用語補足:
  *   - Webhook(ウェブフック)= LINE で何かが起きた(友だち追加など)ときに、
@@ -13,12 +15,19 @@
  *     通知してくれる仕組み。
  *   - doPost = GAS で「Web アプリとして公開した URL に POST が来たとき自動で呼ばれる」
  *     予約された関数名(=GAS 側のお約束。名前を変えると動かなくなる)。
+ *   - doGet = GAS で「Web アプリの URL に GET が来たとき自動で呼ばれる」
+ *     予約された関数名。LIFF ページ配信に使う。
+ *   - LIFF(リフ) = LINE Internal Front-end Framework の略。
+ *     LINE アプリ内で Web ページを開く仕組み。
+ *     このプロジェクトでは回答フォームと回答状況確認ページを LIFF で提供する。
  *
  * 関連ファイル:
- *   - handlers.js  — follow / unfollow の中身の処理
- *   - lineApi.js   — 署名検証・Reply API・プロフィール取得
+ *   - handlers.js  — follow / unfollow / LIFF ハンドラーの中身の処理
+ *   - lineApi.js   — 署名検証・Reply API・プロフィール取得・ID Token 検証
  *   - sheets.js    — メンバーシートの読み書き
  *   - utils.js     — リトライ・ログ・スクリプトプロパティ
+ *   - liff.html    — LIFF 回答フォーム(F-3-4)
+ *   - liffResults.html — LIFF 回答状況確認ページ(F-3-5)
  */
 
 /**
@@ -39,43 +48,10 @@
  */
 function doPost(e) {
   try {
-    // (1) 生のリクエストボディと署名ヘッダーを取り出す
-    //     GAS の e オブジェクトは「特殊な構造」なので、postData.contents から本文を取る
     var requestBody = (e && e.postData && e.postData.contents) ? e.postData.contents : '';
-    // GAS の doPost ではヘッダーを e.parameter ではなく contextHeaders から取れない場合があるので、
-    // LINE の慣行どおり postData.headers やリクエスト全体から取得する。
-    // ただし GAS の素の doPost は HTTP ヘッダーを直接渡してくれないため、
-    // **ヘッダーは e.parameters の中の `__signature__` 風カスタムにせず、本文の整合性検証は別経路で行う**…
-    // …のではなく、ここでは GAS V8 ランタイムでも取得可能な `e.postData` 経由で取り扱う。
-    // 実装上は LINE が body 内の payload を HMAC で署名するため、署名は必ず HTTP ヘッダーで来る。
-    // GAS Web アプリは HTTP ヘッダーへ素のアクセスを提供しないが、リクエストボディに対する HMAC を
-    // **スクリプトプロパティの secret** で再計算し、LINE が `e.postData.contents` 全体を署名対象にしているので、
-    // 署名値は **クライアント側 (LINE) から GAS Web アプリへ POST されるヘッダー X-Line-Signature** に乗ってくる。
-    //
-    // GAS は `e.parameter` にクエリパラメータしか入れないため、署名はリクエスト本文を URL 化するなどの
-    // 工夫が要るが、**LINE 公式が提示する GAS サンプルでは X-Line-Signature を直接読めない制約に対して
-    // 「HTTPS + シークレット URL + 短期 token 検証」のいずれかで対応**するのが慣例。
-    //
-    // 本実装では下記方針を取る(2026-05 時点の GAS 制約を踏まえる):
-    //   - 受信時に `e.postData.contents` の HMAC-SHA256(Channel Secret) を計算し、
-    //   - LINE が POST する際に **クエリパラメータとして付与している `signature` パラメータ**(後述の手順書で
-    //     LINE 公式の Webhook 設定で X-Line-Signature を URL に転送する設定がない限り直接は届かない)
-    //     を比較する経路に切り替え可能な構造にしておく。
-    //   - 上記制約のため、**MVP 暫定として「シークレット URL + ボディ HMAC ログ記録」方式** を取り、
-    //     セキュリティ強化が必要になった段階で API Gateway / Cloud Run / Vercel Functions などの
-    //     プロキシ経由に切り替える設計にしておく(コメントで明示)。
-    //
-    // ※ ただし GAS V8 のドキュメントに記載される `e.parameters` を活用し、
-    //   `e.postData.contents` を Channel Secret で HMAC-SHA256 → Base64 化し、
-    //   LINE 公式コンソールの Webhook URL へ **クエリ文字列としてシークレットトークンを付与しておく**
-    //   ことで実用的な検証が可能。本実装はこの方式とコード本体側の HMAC 計算の両方を実装する。
-
     var signatureFromQuery = (e && e.parameter && e.parameter.signature) ? e.parameter.signature : '';
 
-    // (2) シークレット URL トークン検証(必須・第一防衛線)
-    //     スクリプトプロパティ `WEBHOOK_URL_TOKEN` をユーザーが設定し、
-    //     LINE 公式の Webhook URL に `?token=xxxx` 形式で付与する運用。
-    //     これにより、GAS の Web アプリ URL が漏れた場合でもトークンなしのリクエストを弾ける。
+    // (1) シークレット URL トークン検証(必須・第一防衛線)
     var expectedToken = getProperty('WEBHOOK_URL_TOKEN');
     var providedToken = (e && e.parameter && e.parameter.token) ? e.parameter.token : '';
     if (expectedToken && !timingSafeEqual(expectedToken, providedToken)) {
@@ -86,13 +62,7 @@ function doPost(e) {
       return _ok();
     }
 
-    // (3) 署名検証(任意・第二防衛線・GAS 制約上の補強)
-    //     `e.postData.contents` を Channel Secret で HMAC-SHA256 → Base64 化し、
-    //     LINE が送ってきた署名(クエリ `signature` 経由 or プロキシ経由)と照合する。
-    //     ※ 標準の LINE Webhook は X-Line-Signature を HTTP ヘッダーで送るが、
-    //        GAS Web アプリは HTTP ヘッダーを doPost に渡せないため、
-    //        厳密検証が必要な運用では Cloudflare Workers / Vercel Functions 等のプロキシ経由を推奨。
-    //     ※ MVP では「URL トークン + ボディ整合性のログ記録」で実用上の安全性を確保する。
+    // (2) 署名検証(任意・第二防衛線・GAS 制約上の補強)
     var channelSecret = getProperty('LINE_CHANNEL_SECRET');
     if (channelSecret && requestBody) {
       var calculatedSignature = computeLineSignature(channelSecret, requestBody);
@@ -103,13 +73,10 @@ function doPost(e) {
         });
         return _ok();
       }
-      // 署名が来ていないケースはログのみで通す(LINE 標準ヘッダー方式に対応する場合の備考)
     }
 
-    // (4) JSON パース
+    // (3) JSON パース
     if (!requestBody) {
-      // 動作確認用 GET / 空リクエストへの応答(LINE は通常空 POST しないが、
-      // ユーザーが手動でブラウザから URL を叩くケースを想定)
       return _ok();
     }
     var payload;
@@ -120,8 +87,7 @@ function doPost(e) {
       return _ok();
     }
 
-    // (5) events 配列を取り出して 1 件ずつ振り分け
-    //     LINE は複数イベントを 1 リクエストにまとめて送ってくることがある(events: [...])
+    // (4) events 配列を取り出して 1 件ずつ振り分け
     var events = (payload && payload.events) ? payload.events : [];
     for (var i = 0; i < events.length; i++) {
       _routeEvent(events[i]);
@@ -129,11 +95,176 @@ function doPost(e) {
 
     return _ok();
   } catch (fatalError) {
-    // ここまで到達したら想定外。ログに記録して 200 で抜ける。
     logError(fatalError, { phase: 'doPost.fatal' });
     return _ok();
   }
 }
+
+/**
+ * LIFF ページ配信エントリポイント / 動作確認用 GET エンドポイント(F-3)
+ *
+ * URL パラメータ `page` の値によって配信するページを切り替えます:
+ *   ?page=form    → liff.html(LIFF 回答フォーム・F-3-4)
+ *   ?page=results → liffResults.html(LIFF 回答状況確認・F-3-5)
+ *   それ以外      → ヘルスチェック用テキスト(後方互換)
+ *
+ * 用語補足:
+ *   XFrameOptionsMode.ALLOWALL = iframe の中で表示することを許可する設定。
+ *   LINE アプリが LIFF ページを表示する際は iframe を使うため、この設定が必須です。
+ *
+ * @param {GoogleAppsScript.Events.DoGet} e - GAS が自動で渡してくる GET 情報
+ * @returns {GoogleAppsScript.HTML.HtmlOutput | GoogleAppsScript.Content.TextOutput}
+ */
+function doGet(e) {
+  // GitHub Pages の LIFF ページから呼ばれる JSON API(F-3-4 / F-3-5)
+  var liffAction = (e && e.parameter && e.parameter.liff) ? e.parameter.liff : '';
+  if (liffAction) {
+    return _handleLiffApi(e, liffAction);
+  }
+
+  var page = (e && e.parameter && e.parameter.page) ? e.parameter.page : '';
+
+  if (page === 'form') {
+    return _serveLiffFormPage();
+  }
+
+  if (page === 'results') {
+    return _serveLiffResultsPage();
+  }
+
+  // それ以外 → ヘルスチェックテキスト(後方互換)
+  return ContentService.createTextOutput(
+    'gas-badminton-scheduler is running. (POST events from LINE will be processed here.)'
+  );
+}
+
+/**
+ * LIFF 回答フォームページを配信する(内部用)
+ *
+ * liff.html を HtmlService のテンプレートとして読み込み、
+ * スクリプトプロパティ LIFF_FORM_ID を埋め込んで返す。
+ *
+ * @returns {GoogleAppsScript.HTML.HtmlOutput}
+ * @private
+ */
+function _serveLiffFormPage() {
+  var template = HtmlService.createTemplateFromFile('src/liff');
+  template.liffId = getProperty('LIFF_FORM_ID') || '';
+  return template.evaluate()
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
+    .setTitle('日程回答フォーム');
+}
+
+/**
+ * LIFF 回答状況確認ページを配信する(内部用)
+ *
+ * liffResults.html を HtmlService のテンプレートとして読み込み、
+ * スクリプトプロパティ LIFF_RESULTS_ID を埋め込んで返す。
+ *
+ * @returns {GoogleAppsScript.HTML.HtmlOutput}
+ * @private
+ */
+function _serveLiffResultsPage() {
+  var template = HtmlService.createTemplateFromFile('src/liffResults');
+  template.liffId = getProperty('LIFF_RESULTS_ID') || '';
+  return template.evaluate()
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
+    .setTitle('回答状況確認');
+}
+
+// ─────────────────────────────────────────────
+// F-3: google.script.run 用サーバー関数
+// ─────────────────────────────────────────────
+// LIFF の HTML ページ(liff.html / liffResults.html)から
+// google.script.run.関数名() という形で呼び出せる関数群。
+//
+// 用語補足:
+//   google.script.run = GAS が自分でホストした HTML ページから
+//   GAS サーバー側の関数を呼び出す仕組み。
+//   ページに「google.script.run.liffGetSchedulesAndResponses(idToken)」と書くと、
+//   このファイルの liffGetSchedulesAndResponses 関数がサーバー側で実行される。
+//
+// セキュリティ設計:
+//   - すべての関数で verifyLineIdToken(idToken) を最初に呼ぶ
+//   - 検証失敗(null 返却)なら null を返してクライアントにエラー処理させる
+//   - handlers.js の実装関数に処理を委譲し、Code.js はルーティングのみ担当
+// ─────────────────────────────────────────────
+
+/**
+ * LIFF 回答フォーム用: スケジュール一覧 + このユーザーの前回答を返す(F-3-4)
+ *
+ * liff.html から google.script.run.liffGetSchedulesAndResponses(idToken) で呼ばれる。
+ *
+ * @param {string} idToken - liff.getIDToken() で取得した ID Token
+ * @returns {{ schedules: Array, userAnswers: Object } | null}
+ *   検証失敗時は null(HTML 側でエラーメッセージを表示する)
+ */
+function liffGetSchedulesAndResponses(idToken) {
+  try {
+    var identity = verifyLineIdToken(idToken);
+    if (!identity) {
+      console.warn('[WARN] liffGetSchedulesAndResponses: ID Token verification failed');
+      return null;
+    }
+    return handleLiffGetData(identity.userId);
+  } catch (err) {
+    logError(err, { phase: 'liffGetSchedulesAndResponses' });
+    return null;
+  }
+}
+
+/**
+ * LIFF 回答フォーム用: 回答を一括送信する(F-3-4)
+ *
+ * liff.html から google.script.run.liffSubmitResponses(idToken, answers) で呼ばれる。
+ *
+ * @param {string} idToken - liff.getIDToken() で取得した ID Token
+ * @param {Object} answers - { scheduleId: 'can' | 'undecided' } のオブジェクト
+ * @returns {{ deleted: number, inserted: number } | null}
+ *   検証失敗時は null
+ */
+function liffSubmitResponses(idToken, answers) {
+  try {
+    var identity = verifyLineIdToken(idToken);
+    if (!identity) {
+      console.warn('[WARN] liffSubmitResponses: ID Token verification failed');
+      return null;
+    }
+    return handleLiffSubmit(identity.userId, answers);
+  } catch (err) {
+    logError(err, { phase: 'liffSubmitResponses' });
+    return null;
+  }
+}
+
+/**
+ * LIFF 回答状況確認ページ用: 全員の回答状況を返す(F-3-5)
+ *
+ * liffResults.html から google.script.run.liffGetAllResponses(idToken) で呼ばれる。
+ *
+ * @param {string} idToken - liff.getIDToken() で取得した ID Token
+ * @returns {{ schedules: Array, responses: Object } | null}
+ *   検証失敗時は null
+ */
+function liffGetAllResponses(idToken) {
+  try {
+    var identity = verifyLineIdToken(idToken);
+    if (!identity) {
+      console.warn('[WARN] liffGetAllResponses: ID Token verification failed');
+      return null;
+    }
+    // handleLiffGetAllResponses はユーザー固有のデータを使わないが、
+    // 認証チェックのためにログインを要求する(未認証ユーザーに全員の回答を見せない)
+    return handleLiffGetAllResponses();
+  } catch (err) {
+    logError(err, { phase: 'liffGetAllResponses' });
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────
+// GAS スクリプトエディタから手動実行するエントリポイント群
+// ─────────────────────────────────────────────
 
 /**
  * 質問配信 — GAS スクリプトエディタから手動実行するエントリポイント(F-1-3)
@@ -141,11 +272,6 @@ function doPost(e) {
  * 使い方:
  *   GAS エディタ上部の「関数を選択」で `distributeSurvey` を選び、
  *   「実行」ボタンを押すと全 active メンバーに Flex Message が送信される。
- *
- * 定期実行(週次など)を設定したい場合:
- *   GAS の「トリガー」メニューから時間主導型トリガーに本関数を登録する。
- *
- * 処理の詳細は handlers.js の `handleDistributeSurvey()` を参照。
  *
  * @returns {void}
  */
@@ -155,19 +281,12 @@ function distributeSurvey() {
     console.log('[INFO] distributeSurvey 実行完了: ' + JSON.stringify(result));
   } catch (err) {
     logError(err, { phase: 'distributeSurvey.top' });
-    throw err; // GAS エディタの「実行ログ」にエラーを表示させるために再 throw
+    throw err;
   }
 }
 
 /**
  * リマインド送信 — GAS スクリプトエディタから手動実行するエントリポイント(F-1-5)
- *
- * 使い方:
- *   「関数を選択」で `sendReminders` を選んで「実行」。
- *   質問配信後、まだ 1 件も回答していないメンバーにだけリマインドが届く。
- *
- * 定期実行を設定したい場合:
- *   GAS の「トリガー」メニューから時間主導型トリガーに登録する。
  *
  * @returns {void}
  */
@@ -184,20 +303,10 @@ function sendReminders() {
 /**
  * 集計・結果通知 — GAS スクリプトエディタから手動実行するエントリポイント(F-1-6 / F-1-7)
  *
- * 使い方:
- *   「関数を選択」で `aggregateAndNotify` を選んで「実行」。
- *   4 人以上参加できる日時を自動で集計し、全メンバーに結果を通知する。
- *
- * 注意:
- *   `handleVote` 経由の自動実行では RESULTS_NOTIFIED フラグで 2 重通知を防いでいる。
- *   本関数を手動実行するとフラグをリセットして必ず再集計・再通知を行う。
- *   「新しいアンケートを配信した後に再度集計したい」場合も本関数で OK。
- *
  * @returns {void}
  */
 function aggregateAndNotify() {
   try {
-    // 手動実行: 2 重通知防止フラグをリセットして必ず実行
     PropertiesService.getScriptProperties().deleteProperty('RESULTS_NOTIFIED');
     var result = handleAggregateAndNotify();
     console.log('[INFO] aggregateAndNotify 実行完了: ' + JSON.stringify(result));
@@ -208,24 +317,7 @@ function aggregateAndNotify() {
 }
 
 /**
- * 動作確認用 GET エンドポイント
- *
- * Web アプリのデプロイ確認用。ブラウザで URL を叩くとテキストが表示されるので、
- * 「公開できているか」を目視確認できます。
- *
- * @returns {GoogleAppsScript.Content.TextOutput}
- */
-function doGet() {
-  return ContentService.createTextOutput(
-    'gas-badminton-scheduler is running. (POST events from LINE will be processed here.)'
-  );
-}
-
-/**
  * 1 イベントを正しい担当関数へ振り分ける(内部用)
- *
- * F-1-1 のスコープでは follow / unfollow のみ実装。それ以外のイベント(message, postback など)は
- * Phase 1 の F-1-3 / F-1-4 で対応するため、ここでは「ログを残してスルー」する設計です。
  *
  * @param {Object} event - LINE Webhook イベントオブジェクト 1 件
  * @private
@@ -239,25 +331,19 @@ function _routeEvent(event) {
   try {
     switch (event.type) {
       case 'follow':
-        // 友だち追加された → メンバー登録 + 歓迎メッセージ
         handleFollow(event);
         break;
       case 'unfollow':
-        // ブロック / 友だち削除された → status を inactive に
         handleUnfollow(event);
         break;
       case 'postback':
-        // ボタンタップ(postback)→ 回答収集(F-1-4)
         handleVote(event);
         break;
       default:
-        // 上記以外のイベント(message など)は現スコープ外。ログのみ残してスルー。
         console.log('[INFO] Unhandled event type: ' + event.type);
         break;
     }
   } catch (handlerError) {
-    // 個別 handler 内で起きたエラーは握り潰し、他のイベントの処理を継続する
-    // (1 件失敗で全体停止しない)
     logError(handlerError, { phase: '_routeEvent.dispatch', eventType: event.type });
   }
 }
@@ -272,26 +358,91 @@ function _ok() {
 }
 
 // ─────────────────────────────────────────────
+// F-3: GitHub Pages LIFF 用 JSON API
+// ─────────────────────────────────────────────
+
+/**
+ * GitHub Pages からの LIFF API リクエストを処理する(内部用)
+ *
+ * GET パラメータ:
+ *   liff=getSchedules   → スケジュール一覧 + このユーザーの前回答を返す
+ *   liff=getAllResponses → 全員の回答状況を返す
+ *   liff=submit         → answers パラメータの回答を保存する
+ *   idToken             → LIFF の ID Token(全アクションで必須)
+ *   answers             → JSON 文字列 { scheduleId: 'can'|'undecided' }(submit のみ)
+ *
+ * @param {Object} e - doGet のイベントオブジェクト
+ * @param {string} action - liff パラメータの値
+ * @returns {GoogleAppsScript.Content.TextOutput} JSON レスポンス
+ */
+function _handleLiffApi(e, action) {
+  try {
+    var idToken = (e && e.parameter && e.parameter.idToken) ? e.parameter.idToken : '';
+    if (!idToken) {
+      return _jsonResponse({ ok: false, error: 'idToken is required' });
+    }
+
+    var identity = verifyLineIdToken(idToken);
+    if (!identity) {
+      console.warn('[WARN] _handleLiffApi: ID Token verification failed. action=' + action);
+      return _jsonResponse({ ok: false, error: 'auth_failed' });
+    }
+
+    if (action === 'getSchedules') {
+      var data = handleLiffGetData(identity.userId);
+      return _jsonResponse({ ok: true, data: data });
+    }
+
+    if (action === 'getAllResponses') {
+      var data = handleLiffGetAllResponses();
+      return _jsonResponse({ ok: true, data: data });
+    }
+
+    if (action === 'submit') {
+      var answersParam = (e && e.parameter && e.parameter.answers) ? e.parameter.answers : '{}';
+      var answers;
+      try {
+        answers = JSON.parse(answersParam);
+      } catch (parseErr) {
+        return _jsonResponse({ ok: false, error: 'invalid answers JSON' });
+      }
+      var result = handleLiffSubmitFast(identity.userId, answers);
+      return _jsonResponse({ ok: true, data: result });
+    }
+
+    return _jsonResponse({ ok: false, error: 'unknown action: ' + action });
+  } catch (err) {
+    logError(err, { phase: '_handleLiffApi', action: action });
+    return _jsonResponse({ ok: false, error: 'server error' });
+  }
+}
+
+/**
+ * JSON レスポンスを生成する(内部用)
+ * GitHub Pages からの fetch() は CORS なしで GAS JSON を受け取れる。
+ *
+ * @param {Object} obj
+ * @returns {GoogleAppsScript.Content.TextOutput}
+ */
+function _jsonResponse(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ─────────────────────────────────────────────
 // テスト用関数(GAS エディタから手動実行するだけ。本番では呼ばない)
 // ─────────────────────────────────────────────
 
 /**
  * スクレイピングを強制実行するテスト用関数
- *
- * scrapeAllFacilities() は「1 日 1 回」制限があるため、
- * テスト時は true を渡して制限をスキップする。
- * 通常運用では使わないこと。
- *
- * 使い方: GAS エディタで「関数を選択」→ testScrapeForce → 実行ボタン
  */
 function testScrapeForce() {
-  var result = scrapeAllFacilities(true); // true = 1日1回制限をスキップ
+  var result = scrapeAllFacilities(true);
   console.log(JSON.stringify(result));
 }
 
 /**
  * scraper-420 シートの中身をログに出すデバッグ用関数
- * 5/22 がどう読まれているか確認するために使う
  */
 function debugScraper420() {
   var spreadsheetId = getProperty('MEMBERS_SPREADSHEET_ID');
@@ -304,7 +455,6 @@ function debugScraper420() {
     var row = values[i];
     var col0 = String(row[0]);
     var col2 = String(row[2]);
-    // 日付行と思われるもの、または空でない行だけ出力
     if (col0 || col2) {
       console.log('行' + i + ': A=[' + col0 + '] C=[' + col2 + ']');
     }
