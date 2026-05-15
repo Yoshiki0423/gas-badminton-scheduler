@@ -24,7 +24,7 @@
  *   - scrapeFacilitySchedule(facility, ss) : 1 体育館のシート読み込み + パース + schedules 保存
  *   - parseScraperSheetValues(values, name) : シートの 2D 配列からスケジュール配列を抽出
  *   - checkAndScrapeIfUpdated()        : シート内容のハッシュ比較 → 更新あり時に scrape + 配信
- *   - setupDailyTrigger()              : checkAndScrapeIfUpdated の毎朝 6 時トリガーを設定
+ *   - setupDailyTrigger()              : checkAndScrapeIfUpdated の毎朝 7 時トリガーを設定
  *
  * エラーポリシー(REQUIREMENTS.md §4-2):
  *   - 体育館シート取得失敗 → 前回データをそのまま使い続ける(即時リトライしない)
@@ -86,11 +86,30 @@ var HASH_KEY_PREFIX = 'HASH_FACILITY_';
 /** ScriptProperties キー: 施設ごとの連続失敗カウント接頭辞(例: FAIL_COUNT_FACILITY_420) */
 var FAIL_COUNT_KEY_PREFIX = 'FAIL_COUNT_FACILITY_';
 
+/**
+ * ScriptProperties キー: 施設ごとに「スクレイピングで取得した月の一覧」を一時保存する接頭辞
+ * 値は JSON.stringify(["2026-05","2026-06"]) のような YYYY-MM 配列(ソート済み)
+ * 例: SCRAPED_MONTHS_FACILITY_420
+ * (D-018) デバッグ用に通知後も消さずに残す設計
+ */
+var SCRAPED_MONTHS_KEY_PREFIX = 'SCRAPED_MONTHS_FACILITY_';
+
+/**
+ * ScriptProperties キー: 施設ごとに「最後に新月通知を送った月(YYYY-MM)」を記録する接頭辞
+ * 例: LAST_NOTIFIED_MONTH_FACILITY_420
+ */
+var LAST_NOTIFIED_MONTH_KEY_PREFIX = 'LAST_NOTIFIED_MONTH_FACILITY_';
+
+/**
+ * ScriptProperties キー: 「全施設の予定が揃った」通知を送った最後の月(YYYY-MM)
+ */
+var ALL_FACILITIES_NOTIFIED_MONTH_KEY = 'ALL_FACILITIES_NOTIFIED_MONTH';
+
 /** checkAndScrapeIfUpdated を呼ぶトリガーの関数名 */
 var TRIGGER_FUNCTION_NAME = 'checkAndScrapeIfUpdated';
 
 /** 毎朝トリガーを起動する時刻(0-23) */
-var TRIGGER_HOUR = 6;
+var TRIGGER_HOUR = 7;
 
 /**
  * バドミントン列のデフォルト列インデックス(0-based)
@@ -290,7 +309,49 @@ function scrapeFacilitySchedule(facility, ss) {
     })(schedules[i]);
   }
 
+  // ─── 月一覧を ScriptProperties に一時保存(D-018: 新月検知用) ───
+  // パース済みの schedules から "YYYY-MM" を重複なく抽出してソートして保存する
+  // キー: SCRAPED_MONTHS_FACILITY_<facilityId>
+  // 通知後も残す(デバッグ用・D-018)
+  _saveScrapedMonths(facility.facilityId, schedules);
+
   return savedCount;
+}
+
+/**
+ * パース済みスケジュール配列から月一覧を抽出して ScriptProperties に保存する(内部用)
+ *
+ * スケジュールの date("YYYY-MM-DD")から "YYYY-MM" 部分を抽出し、
+ * 重複を除いてソートした配列を JSON.stringify して ScriptProperties に保存する。
+ * 通知後も消さず残す(デバッグ用・D-018)。
+ *
+ * @param {number} facilityId - 施設 ID
+ * @param {Array<{date: string}>} schedules - parseScraperSheetValues の戻り値
+ * @private
+ */
+function _saveScrapedMonths(facilityId, schedules) {
+  // "YYYY-MM" の重複なし一覧を作る
+  var monthMap = {};
+  for (var i = 0; i < schedules.length; i++) {
+    var date = schedules[i].date; // "YYYY-MM-DD"
+    if (date && date.length >= 7) {
+      var ym = date.substring(0, 7); // "YYYY-MM"
+      monthMap[ym] = true;
+    }
+  }
+
+  // キーを配列にしてソート
+  var months = [];
+  for (var ym in monthMap) {
+    if (monthMap.hasOwnProperty(ym)) {
+      months.push(ym);
+    }
+  }
+  months.sort();
+
+  var key = SCRAPED_MONTHS_KEY_PREFIX + facilityId;
+  PropertiesService.getScriptProperties().setProperty(key, JSON.stringify(months));
+  console.log('[INFO] _saveScrapedMonths: facilityId=' + facilityId + ' → ' + JSON.stringify(months));
 }
 
 /**
@@ -343,6 +404,11 @@ function parseScraperSheetValues(values, facilityName) {
   }
 
   // ─── データ行をループ ───
+  // prevDay: 直前のデータ行の「日」の値。月またぎ検知に使う(D-018 修正)
+  // 月またぎ判定: 今の日(dayNum)が直前の日(prevDay)より大きく減った場合 → 月が変わった
+  // 例: 31日 → 1日 のように dayNum < prevDay のときに month を 1 増やす
+  var prevDay = null;
+
   for (var i = 0; i < values.length; i++) {
     var dataRow = values[i];
 
@@ -356,6 +422,19 @@ function parseScraperSheetValues(values, facilityName) {
     }
 
     var dayNum = parseInt(dateMatch[1], 10);
+
+    // 月またぎ検知(D-018): 直前の日より15日以上減った場合のみ翌月と判定する
+    // しきい値15: 同月内で15日以上後退する暦上のケースはないため誤検知を防ぐ
+    if (prevDay !== null && (prevDay - dayNum) > 15) {
+      month++;
+      if (month > 12) {
+        month = 1;
+        year++;
+      }
+      console.log('[INFO] parseScraperSheetValues: ' + facilityName + ' 月またぎを検知(' + prevDay + '日 → ' + dayNum + '日)。' + year + '-' + ('0' + month).slice(-2) + ' に移行。');
+    }
+    prevDay = dayNum;
+
     var fullDate = _buildDate(year, month, dayNum);
 
     // バドミントン列の値を取得
@@ -399,7 +478,7 @@ function parseScraperSheetValues(values, facilityName) {
 /**
  * 更新検知 → スクレイピング → 質問配信 のメインフロー
  *
- * GAS の time-based trigger から毎朝 6 時に呼ばれる。
+ * GAS の time-based trigger から毎朝 7 時に呼ばれる。
  * 処理の流れ:
  *   1. enabled な施設それぞれの IMPORTHTML シートを読み込む
  *   2. 前回取得時の SHA-256 ハッシュ(ScriptProperties に保存)と比較する
@@ -472,6 +551,14 @@ function checkAndScrapeIfUpdated() {
       logError(scrapeErr, { phase: 'checkAndScrapeIfUpdated.scrape' });
     }
 
+    // 新月検知・通知(D-018 F-2-5)
+    // scrapeAllFacilities 実行後に SCRAPED_MONTHS_FACILITY_* が更新済みであることを前提とする
+    try {
+      _checkAndNotifyNewMonths();
+    } catch (notifyErr) {
+      logError(notifyErr, { phase: 'checkAndScrapeIfUpdated.notify' });
+    }
+
     try {
       handleDistributeSurvey();
     } catch (distributeErr) {
@@ -493,7 +580,7 @@ function checkAndScrapeIfUpdated() {
 }
 
 /**
- * checkAndScrapeIfUpdated を毎朝 6 時に実行するトリガーを設定する
+ * checkAndScrapeIfUpdated を毎朝 7 時に実行するトリガーを設定する
  *
  * 既存トリガーがある場合は重複作成しない。
  * GAS のスクリプトエディタから 1 回だけ手動実行して設定する。
@@ -514,7 +601,7 @@ function setupDailyTrigger() {
     }
   }
 
-  // 毎朝 TRIGGER_HOUR 時(6:00-7:00 の間)に実行するトリガーを作成
+  // 毎朝 TRIGGER_HOUR 時(7:00-8:00 の間)に実行するトリガーを作成
   ScriptApp.newTrigger(TRIGGER_FUNCTION_NAME)
     .timeBased()
     .everyDays(1)
@@ -724,6 +811,231 @@ function _incrementFailCountAndNotifyIfNeeded(facility) {
       } catch (notifyErr) {
         logError(notifyErr, { phase: '_incrementFailCountAndNotifyIfNeeded.push', facilityId: facility.facilityId });
       }
+    }
+  }
+}
+
+// ─────────────────────────────────────────────
+// F-2-5: 新月検知・通知ロジック
+// ─────────────────────────────────────────────
+
+/**
+ * 全施設を対象に新月の公開を検知し、メンバーへ通知する(内部用・D-018)
+ *
+ * 処理の流れ:
+ *   1. FACILITIES の enabled: true な施設をループ
+ *   2. SCRAPED_MONTHS_FACILITY_<id> を読む(なければスキップ)
+ *   3. LAST_NOTIFIED_MONTH_FACILITY_<id> を読む(なければ空文字)
+ *   4. スクレイピングで得た月のうち lastNotified より大きいものがあれば新月ありと判定
+ *   5. 新月が見つかった施設に対して _notifyNewFacilityMonth() を呼ぶ
+ *   6. LAST_NOTIFIED_MONTH_FACILITY_<id> を新月に更新
+ *   7. 全 enabled 施設の LAST_NOTIFIED_MONTH_FACILITY_<id> が同じ値になったら
+ *      ALL_FACILITIES_NOTIFIED_MONTH と比較して新規なら _notifyAllFacilitiesReady() を呼ぶ
+ *   8. ALL_FACILITIES_NOTIFIED_MONTH を更新
+ *
+ * エラーポリシー(D-018): 各施設の通知失敗は logError で記録して次の施設へ続行する
+ *
+ * @private
+ */
+function _checkAndNotifyNewMonths() {
+  var props = PropertiesService.getScriptProperties();
+
+  for (var i = 0; i < FACILITIES.length; i++) {
+    var facility = FACILITIES[i];
+    if (!facility.enabled) {
+      continue;
+    }
+
+    // ScriptProperties から SCRAPED_MONTHS_FACILITY_<id> を読む
+    var scrapedKey = SCRAPED_MONTHS_KEY_PREFIX + facility.facilityId;
+    var scrapedRaw = props.getProperty(scrapedKey);
+    if (!scrapedRaw) {
+      // スクレイピング結果が保存されていない場合はスキップ
+      console.log('[INFO] _checkAndNotifyNewMonths: ' + facility.facilityName + ' の SCRAPED_MONTHS が未設定。スキップします。');
+      continue;
+    }
+
+    var scrapedMonths;
+    try {
+      scrapedMonths = JSON.parse(scrapedRaw);
+    } catch (parseErr) {
+      logError(parseErr, { phase: '_checkAndNotifyNewMonths.parse', facilityId: facility.facilityId });
+      continue;
+    }
+
+    if (!scrapedMonths || scrapedMonths.length === 0) {
+      continue;
+    }
+
+    // LAST_NOTIFIED_MONTH_FACILITY_<id> を読む(なければ空文字)
+    var lastNotifiedKey = LAST_NOTIFIED_MONTH_KEY_PREFIX + facility.facilityId;
+    var lastNotified = props.getProperty(lastNotifiedKey) || '';
+
+    // scrapedMonths のうち lastNotified より大きい最小の月(次の未通知月)を探す
+    // scrapedMonths はソート済みなので最初にヒットした値が最も古い未通知月
+    // 複数月まとめてスクレイピングされた場合も順番通りに1件ずつ処理する
+    var newMonth = null;
+    for (var j = 0; j < scrapedMonths.length; j++) {
+      if (scrapedMonths[j] > lastNotified) {
+        newMonth = scrapedMonths[j];
+        break;
+      }
+    }
+
+    if (!newMonth) {
+      console.log('[INFO] _checkAndNotifyNewMonths: ' + facility.facilityName + ' に新月なし(lastNotified=' + lastNotified + ')');
+      continue;
+    }
+
+    // 新月あり → 施設ごと通知 + lastNotified を更新
+    console.log('[INFO] _checkAndNotifyNewMonths: ' + facility.facilityName + ' に新月を検知。' + newMonth + ' の通知を送ります。');
+    try {
+      _notifyNewFacilityMonth(facility, newMonth);
+    } catch (notifyErr) {
+      logError(notifyErr, { phase: '_checkAndNotifyNewMonths.notifyFacility', facilityId: facility.facilityId });
+      // 通知失敗でも lastNotified は更新しない(次回再試行できるように)
+      continue;
+    }
+    props.setProperty(lastNotifiedKey, newMonth);
+  }
+
+  // ─── 全施設揃い通知の判定 ───
+  // 全 enabled 施設の LAST_NOTIFIED_MONTH_FACILITY_<id> が同じ値かチェック
+  var allNotifiedMonth = _getCommonLastNotifiedMonth(props);
+  if (!allNotifiedMonth) {
+    // 全施設が揃っていない(施設ごとに異なる月または未設定)
+    return;
+  }
+
+  var allFacilitiesNotified = props.getProperty(ALL_FACILITIES_NOTIFIED_MONTH_KEY) || '';
+  if (allFacilitiesNotified === allNotifiedMonth) {
+    // 全施設揃い通知は既に送済み
+    console.log('[INFO] _checkAndNotifyNewMonths: 全施設揃い通知は送済み(' + allNotifiedMonth + ')。スキップします。');
+    return;
+  }
+
+  // 新規の全施設揃い通知
+  console.log('[INFO] _checkAndNotifyNewMonths: 全施設で ' + allNotifiedMonth + ' が揃いました。全施設揃い通知を送ります。');
+  try {
+    _notifyAllFacilitiesReady(allNotifiedMonth);
+  } catch (allNotifyErr) {
+    logError(allNotifyErr, { phase: '_checkAndNotifyNewMonths.notifyAll' });
+    // 通知失敗時は ALL_FACILITIES_NOTIFIED_MONTH を更新しない(次回再試行)
+    return;
+  }
+  props.setProperty(ALL_FACILITIES_NOTIFIED_MONTH_KEY, allNotifiedMonth);
+}
+
+/**
+ * 全 enabled 施設の LAST_NOTIFIED_MONTH_FACILITY_<id> が同じ値かチェックする(内部用)
+ *
+ * 全施設が同じ YYYY-MM を持っていればその値を、揃っていなければ null を返す。
+ * enabled 施設が 1 件もない場合も null を返す。
+ *
+ * @param {GoogleAppsScript.Properties.Properties} props - PropertiesService.getScriptProperties()
+ * @returns {string|null} 全施設共通の YYYY-MM、揃っていなければ null
+ * @private
+ */
+function _getCommonLastNotifiedMonth(props) {
+  var commonMonth = null;
+  var enabledCount = 0;
+
+  for (var i = 0; i < FACILITIES.length; i++) {
+    var facility = FACILITIES[i];
+    if (!facility.enabled) {
+      continue;
+    }
+    enabledCount++;
+
+    var key = LAST_NOTIFIED_MONTH_KEY_PREFIX + facility.facilityId;
+    var month = props.getProperty(key) || '';
+
+    if (!month) {
+      // 未設定施設がある場合は揃っていない
+      return null;
+    }
+
+    if (commonMonth === null) {
+      commonMonth = month;
+    } else if (commonMonth !== month) {
+      // 施設間で値が異なる
+      return null;
+    }
+  }
+
+  // enabled 施設が 0 件 または 全施設が同じ値
+  return enabledCount > 0 ? commonMonth : null;
+}
+
+/**
+ * 施設の新月公開をメンバー全員に通知する(内部用・D-018)
+ *
+ * メッセージ形式: "<施設名>の<月>月分が公開されました！"
+ * 送信失敗は logError で記録し、次のメンバーへ続行する(エラーポリシー §4-2 準拠)
+ *
+ * @param {{ facilityId: number, facilityName: string }} facility - 施設情報
+ * @param {string} yearMonth - "YYYY-MM" 形式(例: "2026-06")
+ * @private
+ */
+function _notifyNewFacilityMonth(facility, yearMonth) {
+  // "YYYY-MM" から月の数字を取り出す(先頭ゼロ除去のため parseInt を使う)
+  var monthLabel = parseInt(yearMonth.split('-')[1], 10);
+  var message = facility.facilityName + 'の' + monthLabel + '月分が公開されました！';
+
+  var members = getActiveMembers();
+  console.log('[INFO] _notifyNewFacilityMonth: ' + facility.facilityName + ' ' + yearMonth + ' → ' + members.length + '人に通知');
+
+  for (var i = 0; i < members.length; i++) {
+    var member = members[i];
+    try {
+      pushText(member.userId, message);
+    } catch (pushErr) {
+      logError(pushErr, {
+        phase: '_notifyNewFacilityMonth.push',
+        facilityId: facility.facilityId,
+        yearMonth: yearMonth,
+        userId: member.userId
+      });
+      // 1 人失敗しても次のメンバーへ続行する(エラーポリシー §4-2)
+    }
+  }
+}
+
+/**
+ * 全施設の予定が揃ったことをメンバー全員に通知する(内部用・D-018)
+ *
+ * メッセージ形式:
+ *   "[<月>月の全施設の予定が揃いました！\n日程入力はこちら👇\nhttps://liff.line.me/<LIFF_FORM_ID>]"
+ *   LIFF_FORM_ID が取得できない場合はリンク部分を省略してメッセージは送る
+ *
+ * 送信失敗は logError で記録し、次のメンバーへ続行する(エラーポリシー §4-2 準拠)
+ *
+ * @param {string} yearMonth - "YYYY-MM" 形式(例: "2026-06")
+ * @private
+ */
+function _notifyAllFacilitiesReady(yearMonth) {
+  var monthLabel = parseInt(yearMonth.split('-')[1], 10);
+  var liffFormId = getProperty('LIFF_FORM_ID');
+
+  var message = monthLabel + '月の全施設の予定が揃いました！';
+  if (liffFormId) {
+    message += '\n日程入力はこちら👇\nhttps://liff.line.me/' + liffFormId;
+  }
+
+  var members = getActiveMembers();
+  console.log('[INFO] _notifyAllFacilitiesReady: ' + yearMonth + ' 全施設揃い通知 → ' + members.length + '人に通知');
+
+  for (var i = 0; i < members.length; i++) {
+    var member = members[i];
+    try {
+      pushText(member.userId, message);
+    } catch (pushErr) {
+      logError(pushErr, {
+        phase: '_notifyAllFacilitiesReady.push',
+        yearMonth: yearMonth,
+        userId: member.userId
+      });
+      // 1 人失敗しても次のメンバーへ続行する(エラーポリシー §4-2)
     }
   }
 }

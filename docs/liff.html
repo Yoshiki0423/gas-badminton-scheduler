@@ -94,7 +94,8 @@
     .btn-slot {
       flex: 1;
       min-width: 0;
-      padding: 7px 2px;
+      min-height: 44px; /* WCAG 2.5.5 AAA タップターゲット */
+      padding: 10px 2px;
       border: 2px solid #ddd;
       border-radius: 6px;
       background-color: #fff;
@@ -164,6 +165,36 @@
     .success { text-align: center; padding: 40px 16px; }
     .success-icon { font-size: 48px; color: #06C755; margin-bottom: 16px; }
     .success-text { font-size: 16px; font-weight: bold; color: #333; line-height: 1.6; }
+
+    /* 送信中プログレスバー */
+    .submit-area { position: relative; }
+    .submit-progress {
+      position: absolute;
+      top: 0; left: 0; right: 0;
+      height: 3px;
+      overflow: hidden;
+      display: none;
+    }
+    .submit-progress.active { display: block; }
+    .submit-progress::after {
+      content: '';
+      display: block;
+      height: 100%;
+      background-color: #06C755;
+      animation: progress-slide 1.2s ease-in-out infinite;
+    }
+    @keyframes progress-slide {
+      0%   { transform: translateX(-100%); }
+      100% { transform: translateX(400%); }
+    }
+
+    /* アニメーション無効化（前庭機能障害ユーザー向け） */
+    @media (prefers-reduced-motion: reduce) {
+      .spinner { animation: none; border-top-color: #06C755; }
+      .btn-slot { transition: none; }
+      .btn-submit { transition: none; }
+      .submit-progress::after { animation: none; background-color: #06C755; width: 100%; transform: none; }
+    }
   </style>
 </head>
 <body>
@@ -291,10 +322,13 @@
           }
 
           if (slot.available) {
-            // タップ可能(data 属性でキーを渡す)
-            html += '<button class="' + btnClass + '" data-key="' + esc(slotKey) + '" onclick="tapSlot(this)">' + esc(btnText) + '</button>';
+            var ariaPressed = currentAnswer === 'can' ? 'true' : (currentAnswer === 'undecided' ? 'mixed' : 'false');
+            var stateText = currentAnswer === 'can' ? '行ける' : (currentAnswer === 'undecided' ? '未定' : '未回答');
+            var ariaLabel = esc(dateInfo.dateLabel) + ' ' + formatSlotLabel(slot.slotStart, null) + '時台の回答: ' + stateText;
+            html += '<button class="' + btnClass + '" data-key="' + esc(slotKey) + '" data-date-label="' + esc(dateInfo.dateLabel) + '" aria-pressed="' + ariaPressed + '" aria-label="' + ariaLabel + '" onclick="tapSlot(this)">' + esc(btnText) + '</button>';
           } else {
-            html += '<button class="' + btnClass + '" disabled aria-disabled="true">' + esc(btnText) + '</button>';
+            var ariaLabel = esc(dateInfo.dateLabel) + ' ' + formatSlotLabel(slot.slotStart, null) + '時台: 利用不可';
+            html += '<button class="' + btnClass + '" disabled aria-disabled="true" aria-label="' + ariaLabel + '">' + esc(btnText) + '</button>';
           }
         }
 
@@ -303,7 +337,7 @@
       }
 
       html += '</div>'; // date-list
-      html += '<div class="submit-area"><button class="btn-submit" id="submitBtn" onclick="submitAnswers()">送信する</button></div>';
+      html += '<div class="submit-area"><div class="submit-progress" id="submitProgress"></div><button class="btn-submit" id="submitBtn" onclick="submitAnswers()">送信する</button></div>';
 
       app.innerHTML = html;
     }
@@ -333,18 +367,25 @@
         answers[slotKey] = next;
       }
 
-      // ボタン表示を更新
+      // ボタン表示・aria 属性を更新
       var slotStart = slotKey.split('|')[1] || '';
+      var dateLabel = btn.getAttribute('data-date-label') || '';
+      var stateText, ariaPressed;
       if (next === 'can') {
         btn.className = 'btn-slot selected-can';
         btn.textContent = '○ ' + formatSlotLabel(slotStart, null);
+        stateText = '行ける'; ariaPressed = 'true';
       } else if (next === 'undecided') {
         btn.className = 'btn-slot selected-undecided';
         btn.textContent = '△ ' + formatSlotLabel(slotStart, null);
+        stateText = '未定'; ariaPressed = 'mixed';
       } else {
         btn.className = 'btn-slot';
         btn.textContent = formatSlotLabel(slotStart, null);
+        stateText = '未回答'; ariaPressed = 'false';
       }
+      btn.setAttribute('aria-pressed', ariaPressed);
+      btn.setAttribute('aria-label', (dateLabel ? dateLabel + ' ' : '') + formatSlotLabel(slotStart, null) + '時台の回答: ' + stateText);
     }
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -355,7 +396,9 @@
       if (!idToken) { showError('ログイン情報の取得に失敗しました。'); return; }
 
       var btn = document.getElementById('submitBtn');
+      var progress = document.getElementById('submitProgress');
       if (btn) { btn.disabled = true; btn.textContent = '送信中...'; }
+      if (progress) { progress.classList.add('active'); }
 
       var url = GAS_API_URL + '?liff=submit'
         + '&idToken=' + encodeURIComponent(idToken)
@@ -366,6 +409,7 @@
         .then(function (res) {
           if (!res.ok) {
             if (btn) { btn.disabled = false; btn.textContent = '送信する'; }
+            if (progress) { progress.classList.remove('active'); }
             showError('送信に失敗しました。(' + (res.error || '') + ')');
             return;
           }
@@ -375,6 +419,7 @@
         })
         .catch(function () {
           if (btn) { btn.disabled = false; btn.textContent = '送信する'; }
+          if (progress) { progress.classList.remove('active'); }
           showError('通信エラーが発生しました。ページを閉じて再度お試しください。');
         });
     }

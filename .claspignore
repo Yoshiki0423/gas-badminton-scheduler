@@ -39,3 +39,6 @@ QRコード/**
 # === clasp 自身の設定(自動的に除外されるが念のため) ===
 .clasp.json
 .claspignore
+
+# === Claude Code の内部ファイル(ワークツリーやメモリを GAS に送らない) ===
+.claude/**

@@ -603,8 +603,64 @@
 
 ---
 
+---
+
+---
+
+## v1.0(2026-05-15): F-2-5 新月公開通知機能に伴う追加決定
+
+## D-021: 新月通知の判定タイミングと `SCRAPED_MONTHS_FACILITY_*` 一時キー設計（F-2-5）
+
+- **決定日**: 2026-05-15
+- **対応機能**: F-2-5(新月公開通知)
+- **決定**:
+  1. 新月の公開検知は「**月またぎバグ修正後の `parseScraperSheetValues` が返すスケジュール配列を使う**」タイミングで行う
+  2. `SCRAPED_MONTHS_FACILITY_<facilityId>` を一時キーとして使い、通知後も消さず残す設計とする
+  3. `_notifyNewFacilityMonth` と `_notifyAllFacilitiesReady` は送信失敗しても止めない設計とする
+
+- **背景・課題**:
+  - 月またぎバグ(D-016 制約)は「月末に実行すると翌月 1 日を今月として誤登録する」問題だった。F-2-5 の新月通知を正確に行うには、この誤判定を修正した上で月の一覧を取り出す必要がある。
+  - 通知の重複送信を防ぐには「いつどの施設・月の通知を送ったか」を永続的に記録する仕組みが必要。
+  - 複数施設の「全施設揃い通知」は、施設ごとの通知状態が全部揃ったタイミングで 1 回だけ送る必要がある。
+
+- **判断 1: 月またぎバグ修正後のパース結果を使う**
+  - **採用理由**: 旧バグありのデータから月を抽出すると「今月 1 日」と「翌月 1 日」を混同する可能性がある。修正後の `parseScraperSheetValues` が返す正確な date("YYYY-MM-DD")から "YYYY-MM" を取り出すのが最もシンプルかつ正確。
+  - `scrapeFacilitySchedule` の末尾で `_saveScrapedMonths(facility.facilityId, schedules)` を呼ぶことで、保存と通知のタイミングを分離した(SRP 準拠)。
+
+- **判断 2: `SCRAPED_MONTHS_FACILITY_*` を通知後も残す**
+  - **検討した代替案**:
+    - 案 A: 通知後に削除する → 通知送信後のデバッグが困難。再実行時に「まだ通知してない」と誤判定されるリスクがある
+    - 案 B: 通知後も残す(採用) → デバッグ・運用確認が容易。`LAST_NOTIFIED_MONTH_FACILITY_<id>` で二重通知を防ぐので削除の必要がない
+  - **採用案**: 案 B
+  - **採用理由**: ScriptProperties の容量(500KB・最大 500 件)は本プロジェクトの規模では枯渇しない。デバッグ用途の価値が高い。
+
+- **判断 3: 通知失敗時にエラーで止めない設計**
+  - **採用理由**: REQUIREMENTS.md §4-2 エラーポリシー「送信失敗しても次の処理へ続行する」に準拠。1 人のメンバーへの送信失敗が他のメンバーへの配信を妨げない。
+  - 通知に成功した施設のみ `LAST_NOTIFIED_MONTH_FACILITY_<id>` を更新し、失敗した施設は次回スクレイピング時に再試行できる設計とした。
+
+- **全施設揃い通知の判定方式**:
+  - `_getCommonLastNotifiedMonth()` で全 enabled 施設の `LAST_NOTIFIED_MONTH_FACILITY_<id>` が同じ値かチェックする
+  - 1 施設でも異なる値(または未設定)なら通知しない
+  - `ALL_FACILITIES_NOTIFIED_MONTH` との比較で二重送信を防ぐ
+
+- **ScriptProperties キー一覧**:
+
+  | キー形式 | 例 | 用途 |
+  |:--|:--|:--|
+  | `SCRAPED_MONTHS_FACILITY_<id>` | `SCRAPED_MONTHS_FACILITY_420` | 最後のスクレイピングで取得した月一覧(YYYY-MM の JSON 配列) |
+  | `LAST_NOTIFIED_MONTH_FACILITY_<id>` | `LAST_NOTIFIED_MONTH_FACILITY_420` | 施設ごとに最後に通知した月(YYYY-MM) |
+  | `ALL_FACILITIES_NOTIFIED_MONTH` | — | 全施設揃い通知を送った最後の月(YYYY-MM) |
+
+- **影響範囲**:
+  - `src/scraper.js`: 月またぎバグ修正(`parseScraperSheetValues` に `prevDay` 変数追加) / `_saveScrapedMonths` 関数追加 / `_checkAndNotifyNewMonths` 関数追加 / `_getCommonLastNotifiedMonth` 関数追加 / `_notifyNewFacilityMonth` 関数追加 / `_notifyAllFacilitiesReady` 関数追加 / `checkAndScrapeIfUpdated` に `_checkAndNotifyNewMonths()` 呼び出し追加
+  - トリガー時刻: 6 時 → 7 時に変更(TRIGGER_HOUR=7)
+  - GAS スクリプトプロパティ: `LIFF_FORM_ID` を新規追加要(なければ URL 省略でメッセージは送る)
+
+---
+
 ## 改訂履歴
 
+- **v1.0**(2026-05-15): D-021 追加。F-2-5 新月公開通知機能の設計判断(判定タイミング / 一時キー設計 / エラー時の止めない設計 / 全施設揃い通知判定方式)を記録。月またぎバグ修正(D-016 制約の解消)を合わせて記録。
 - **v0.9**(2026-05-14): D-020 追加。F-4 LIFF グリッドフォームリニューアルの設計判断(グリッド形式採用の根拠 / グレーアウト判定ロジックの根拠 / データモデル変更の根拠 / 既存機能への影響)を記録。
 - **v0.8**(2026-05-14): D-019 追加。LIFF を GitHub Pages + fetch() 方式に変更した経緯・セキュリティ注記を記録。
 - **v0.7**(2026-05-12): D-017 / D-018 追加。Phase 3 LIFF UX リニューアル設計（F-3-4〜F-3-6）に伴う意思決定を記録。TBD-5 を D-017 で解消。
