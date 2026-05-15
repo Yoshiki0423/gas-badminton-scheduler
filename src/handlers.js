@@ -921,8 +921,7 @@ function handleTextMessage(event) {
 
   try {
     if (cmd === '/配信') {
-      var distResult = handleDistributeSurvey();
-      replyText(replyToken, 'アンケートを配信しました ✅\n送信: ' + distResult.sent + '件');
+      handleDistributeSurvey();
 
     } else if (cmd === '/リマインド') {
       var remResult = handleSendReminders();
