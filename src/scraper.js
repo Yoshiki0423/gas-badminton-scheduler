@@ -560,7 +560,15 @@ function checkAndScrapeIfUpdated() {
     }
 
     try {
-      handleDistributeSurvey();
+      var currentMonth = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM');
+      var autoDistributedMonth = getProperty('SURVEY_AUTO_DISTRIBUTED_MONTH') || '';
+      if (autoDistributedMonth !== currentMonth) {
+        handleDistributeSurvey();
+        PropertiesService.getScriptProperties().setProperty('SURVEY_AUTO_DISTRIBUTED_MONTH', currentMonth);
+        console.log('[INFO] checkAndScrapeIfUpdated: アンケートを自動配信しました(' + currentMonth + ')。');
+      } else {
+        console.log('[INFO] checkAndScrapeIfUpdated: アンケートは今月(' + currentMonth + ')既に自動配信済み。スキップします。');
+      }
     } catch (distributeErr) {
       logError(distributeErr, { phase: 'checkAndScrapeIfUpdated.distribute' });
     }
