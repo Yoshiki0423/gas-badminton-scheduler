@@ -230,7 +230,10 @@ function liffSubmitResponses(idToken, answers) {
       console.warn('[WARN] liffSubmitResponses: ID Token verification failed');
       return null;
     }
-    return handleLiffSubmitFast(identity.userId, answers);
+    var result = handleLiffSubmitFast(identity.userId, answers);
+    // F-5: 回答送信後に「4人以上即通知」チェックを実行する
+    _checkAndNotifyViableSlots();
+    return result;
   } catch (err) {
     logError(err, { phase: 'liffSubmitResponses' });
     return null;
@@ -271,7 +274,7 @@ function liffGetAllResponses(idToken) {
  *
  * 使い方:
  *   GAS エディタ上部の「関数を選択」で `distributeSurvey` を選び、
- *   「実行」ボタンを押すと全 active メンバーに Flex Message が送信される。
+ *   「実行」ボタンを押すとグループトークに Flex Message が送信される。
  *
  * @returns {void}
  */
@@ -359,6 +362,14 @@ function _routeEvent(event) {
       case 'message':
         handleTextMessage(event);
         break;
+      case 'join':
+        // F-5: Bot がグループに招待されたときにグループ ID を保存する
+        handleJoin(event);
+        break;
+      case 'memberJoined':
+        // F-5: グループに新メンバーが参加したときに自動登録する
+        handleMemberJoined(event);
+        break;
       default:
         console.log('[INFO] Unhandled event type: ' + event.type);
         break;
@@ -427,6 +438,8 @@ function _handleLiffApi(e, action) {
         return _jsonResponse({ ok: false, error: 'invalid answers JSON' });
       }
       var result = handleLiffSubmitFast(identity.userId, answers);
+      // F-5: 回答送信後に「4人以上即通知」チェックを実行する
+      _checkAndNotifyViableSlots();
       return _jsonResponse({ ok: true, data: result });
     }
 

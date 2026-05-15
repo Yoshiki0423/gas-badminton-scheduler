@@ -1,18 +1,21 @@
 /**
- * @fileoverview F-1-1 メンバー自動登録機能 — イベントハンドラー
+ * @fileoverview F-1-1 メンバー自動登録機能 / F-5 グループトーク対応 — イベントハンドラー
  *
- * follow / unfollow イベントを受け取って、実際の業務処理(=スプレッドシート更新 +
- * 歓迎メッセージ送信)を行うファイルです。
+ * follow / unfollow / join / memberJoined イベントを受け取って、
+ * 実際の業務処理(スプレッドシート更新 + メッセージ送信)を行うファイルです。
  *
  * 各関数の役割を 1 行で:
- *   - handleFollow(event)               : 新メンバー登録 + 歓迎メッセージ
+ *   - handleFollow(event)               : 新メンバー登録 + 歓迎メッセージ(1対1用・後方互換)
  *   - handleUnfollow(event)             : メンバーを inactive に変更(削除はしない)
+ *   - handleJoin(event)                 : グループ参加時にグループ ID を保存する(F-5)
+ *   - handleMemberJoined(event)         : グループへの新メンバー参加時に自動登録する(F-5)
  *   - handleVote(event)                 : D-018 でカルーセル廃止済み・no-op
- *   - handleDistributeSurvey()          : 全 active メンバーに 2 ボタン Flex Message を Push 配信(F-1-3 / F-3-6)
- *   - handleSendReminders()             : 未回答メンバーに 2 ボタン Flex Message を再送(F-1-5 / F-3-6)
+ *   - handleDistributeSurvey()          : グループトークに 2 ボタン Flex Message を Push 配信(F-1-3 / F-3-6 / F-5)
+ *   - handleSendReminders()             : 未回答メンバーに個別 Push を再送(F-1-5 / F-3-6・変更なし)
  *   - handleLiffGetData(userId)         : F-4 グリッドフォーム用データ取得(日付×スロット構造)
  *   - handleLiffSubmitFast(userId, answers) : F-4 回答一括送信(新データモデル)
  *   - handleLiffGetAllResponses()       : F-4 LIFF 回答状況確認ページ用データ取得
+ *   - _checkAndNotifyViableSlots()      : 4人以上即通知チェック(F-5)
  */
 
 /**
@@ -121,6 +124,99 @@ function handleUnfollow(event) {
 }
 
 // ─────────────────────────────────────────────
+// F-5: グループトーク対応
+// ─────────────────────────────────────────────
+
+/**
+ * join イベント処理 — Bot がグループに招待されたときの処理(F-5)
+ *
+ * Bot がグループトークに招待されると LINE から `join` イベントが届きます。
+ * このとき `event.source.groupId` を ScriptProperties の `LINE_GROUP_ID` に保存します。
+ * 以降のすべてのグループ宛通知は、この groupId を使います。
+ *
+ * 設計上の注意:
+ *   - 保存だけ行い、グループへのメッセージ送信は行わない(不要なメッセージを送らない)
+ *   - groupId が取得できない場合はログのみ(エラーにしない)
+ *
+ * @param {Object} event - LINE join イベント
+ *   - event.source.groupId : グループ ID(必須)
+ * @returns {void}
+ */
+function handleJoin(event) {
+  var groupId = (event && event.source && event.source.groupId) ? event.source.groupId : '';
+
+  if (!groupId) {
+    console.warn('[WARN] handleJoin: groupId is missing. event.source=' +
+                 JSON.stringify(event && event.source));
+    return;
+  }
+
+  try {
+    PropertiesService.getScriptProperties().setProperty('LINE_GROUP_ID', groupId);
+    console.log('[INFO] handleJoin: グループ ID を保存しました。groupId=' + groupId);
+  } catch (err) {
+    logError(err, { phase: 'handleJoin.setProperty', groupId: groupId });
+  }
+}
+
+/**
+ * memberJoined イベント処理 — グループへの新メンバー参加時に自動登録する(F-5)
+ *
+ * グループトークに新しいメンバーが参加すると `memberJoined` イベントが届きます。
+ * `event.joined.members` をループして各メンバーを自動でメンバーシートに登録します。
+ * handleFollow と同じ登録処理(upsertMemberAsActive)を使います。
+ *
+ * 設計上の注意:
+ *   - グループメンバーは友達追加なしで参加できるため、follow イベントの代わりにこちらを使う
+ *   - プロフィール取得失敗時は「(名前不明)」として登録する(登録自体は続行)
+ *   - 1人失敗しても次のメンバーへ続行する(全員分を処理する)
+ *
+ * @param {Object} event - LINE memberJoined イベント
+ *   - event.joined.members : 参加したメンバーの配列
+ *     各メンバーは { type: 'user', userId: '...' } の形式
+ * @returns {void}
+ */
+function handleMemberJoined(event) {
+  var members = (event && event.joined && event.joined.members) ? event.joined.members : [];
+
+  if (members.length === 0) {
+    console.warn('[WARN] handleMemberJoined: joined.members が空です');
+    return;
+  }
+
+  for (var i = 0; i < members.length; i++) {
+    var member = members[i];
+    var userId = (member && member.type === 'user' && member.userId) ? member.userId : '';
+
+    if (!userId) {
+      console.warn('[WARN] handleMemberJoined: userId が取得できませんでした。member=' +
+                   JSON.stringify(member));
+      continue;
+    }
+
+    // (1) プロフィール取得(失敗しても登録は続行)
+    var displayName = '(名前不明)';
+    try {
+      var profile = getLineProfile(userId);
+      if (profile && profile.displayName) {
+        displayName = profile.displayName;
+      }
+    } catch (profileError) {
+      logError(profileError, { phase: 'handleMemberJoined.getProfile', userId: userId });
+    }
+
+    // (2) メンバーシートに登録 or 復活
+    try {
+      upsertMemberAsActive(userId, displayName);
+      console.log('[INFO] handleMemberJoined: 登録完了 userId=' + _maskUserId(userId) +
+                  ' displayName=' + displayName);
+    } catch (sheetError) {
+      logError(sheetError, { phase: 'handleMemberJoined.upsert', userId: userId });
+    }
+  }
+}
+
+// ─────────────────────────────────────────────
 // F-1-3: 質問配信機能
 // ─────────────────────────────────────────────
 
@@ -137,23 +233,27 @@ var SURVEY_FLEX_MAX_PER_BUBBLE = 3;
 var SURVEY_FLEX_MAX_BUBBLES = 12;
 
 /**
- * 質問配信 — F-1-3 / F-3-6 の本体
+ * 質問配信 — F-1-3 / F-3-6 / F-5 の本体
  *
- * F-3-6 変更点:
- *   従来の Flex Carousel(スケジュールごとのボタン)から
- *   「2 ボタン Flex Message」(回答する / 回答状況を見る)に変更。
+ * F-5 変更点:
+ *   全 active メンバーへの個別 Push から「グループに 1 通」に変更。
+ *   また、新しいアンケート配信のタイミングで VIABLE_NOTIFIED_SLOT_* 系のフラグを
+ *   全削除してリセットする(4人以上即通知の重複防止フラグのリセット)。
  *
  * 処理の流れ:
  *   1. schedules シートから直近 14 日のスケジュールを取得
- *   2. members シートから active なメンバーだけを取得
+ *   2. VIABLE_NOTIFIED_SLOT_* 系のキーを全削除(新アンケート開始のため)
  *   3. 2 ボタン Flex Message を組み立てる
- *   4. 全 active メンバーに Push API で 1 対 1 送信する
+ *   4. グループ ID を取得してグループに 1 通 Push 送信する
  *
  * @returns {{sent: number, skipped: number}}
  */
 function handleDistributeSurvey() {
   // 新アンケート配信のタイミングで自動集計フラグをリセットする。
   PropertiesService.getScriptProperties().deleteProperty('RESULTS_NOTIFIED');
+
+  // F-5: 4人以上即通知の重複防止フラグをすべて削除する(新しいアンケートが始まるため)
+  _resetViableNotifiedSlotFlags();
 
   // (1) スケジュール取得 → 直近 SURVEY_SCHEDULE_DAYS 日以内に絞り込む
   var schedules = _filterUpcomingSchedules(getSchedules(), SURVEY_SCHEDULE_DAYS);
@@ -163,37 +263,55 @@ function handleDistributeSurvey() {
     return { sent: 0, skipped: 0 };
   }
 
-  // (2) アクティブメンバー取得
-  var members = getActiveMembers();
-  if (members.length === 0) {
-    console.log('[INFO] distributeSurvey: active メンバーがいません。配信をスキップします。');
-    return { sent: 0, skipped: 0 };
+  // (2) グループ ID を取得する
+  var groupId = getProperty('LINE_GROUP_ID');
+  if (!groupId) {
+    console.warn('[WARN] distributeSurvey: LINE_GROUP_ID が未設定です。配信をスキップします。');
+    return { sent: 0, skipped: 1 };
   }
 
   // (3) 2 ボタン Flex Message 組み立て(F-3-6)
   var flexContents = _buildTwoButtonFlex('直近のスケジュールが届きました！\n参加できる日時を回答してください。');
   var altText = '【日程調整】参加できる日時を回答してください(' + schedules.length + '件)';
 
-  // (4) 全メンバーに Push 送信(失敗しても次のメンバーへ続行)
-  var sent = 0;
-  var skipped = 0;
-
-  for (var i = 0; i < members.length; i++) {
-    var member = members[i];
-    try {
-      withRetry(function () {
-        return pushFlexMessage(member.userId, altText, flexContents);
-      }, { maxAttempts: DEFAULT_MAX_ATTEMPTS, baseDelayMs: 1000, label: 'pushSurvey' });
-      sent++;
-      console.log('[INFO] 質問送信完了: ' + _maskUserId(member.userId) + ' (' + member.displayName + ')');
-    } catch (pushError) {
-      logError(pushError, { phase: 'distributeSurvey.push', index: i, userId: _maskUserId(member.userId), displayName: member.displayName });
-      skipped++;
-    }
+  // (4) グループに 1 通 Push 送信(F-5)
+  try {
+    withRetry(function () {
+      return pushFlexMessage(groupId, altText, flexContents);
+    }, { maxAttempts: DEFAULT_MAX_ATTEMPTS, baseDelayMs: 1000, label: 'pushSurvey' });
+    console.log('[INFO] distributeSurvey 完了: グループ(' + groupId + ')に送信しました');
+    return { sent: 1, skipped: 0 };
+  } catch (pushError) {
+    logError(pushError, { phase: 'distributeSurvey.push', groupId: groupId });
+    return { sent: 0, skipped: 1 };
   }
+}
 
-  console.log('[INFO] distributeSurvey 完了: sent=' + sent + ' skipped=' + skipped);
-  return { sent: sent, skipped: skipped };
+/**
+ * VIABLE_NOTIFIED_SLOT_* 系のキーをすべて削除する(内部用・F-5)
+ *
+ * 新しいアンケートが配信されたタイミングで呼ばれます。
+ * `VIABLE_NOTIFIED_SLOT_` で始まるすべてのキーを ScriptProperties から削除します。
+ *
+ * @private
+ */
+function _resetViableNotifiedSlotFlags() {
+  try {
+    var props = PropertiesService.getScriptProperties().getProperties();
+    var keysToDelete = [];
+    var prefix = 'VIABLE_NOTIFIED_SLOT_';
+    for (var key in props) {
+      if (key.indexOf(prefix) === 0) {
+        keysToDelete.push(key);
+      }
+    }
+    for (var i = 0; i < keysToDelete.length; i++) {
+      PropertiesService.getScriptProperties().deleteProperty(keysToDelete[i]);
+    }
+    console.log('[INFO] _resetViableNotifiedSlotFlags: ' + keysToDelete.length + ' 件のフラグを削除しました');
+  } catch (err) {
+    logError(err, { phase: '_resetViableNotifiedSlotFlags' });
+  }
 }
 
 /**
@@ -427,6 +545,9 @@ function handleVote(event) {
 /**
  * リマインド送信 — F-1-5 / F-3-6 の本体
  *
+ * F-5 非変更: リマインドは未回答者に個別 Push を継続する。
+ * 理由: 未回答者のみを対象にするためには userId が必要なため。
+ *
  * F-3-6 変更点:
  *   従来の「テキスト + Flex Carousel」から「2 ボタン Flex Message」に変更。
  *
@@ -494,28 +615,22 @@ function handleSendReminders() {
 }
 
 // ─────────────────────────────────────────────
-// F-1-6 / F-1-7: 集計・判定・結果通知機能(F-4 対応版)
+// F-1-6 / F-1-7: 集計・判定・結果通知機能(F-4 / F-5 対応版)
 // ─────────────────────────────────────────────
 
 /** 「成立」と見なす最小参加人数(REQUIREMENTS.md §2 より) */
 var MIN_ATTENDEES = 4;
 
 /**
- * 集計・結果通知 — F-1-6 / F-1-7 の本体(F-4 スロット単位対応版)
+ * 集計・結果通知 — F-1-6 / F-1-7 の本体(F-4 スロット単位 / F-5 グループ送信対応版)
  *
- * F-4 以降は (date, slotStart) 単位で集計し、
- * MIN_ATTENDEES(4) 人以上 can で回答したスロットをアナウンスする。
+ * F-5 変更点:
+ *   全 active メンバーへの個別 Push から「グループに 1 通」に変更。
+ *   グループ ID が未設定の場合はログを出して処理をスキップ(エラーにしない)。
  *
  * @returns {{viable: number, sent: number, skipped: number}}
  */
 function handleAggregateAndNotify() {
-  var members = getActiveMembers();
-
-  if (members.length === 0) {
-    console.log('[INFO] aggregateAndNotify: メンバーがいません。集計スキップ。');
-    return { viable: 0, sent: 0, skipped: 0 };
-  }
-
   // (date, slotStart) ごとに can / undecided の票数を集計(△も参加候補として含める)
   var responses = getAllSlotResponses();
   var canCounts = {};       // key: 'YYYY-MM-DD|HH:mm' → can 票数
@@ -547,31 +662,24 @@ function handleAggregateAndNotify() {
 
   var message = _buildSlotResultMessage(viableSlots, canCounts, undecidedCounts);
 
-  var sent = 0;
-  var skipped = 0;
-
-  for (var j = 0; j < members.length; j++) {
-    var member = members[j];
-    try {
-      withRetry(function () {
-        return pushText(member.userId, message);
-      }, { maxAttempts: DEFAULT_MAX_ATTEMPTS, baseDelayMs: 1000, label: 'pushResult' });
-      sent++;
-      console.log('[INFO] 結果通知完了: ' + _maskUserId(member.userId) +
-                  ' (' + member.displayName + ')');
-    } catch (pushError) {
-      logError(pushError, {
-        phase: 'aggregateAndNotify.push',
-        userId: _maskUserId(member.userId),
-        displayName: member.displayName
-      });
-      skipped++;
-    }
+  // F-5: グループに 1 通送信する
+  var groupId = getProperty('LINE_GROUP_ID');
+  if (!groupId) {
+    console.warn('[WARN] handleAggregateAndNotify: LINE_GROUP_ID が未設定です。通知をスキップします。');
+    return { viable: viableSlots.length, sent: 0, skipped: 1 };
   }
 
-  console.log('[INFO] aggregateAndNotify 完了: viable=' + viableSlots.length +
-              ' sent=' + sent + ' skipped=' + skipped);
-  return { viable: viableSlots.length, sent: sent, skipped: skipped };
+  try {
+    withRetry(function () {
+      return pushText(groupId, message);
+    }, { maxAttempts: DEFAULT_MAX_ATTEMPTS, baseDelayMs: 1000, label: 'pushResult' });
+    console.log('[INFO] aggregateAndNotify 完了: viable=' + viableSlots.length +
+                ' グループ(' + groupId + ')に送信しました');
+    return { viable: viableSlots.length, sent: 1, skipped: 0 };
+  } catch (pushError) {
+    logError(pushError, { phase: 'aggregateAndNotify.push', groupId: groupId });
+    return { viable: viableSlots.length, sent: 0, skipped: 1 };
+  }
 }
 
 /**
@@ -793,6 +901,9 @@ function _maskUserId(userId) {
  * LINE テキストメッセージを管理者コマンドとして処理する
  *
  * ADMIN_USER_ID と一致する送信者のみコマンドを受け付ける。
+ * F-5 対応: source.type が 'user'(1対1)でも 'group'(グループ)でも動作する。
+ * ADMIN_USER_ID との照合は変わらず行う(グループ内でも管理者だけが使える)。
+ *
  * 対応コマンド: /配信 /リマインド /状況 /集計 /ヘルプ
  *
  * @param {Object} event - LINE message イベント
@@ -811,7 +922,7 @@ function handleTextMessage(event) {
   try {
     if (cmd === '/配信') {
       var distResult = handleDistributeSurvey();
-      replyText(replyToken, 'アンケートを配信しました ✅\n送信: ' + distResult.sent + '人');
+      replyText(replyToken, 'アンケートを配信しました ✅\n送信: ' + distResult.sent + '件');
 
     } else if (cmd === '/リマインド') {
       var remResult = handleSendReminders();
@@ -823,7 +934,7 @@ function handleTextMessage(event) {
     } else if (cmd === '/集計') {
       PropertiesService.getScriptProperties().deleteProperty('RESULTS_NOTIFIED');
       var aggResult = handleAggregateAndNotify();
-      replyText(replyToken, '集計・通知を実行しました ✅\n成立スロット: ' + aggResult.viable + '件 / 送信: ' + aggResult.sent + '人');
+      replyText(replyToken, '集計・通知を実行しました ✅\n成立スロット: ' + aggResult.viable + '件 / 送信: ' + aggResult.sent + '件');
 
     } else if (cmd === '/ヘルプ') {
       replyText(replyToken,
@@ -1204,4 +1315,111 @@ function handleLiffGetAllResponses() {
  */
 function handleLiffSubmit(userId, answers) {
   return handleLiffSubmitFast(userId, answers);
+}
+
+// ─────────────────────────────────────────────
+// F-5: 4人以上即通知
+// ─────────────────────────────────────────────
+
+/**
+ * LIFF 回答送信後に「4人以上即通知」チェックを実行する(F-5 / Code.js から呼ばれる)
+ *
+ * 処理フロー:
+ *   1. getAllSlotResponses() で全回答を取得
+ *   2. スロットごとに can 票数を集計
+ *   3. MIN_ATTENDEES(4) 以上のスロットを抽出
+ *   4. 各スロットについて ScriptProperties の VIABLE_NOTIFIED_SLOT_<date>|<slotStart> を確認
+ *   5. まだ通知していないスロットがあればグループに 1 通まとめて通知
+ *   6. 通知したスロットに VIABLE_NOTIFIED_SLOT_* = 'true' を保存
+ *
+ * 設計上の注意:
+ *   - グループ ID が未設定の場合はログのみ・処理をスキップ(エラーにしない)
+ *   - 複数スロットが同時に条件を満たした場合は 1 通にまとめて送る
+ *   - このチェックは「can 票数のみ」で判定する(undecided は含めない)
+ *   - 例外が発生しても呼び出し元の回答送信処理には影響しないよう try-catch で囲む
+ *
+ * @private
+ */
+function _checkAndNotifyViableSlots() {
+  try {
+    var groupId = getProperty('LINE_GROUP_ID');
+    if (!groupId) {
+      console.log('[INFO] _checkAndNotifyViableSlots: LINE_GROUP_ID が未設定のためスキップします');
+      return;
+    }
+
+    // (1) 全回答を取得して can 票数をスロットごとに集計
+    var responses = getAllSlotResponses();
+    var canCounts = {};  // key: 'YYYY-MM-DD|HH:mm' → can 票数
+
+    for (var i = 0; i < responses.length; i++) {
+      var r = responses[i];
+      if (r.answer === 'can') {
+        var key = r.date + '|' + r.slotStart;
+        canCounts[key] = (canCounts[key] || 0) + 1;
+      }
+    }
+
+    // (2) MIN_ATTENDEES 以上かつ未通知のスロットを抽出
+    var newlyViableSlots = [];
+    var slotKeys = Object.keys(canCounts);
+    var propKeyPrefix = 'VIABLE_NOTIFIED_SLOT_';
+
+    for (var j = 0; j < slotKeys.length; j++) {
+      var slotKey = slotKeys[j];
+      if (canCounts[slotKey] >= MIN_ATTENDEES) {
+        var notifiedKey = propKeyPrefix + slotKey;
+        var alreadyNotified = getProperty(notifiedKey);
+        if (alreadyNotified !== 'true') {
+          newlyViableSlots.push(slotKey);
+        }
+      }
+    }
+
+    if (newlyViableSlots.length === 0) {
+      return;  // 新たに条件を満たしたスロットなし
+    }
+
+    newlyViableSlots.sort();  // 日付・時刻順
+
+    // (3) 通知メッセージを組み立てる
+    var SLOT_ENDS = {
+      '09:00': '11:00', '11:00': '13:00', '13:00': '15:00',
+      '15:00': '17:00', '17:00': '19:00', '19:00': '21:00'
+    };
+    var weekdays = ['日', '月', '火', '水', '木', '金', '土'];
+
+    var lines = ['4人以上参加できる時間帯が見つかりました！🏸', ''];
+    for (var n = 0; n < newlyViableSlots.length; n++) {
+      var parts = newlyViableSlots[n].split('|');
+      var date = parts[0];
+      var slotStart = parts[1];
+      var slotEnd = SLOT_ENDS[slotStart] || '?';
+      var canCount = canCounts[newlyViableSlots[n]] || 0;
+
+      var d = new Date(date + 'T00:00:00+09:00');
+      var m = d.getMonth() + 1;
+      var day = d.getDate();
+      var w = weekdays[d.getDay()];
+
+      lines.push('・' + m + '/' + day + '(' + w + ') ' + slotStart + '〜' + slotEnd +
+                 '（○' + canCount + '人）');
+    }
+    var message = lines.join('\n');
+
+    // (4) グループに通知
+    pushText(groupId, message);
+    console.log('[INFO] _checkAndNotifyViableSlots: ' + newlyViableSlots.length +
+                ' スロットをグループに通知しました');
+
+    // (5) 通知済みフラグを保存
+    for (var f = 0; f < newlyViableSlots.length; f++) {
+      PropertiesService.getScriptProperties()
+        .setProperty(propKeyPrefix + newlyViableSlots[f], 'true');
+    }
+
+  } catch (err) {
+    logError(err, { phase: '_checkAndNotifyViableSlots' });
+    // 呼び出し元(回答送信)の処理を止めないため、例外は再 throw しない
+  }
 }

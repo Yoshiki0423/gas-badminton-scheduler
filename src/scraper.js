@@ -1,4 +1,4 @@
-﻿/**
+/**
  * @fileoverview F-2-1 スクレイピング自動化 / F-2-2 更新検知による自動起動
  *
  * Google スプレッドシートの IMPORTHTML 関数を使って
@@ -678,9 +678,9 @@ function _extractTimesFromCell(text) {
   }
 
   // パターン1: "9-11" / "9〜11" / "13‐21" 形式(コロンなし)
-  // [－\-〜～\u2010] = 全角ハイフン / 半角ハイフン / 波ダッシュ2種 / Unicode U+2010 ハイフン
+  // [－\-〜～‐] = 全角ハイフン / 半角ハイフン / 波ダッシュ2種 / Unicode U+2010 ハイフン
   // 後方否定先読み (?![\d日]) で "9日" や "11-12日" との誤マッチを防ぐ
-  var hourRange = text.match(/(\d{1,2})[－\-〜～\u2010](\d{1,2})(?![\d日])/);
+  var hourRange = text.match(/(\d{1,2})[－\-〜～‐](\d{1,2})(?![\d日])/);
   if (hourRange) {
     var startH = parseInt(hourRange[1], 10);
     var endH = parseInt(hourRange[2], 10);
@@ -718,7 +718,7 @@ function _buildNoteFromCell(text) {
       var deltaRemainder = afterDelta[1]
         .replace(/\d{1,2}:\d{2}[〜\-～]\d{1,2}:\d{2}/g, ' ')   // "HH:mm〜HH:mm" 形式を除去
         .replace(/\d{1,2}:\d{2}/g, ' ')                          // 単体時刻を除去
-        .replace(/\d{1,2}[－\-〜～\u2010]\d{1,2}(?![\d日])/g, ' ')  // "9-11" / "13‐21" 形式を除去
+        .replace(/\d{1,2}[－\-〜～‐]\d{1,2}(?![\d日])/g, ' ')  // "9-11" / "13‐21" 形式を除去
         .replace(/\s+/g, ' ')
         .trim();
       return deltaRemainder || '要確認';
@@ -732,7 +732,7 @@ function _buildNoteFromCell(text) {
     .replace(/^[〇○]/, '')                                    // 先頭の記号を除去
     .replace(/\d{1,2}:\d{2}[〜\-～]\d{1,2}:\d{2}/g, ' ')    // "HH:mm〜HH:mm" 形式をスペースに置換
     .replace(/\d{1,2}:\d{2}/g, ' ')                          // 単体時刻をスペースに置換
-    .replace(/\d{1,2}[－\-〜～\u2010]\d{1,2}(?![\d日])/g, ' ')   // "9-11" / "13‐21" 形式をスペースに置換
+    .replace(/\d{1,2}[－\-〜～‐]\d{1,2}(?![\d日])/g, ' ')   // "9-11" / "13‐21" 形式をスペースに置換
     .replace(/\s+/g, ' ')
     .trim();
 
@@ -968,10 +968,13 @@ function _getCommonLastNotifiedMonth(props) {
 }
 
 /**
- * 施設の新月公開をメンバー全員に通知する(内部用・D-018)
+ * 施設の新月公開をグループトークに通知する(内部用・D-018 / F-5 グループ送信対応)
+ *
+ * F-5 変更点:
+ *   全 active メンバーへの個別 Push から「グループに 1 通」に変更。
+ *   グループ ID が未設定の場合はログのみ・処理をスキップ(エラーにしない)。
  *
  * メッセージ形式: "<施設名>の<月>月分が公開されました！"
- * 送信失敗は logError で記録し、次のメンバーへ続行する(エラーポリシー §4-2 準拠)
  *
  * @param {{ facilityId: number, facilityName: string }} facility - 施設情報
  * @param {string} yearMonth - "YYYY-MM" 形式(例: "2026-06")
@@ -982,33 +985,39 @@ function _notifyNewFacilityMonth(facility, yearMonth) {
   var monthLabel = parseInt(yearMonth.split('-')[1], 10);
   var message = facility.facilityName + 'の' + monthLabel + '月分が公開されました！';
 
-  var members = getActiveMembers();
-  console.log('[INFO] _notifyNewFacilityMonth: ' + facility.facilityName + ' ' + yearMonth + ' → ' + members.length + '人に通知');
+  // F-5: グループに 1 通送信する
+  var groupId = getProperty('LINE_GROUP_ID');
+  if (!groupId) {
+    console.warn('[WARN] _notifyNewFacilityMonth: LINE_GROUP_ID が未設定です。通知をスキップします。' +
+                 ' facility=' + facility.facilityName + ' yearMonth=' + yearMonth);
+    return;
+  }
 
-  for (var i = 0; i < members.length; i++) {
-    var member = members[i];
-    try {
-      pushText(member.userId, message);
-    } catch (pushErr) {
-      logError(pushErr, {
-        phase: '_notifyNewFacilityMonth.push',
-        facilityId: facility.facilityId,
-        yearMonth: yearMonth,
-        userId: member.userId
-      });
-      // 1 人失敗しても次のメンバーへ続行する(エラーポリシー §4-2)
-    }
+  console.log('[INFO] _notifyNewFacilityMonth: ' + facility.facilityName + ' ' + yearMonth + ' → グループ(' + groupId + ')に通知');
+  try {
+    pushText(groupId, message);
+  } catch (pushErr) {
+    logError(pushErr, {
+      phase: '_notifyNewFacilityMonth.push',
+      facilityId: facility.facilityId,
+      yearMonth: yearMonth,
+      groupId: groupId
+    });
+    // Push 失敗は例外として re-throw する(呼び出し元の _checkAndNotifyNewMonths が lastNotified 更新をスキップするため)
+    throw pushErr;
   }
 }
 
 /**
- * 全施設の予定が揃ったことをメンバー全員に通知する(内部用・D-018)
+ * 全施設の予定が揃ったことをグループトークに通知する(内部用・D-018 / F-5 グループ送信対応)
+ *
+ * F-5 変更点:
+ *   全 active メンバーへの個別 Push から「グループに 1 通」に変更。
+ *   グループ ID が未設定の場合はログのみ・処理をスキップ(エラーにしない)。
  *
  * メッセージ形式:
  *   "[<月>月の全施設の予定が揃いました！\n日程入力はこちら👇\nhttps://liff.line.me/<LIFF_FORM_ID>]"
  *   LIFF_FORM_ID が取得できない場合はリンク部分を省略してメッセージは送る
- *
- * 送信失敗は logError で記録し、次のメンバーへ続行する(エラーポリシー §4-2 準拠)
  *
  * @param {string} yearMonth - "YYYY-MM" 形式(例: "2026-06")
  * @private
@@ -1022,20 +1031,24 @@ function _notifyAllFacilitiesReady(yearMonth) {
     message += '\n日程入力はこちら👇\nhttps://liff.line.me/' + liffFormId;
   }
 
-  var members = getActiveMembers();
-  console.log('[INFO] _notifyAllFacilitiesReady: ' + yearMonth + ' 全施設揃い通知 → ' + members.length + '人に通知');
+  // F-5: グループに 1 通送信する
+  var groupId = getProperty('LINE_GROUP_ID');
+  if (!groupId) {
+    console.warn('[WARN] _notifyAllFacilitiesReady: LINE_GROUP_ID が未設定です。通知をスキップします。' +
+                 ' yearMonth=' + yearMonth);
+    return;
+  }
 
-  for (var i = 0; i < members.length; i++) {
-    var member = members[i];
-    try {
-      pushText(member.userId, message);
-    } catch (pushErr) {
-      logError(pushErr, {
-        phase: '_notifyAllFacilitiesReady.push',
-        yearMonth: yearMonth,
-        userId: member.userId
-      });
-      // 1 人失敗しても次のメンバーへ続行する(エラーポリシー §4-2)
-    }
+  console.log('[INFO] _notifyAllFacilitiesReady: ' + yearMonth + ' 全施設揃い通知 → グループ(' + groupId + ')に送信');
+  try {
+    pushText(groupId, message);
+  } catch (pushErr) {
+    logError(pushErr, {
+      phase: '_notifyAllFacilitiesReady.push',
+      yearMonth: yearMonth,
+      groupId: groupId
+    });
+    // Push 失敗は例外として re-throw する(呼び出し元の _checkAndNotifyNewMonths が ALL_FACILITIES_NOTIFIED_MONTH 更新をスキップするため)
+    throw pushErr;
   }
 }
