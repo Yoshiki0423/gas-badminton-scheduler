@@ -356,9 +356,6 @@ function _routeEvent(event) {
       case 'unfollow':
         handleUnfollow(event);
         break;
-      case 'postback':
-        handleVote(event);
-        break;
       case 'message':
         handleTextMessage(event);
         break;

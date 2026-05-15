@@ -9,7 +9,6 @@
  *   - handleUnfollow(event)             : メンバーを inactive に変更(削除はしない)
  *   - handleJoin(event)                 : グループ参加時にグループ ID を保存する(F-5)
  *   - handleMemberJoined(event)         : グループへの新メンバー参加時に自動登録する(F-5)
- *   - handleVote(event)                 : D-018 でカルーセル廃止済み・no-op
  *   - handleDistributeSurvey()          : グループトークに 2 ボタン Flex Message を Push 配信(F-1-3 / F-3-6 / F-5)
  *   - handleSendReminders()             : 未回答メンバーに個別 Push を再送(F-1-5 / F-3-6・変更なし)
  *   - handleLiffGetData(userId)         : F-4 グリッドフォーム用データ取得(日付×スロット構造)
@@ -226,13 +225,6 @@ function handleMemberJoined(event) {
 var SURVEY_SCHEDULE_DAYS = 14;
 
 /**
- * (Phase 1 互換・内部用) Flex Carousel を組み立てる関数群
- * D-021: F-3-6 で配信・リマインドからは呼ばれなくなるが、デバッグ・将来復活用として残す
- */
-var SURVEY_FLEX_MAX_PER_BUBBLE = 3;
-var SURVEY_FLEX_MAX_BUBBLES = 12;
-
-/**
  * 質問配信 — F-1-3 / F-3-6 / F-5 の本体
  *
  * F-5 変更点:
@@ -389,103 +381,6 @@ function _buildTwoButtonFlex(bodyText) {
 }
 
 /**
- * Flex Message の中身(contents)を組み立てる(内部用・Phase 1 互換)
- *
- * D-021: F-3-6 以降は _buildTwoButtonFlex が使われるが、
- * デバッグや将来復活の可能性を考慮してコードは残す。
- *
- * 候補が SURVEY_FLEX_MAX_PER_BUBBLE(3) 件以下なら 1 つの Bubble を返す。
- * 超える場合は Carousel(= 複数 Bubble を横スワイプで切り替える形式)に分割する。
- *
- * @param {Array<Object>} schedules - getSchedules() が返すオブジェクト配列
- * @returns {Object} LINE Flex Message の contents オブジェクト(bubble or carousel)
- * @private
- */
-function _buildSurveyFlex(schedules) {
-  if (schedules.length <= SURVEY_FLEX_MAX_PER_BUBBLE) {
-    return _buildSurveyBubble(schedules);
-  }
-
-  // 3 件ずつ Bubble に分割して Carousel に束ねる(LINE 上限の 12 バブルで打ち切り)
-  var bubbles = [];
-  for (var i = 0; i < schedules.length; i += SURVEY_FLEX_MAX_PER_BUBBLE) {
-    if (bubbles.length >= SURVEY_FLEX_MAX_BUBBLES) {
-      break;
-    }
-    var chunk = schedules.slice(i, Math.min(i + SURVEY_FLEX_MAX_PER_BUBBLE, schedules.length));
-    bubbles.push(_buildSurveyBubble(chunk));
-  }
-
-  return { type: 'carousel', contents: bubbles };
-}
-
-/**
- * 1 つの Bubble を組み立てる(内部用・Phase 1 互換)
- *
- * D-021: 将来復活用として残す。
- *
- * @param {Array<Object>} schedules
- * @returns {Object} Flex Message の bubble オブジェクト
- * @private
- */
-function _buildSurveyBubble(schedules) {
-  var bodyContents = [
-    {
-      type: 'text',
-      text: '参加できる日時をすべて選んでください。',
-      wrap: true,
-      size: 'sm',
-      color: '#555555'
-    },
-    { type: 'separator' }
-  ];
-
-  for (var i = 0; i < schedules.length; i++) {
-    var s = schedules[i];
-    var label = _formatScheduleLabel(s);
-    // LINE ボタンのラベルは最大 40 文字(日本語を含む場合も文字数で制限)
-    if (label.length > 40) {
-      label = label.substring(0, 39) + '…';
-    }
-    bodyContents.push({
-      type: 'button',
-      style: 'secondary',
-      height: 'sm',
-      action: {
-        type: 'postback',
-        label: label,
-        // F-1-4(回答収集)が postback データから scheduleId を取り出せる形式
-        data: 'action=vote&scheduleId=' + s.scheduleId,
-        // ユーザーのトークルームに表示されるテキスト(ボタンをタップした証跡)
-        displayText: label
-      }
-    });
-  }
-
-  return {
-    type: 'bubble',
-    header: {
-      type: 'box',
-      layout: 'vertical',
-      backgroundColor: '#1DB446',
-      contents: [{
-        type: 'text',
-        text: 'バドミントン日程調整',
-        weight: 'bold',
-        size: 'xl',
-        color: '#FFFFFF'
-      }]
-    },
-    body: {
-      type: 'box',
-      layout: 'vertical',
-      spacing: 'md',
-      contents: bodyContents
-    }
-  };
-}
-
-/**
  * スケジュールオブジェクトからボタン用ラベル文字列を生成する(内部用)
  *
  * 生成例: "5/15(金) 18:00〜20:00 鳥屋野総合体育館"
@@ -517,25 +412,6 @@ function _buildWelcomeMessage(displayName) {
     'よろしくお願いします!'
   ];
   return lines.join('\n');
-}
-
-// ─────────────────────────────────────────────
-// F-1-4: 回答収集機能(postback)
-// ─────────────────────────────────────────────
-
-/**
- * postback イベント処理 — D-018 でカルーセル廃止済み・no-op
- *
- * D-018 でカルーセル(postback 経由の個別スケジュール投票)は廃止済み。
- * F-4 以降の回答は LIFF グリッドフォーム経由のみ。
- * postback が来た場合は無視してログだけ残す。
- *
- * @param {Object} event - LINE postback イベント
- * @returns {void}
- */
-function handleVote(event) {
-  // D-018 でカルーセル廃止済み。postback は受け付けるが何もしない。
-  console.log('[INFO] handleVote: deprecated since D-018, ignoring.');
 }
 
 // ─────────────────────────────────────────────
@@ -762,53 +638,6 @@ function _buildSlotResultMessage(viableSlots, canCounts, undecidedCounts) {
       if (undecidedCount > 0) { countStr += ' △' + undecidedCount; }
 
       lines.push('・' + m + '/' + day + '(' + w + ') ' + slotStart + '〜' + slotEnd + ' (' + countStr + ')');
-    }
-
-    lines.push('');
-    lines.push('詳細は改めてご連絡します。');
-  }
-
-  return lines.join('\n');
-}
-
-/**
- * 後方互換: 旧 _buildResultMessage(viable, voteCounts) を呼ぶ箇所のために残す
- *
- * @deprecated F-4 以降は _buildSlotResultMessage を使う
- */
-function _buildResultMessage(viable, voteCounts) {
-  var lines = ['【日程調整 結果】'];
-
-  if (viable.length === 0) {
-    lines.push('');
-    lines.push('申し訳ありません。' + MIN_ATTENDEES + ' 人以上参加できる日時が見つかりませんでした。');
-    lines.push('');
-    lines.push('改めて日程を調整します。しばらくお待ちください。');
-  } else {
-    lines.push('');
-    lines.push(MIN_ATTENDEES + ' 人以上が参加できる日時です:');
-    lines.push('');
-
-    var groups = {};
-    var groupOrder = [];
-    for (var i = 0; i < viable.length; i++) {
-      var s = viable[i];
-      var key = s.date + '|' + s.startTime + '|' + s.endTime;
-      if (!groups[key]) {
-        groups[key] = { schedule: s, facilities: [], maxCount: 0 };
-        groupOrder.push(key);
-      }
-      groups[key].facilities.push(s.facilityName);
-      var count = voteCounts[s.scheduleId] || 0;
-      if (count > groups[key].maxCount) {
-        groups[key].maxCount = count;
-      }
-    }
-
-    for (var k = 0; k < groupOrder.length; k++) {
-      var g = groups[groupOrder[k]];
-      lines.push('・' + _formatDateTimeLabel(g.schedule) + ' (' + g.maxCount + '人)');
-      lines.push('  ' + g.facilities.join(' / ') + ' が利用可');
     }
 
     lines.push('');
@@ -1301,19 +1130,6 @@ function handleLiffGetAllResponses() {
     dates: gridData.dates,
     responses: responseMap
   };
-}
-
-/**
- * 後方互換: 旧 handleLiffSubmit を呼ぶ箇所のために残す
- *
- * @deprecated F-4 以降は handleLiffSubmitFast を使う
- *
- * @param {string} userId
- * @param {Object} answers - { 'YYYY-MM-DD|HH:mm': 'can'|'undecided' } または旧形式
- * @returns {{ deleted: number, inserted: number }}
- */
-function handleLiffSubmit(userId, answers) {
-  return handleLiffSubmitFast(userId, answers);
 }
 
 // ─────────────────────────────────────────────

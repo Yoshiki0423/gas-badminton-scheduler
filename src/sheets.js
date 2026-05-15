@@ -25,11 +25,6 @@
  *   - getAllSlotResponses()                                 : 全レコードを返す(集計用)
  *   - getSlotResponsesByUserId(userId)                     : ユーザーの回答を { 'YYYY-MM-DD|HH:mm': 'can'|'undecided' } 形式で返す
  *   - resetResponsesSheet()                                : シートをリセットして新ヘッダーを設定
- *   【後方互換(F-1-4 / F-3 用・内部からは呼ばれなくなる)】
- *   - upsertResponse(userId, scheduleId, canAttend) : 回答を登録(あれば上書き・なければ追加)
- *   - getResponsesByUserId(userId)                  : 指定ユーザーの全回答を返す(LIFF 前回答復元用)
- *   - clearResponsesByUserId(userId)                : 指定ユーザーの全回答行を削除(LIFF 一括送信用)
- *
  * メンバーシート構造(D-007 で確定):
  *   A: userId       (LINE ユーザー ID・主キー・テキスト書式)
  *   B: displayName  (LINE 表示名)
@@ -675,30 +670,6 @@ var SRCOL_ANSWER      = 5;
 var SRCOL_CREATED_AT  = 6;
 var SRCOL_UPDATED_AT  = 7;
 
-/**
- * 後方互換用の旧 responses シートヘッダー(F-1-4 / F-3 の旧関数が使う)
- *
- * @deprecated F-4 以降は SLOT_RESPONSES_HEADER を使う。
- *   旧関数(upsertResponse / clearResponsesByUserId / getResponsesByUserId)は
- *   後方互換のために残しているが、内部からは呼ばれなくなる。
- */
-var RESPONSES_HEADER = [
-  'responseId',
-  'userId',
-  'scheduleId',
-  'canAttend',
-  'respondedAt',
-  'lastUpdatedAt'
-];
-
-/** 後方互換用の旧 responses シート列インデックス */
-var RCOL_RESPONSE_ID  = 1;
-var RCOL_USER_ID      = 2;
-var RCOL_SCHEDULE_ID  = 3;
-var RCOL_CAN_ATTEND   = 4;
-var RCOL_RESPONDED_AT = 5;
-var RCOL_LAST_UPDATED = 6;
-
 // ─────────────────────────────────────────────
 // F-4 responses シート 関数(新API)
 // ─────────────────────────────────────────────
@@ -991,110 +962,6 @@ function getSlotResponsesByUserId(userId) {
   }
 
   return result;
-}
-
-// ─────────────────────────────────────────────
-// responses シート 後方互換関数(F-1-4 / F-3)
-// ─────────────────────────────────────────────
-
-/**
- * 回答を登録する(同一 userId + scheduleId があれば上書き、なければ新規追加)
- *
- * @deprecated F-4 以降は upsertSlotResponse を使うこと。
- *   本関数は後方互換のために残す。内部ロジックからは呼ばれなくなる。
- *
- * @param {string} userId    - LINE ユーザー ID
- * @param {string} scheduleId - 回答対象のスケジュール ID
- * @param {boolean|string} [canAttend=true] - 参加可否
- * @returns {{action: 'inserted' | 'updated', row: number, responseId: string}}
- */
-function upsertResponse(userId, scheduleId, canAttend) {
-  if (!userId) throw new Error('upsertResponse: userId is required');
-  if (!scheduleId) throw new Error('upsertResponse: scheduleId is required');
-
-  var attendValue = (canAttend === undefined) ? true : canAttend;
-
-  var lock = LockService.getScriptLock();
-  if (!lock.tryLock(10 * 1000)) {
-    throw new Error('upsertResponse: could not acquire lock');
-  }
-
-  try {
-    return withRetry(function () {
-      var sheet = getResponsesSheet();
-      var nowIso = _toIsoTokyo(new Date());
-      var lastRow = sheet.getLastRow();
-
-      // 旧形式(userId + scheduleId)で検索 — F-4 移行後はヒットしない想定
-      if (lastRow >= 2) {
-        var vals = sheet.getRange(2, SRCOL_USER_ID, lastRow - 1, 3).getValues();
-        for (var i = 0; i < vals.length; i++) {
-          if (String(vals[i][0]) === userId && String(vals[i][1]) === scheduleId) {
-            var foundRow = i + 2;
-            sheet.getRange(foundRow, SRCOL_ANSWER).setValue(attendValue);
-            sheet.getRange(foundRow, SRCOL_UPDATED_AT).setValue(nowIso);
-            SpreadsheetApp.flush();
-            var existingId = String(sheet.getRange(foundRow, SRCOL_RESPONSE_ID).getValue());
-            return { action: 'updated', row: foundRow, responseId: existingId };
-          }
-        }
-      }
-
-      var responseId = _generateResponseId();
-      var newRow = sheet.getLastRow() + 1;
-      // 旧形式を新シート構造に書く場合: date=scheduleId, slotStart='', answer=attendValue
-      sheet.getRange(newRow, 1, 1, SLOT_RESPONSES_HEADER.length).setValues([[
-        responseId, userId, scheduleId, '', attendValue, nowIso, nowIso
-      ]]);
-      SpreadsheetApp.flush();
-      return { action: 'inserted', row: newRow, responseId: responseId };
-    }, { maxAttempts: DEFAULT_MAX_ATTEMPTS, baseDelayMs: 1000, label: 'upsertResponse' });
-  } finally {
-    lock.releaseLock();
-  }
-}
-
-/**
- * 指定ユーザーの全回答を返す(旧 LIFF フォームの前回答復元用)
- *
- * @deprecated F-4 以降は getSlotResponsesByUserId を使うこと。
- *
- * @param {string} userId - LINE ユーザー ID
- * @returns {Array<{scheduleId: string, canAttend: boolean|string}>}
- */
-function getResponsesByUserId(userId) {
-  if (!userId) return [];
-
-  var sheet = getResponsesSheet();
-  var lastRow = sheet.getLastRow();
-  if (lastRow < 2) return [];
-
-  var values = sheet.getRange(2, SRCOL_USER_ID, lastRow - 1, 3).getValues();
-  var result = [];
-
-  for (var i = 0; i < values.length; i++) {
-    if (String(values[i][0]) === userId) {
-      result.push({
-        scheduleId: String(values[i][1]),
-        canAttend:  values[i][2]
-      });
-    }
-  }
-
-  return result;
-}
-
-/**
- * 指定ユーザーの全回答行を削除する(旧 LIFF 一括送信用)
- *
- * @deprecated F-4 以降は clearSlotResponsesByUserId を使うこと。
- *
- * @param {string} userId - LINE ユーザー ID
- * @returns {number} 削除した行数
- */
-function clearResponsesByUserId(userId) {
-  // F-4 の新関数に委譲(ロジックは同じ)
-  return clearSlotResponsesByUserId(userId);
 }
 
 // ─────────────────────────────────────────────
