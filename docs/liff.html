@@ -404,23 +404,38 @@
         + '&idToken=' + encodeURIComponent(idToken)
         + '&answers=' + encodeURIComponent(JSON.stringify(answers));
 
+      var closed = false;
+      function showSuccessAndClose() {
+        if (closed) return;
+        closed = true;
+        var app = document.getElementById('app');
+        app.innerHTML = '<div class="success"><div class="success-icon">&#10003;</div><p class="success-text">回答を送信しました！<br>ご回答ありがとうございます。</p></div>';
+        setTimeout(function () { liff.closeWindow(); }, 1500);
+      }
+
+      // GAS の応答が 3 秒以内に来なければ成功とみなして閉じる
+      // (GAS はクライアントが閉じても処理を続けてデータを保存する)
+      var fallbackTimer = setTimeout(showSuccessAndClose, 3000);
+
       fetch(url)
         .then(function (r) { return r.json(); })
         .then(function (res) {
+          clearTimeout(fallbackTimer);
           if (!res.ok) {
             if (btn) { btn.disabled = false; btn.textContent = '送信する'; }
             if (progress) { progress.classList.remove('active'); }
             showError('送信に失敗しました。(' + (res.error || '') + ')');
             return;
           }
-          var app = document.getElementById('app');
-          app.innerHTML = '<div class="success"><div class="success-icon">&#10003;</div><p class="success-text">回答を送信しました！<br>ご回答ありがとうございます。</p></div>';
-          setTimeout(function () { liff.closeWindow(); }, 1500);
+          showSuccessAndClose();
         })
         .catch(function () {
-          if (btn) { btn.disabled = false; btn.textContent = '送信する'; }
-          if (progress) { progress.classList.remove('active'); }
-          showError('通信エラーが発生しました。ページを閉じて再度お試しください。');
+          clearTimeout(fallbackTimer);
+          if (!closed) {
+            if (btn) { btn.disabled = false; btn.textContent = '送信する'; }
+            if (progress) { progress.classList.remove('active'); }
+            showError('通信エラーが発生しました。ページを閉じて再度お試しください。');
+          }
         });
     }
 

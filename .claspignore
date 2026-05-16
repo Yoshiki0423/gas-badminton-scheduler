@@ -39,6 +39,9 @@ desktop.ini
 # === QR コード・画像等のローカル資料 ===
 QRコード/**
 
+# === GitHub Pages ホスティング用ファイル(GAS にデプロイしない) ===
+docs/**
+
 # === clasp 自身の設定(自動的に除外されるが念のため) ===
 .clasp.json
 .claspignore
