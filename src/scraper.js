@@ -13,7 +13,7 @@
  *
  * セットアップ手順:
  *   1. GAS エディタで setupScraperSheets() を 1 回だけ手動実行する
- *      → scraper-420 / scraper-413 / scraper-495 シートが作成され、
+ *      → scraper-420 / scraper-420-next / scraper-413 / scraper-413-next シートが作成され、
  *        各シートに IMPORTHTML 式が設定される
  *   2. 各シートで IMPORTHTML の読み込みが完了するのを確認する
  *   3. scrapeAllFacilities() または checkAndScrapeIfUpdated() を実行して動作確認する
@@ -56,6 +56,7 @@ var FACILITIES = [
     facilityName: '鳥屋野総合体育館',
     url: 'https://niigata-kaikou.jp/facility/420/schedule',
     sheetName: 'scraper-420',
+    nextSheetName: 'scraper-420-next',
     enabled: true
   },
   {
@@ -63,15 +64,9 @@ var FACILITIES = [
     facilityName: '東総合スポーツセンター',
     url: 'https://niigata-kaikou.jp/facility/413/schedule',
     sheetName: 'scraper-413',
+    nextSheetName: 'scraper-413-next',
     enabled: true
   },
-  {
-    facilityId: 495,
-    facilityName: '白根カルチャーセンター',
-    url: 'https://niigata-kaikou.jp/facility/495/schedule',
-    sheetName: 'scraper-495',
-    enabled: true
-  }
 ];
 
 /** 連続失敗カウントのしきい値(これを超えたら管理者通知) */
@@ -128,7 +123,7 @@ var HEADER_SEARCH_LIMIT = 5;
  * IMPORTHTML 用スクレイパーシートを初期セットアップする
  *
  * 1 回だけ GAS エディタから手動実行する初期化関数。
- * enabled な施設(scraper-420 / scraper-413 / scraper-495)それぞれのシートを作成し、
+ * enabled な施設ごとに当月シート(scraper-420 等)と翌月シート(scraper-420-next 等)を作成し、
  * A1 セルに IMPORTHTML 式を設定する。
  * 既存シートがあれば中身を上書き(セットアップ再実行に対応)。
  *
@@ -161,11 +156,26 @@ function setupScraperSheets() {
       console.log('[INFO] setupScraperSheets: ' + facility.sheetName + ' シートを新規作成しました。');
     }
 
-    // IMPORTHTML 式を A1 に設定
-    // table,2 が対象テーブル(D-016 で確認済み)
+    // 当月シート: table,2 が当月スケジュール(D-016 で確認済み)
     var formula = '=IMPORTHTML("' + facility.url + '","table",2)';
     sheet.getRange('A1').setFormula(formula);
     console.log('[INFO] setupScraperSheets: ' + facility.sheetName + ' に設定: ' + formula);
+
+    // 翌月シート: table,3 が翌月公開後に翌月スケジュールになる(D-023 で確認済み)
+    // 翌月未公開時は施設案内が入るが、パーサーが日付行以外をスキップするため副作用なし
+    if (facility.nextSheetName) {
+      var nextSheet = ss.getSheetByName(facility.nextSheetName);
+      if (nextSheet) {
+        nextSheet.clearContents();
+        console.log('[INFO] setupScraperSheets: ' + facility.nextSheetName + ' の既存シートをクリアしました。');
+      } else {
+        nextSheet = ss.insertSheet(facility.nextSheetName);
+        console.log('[INFO] setupScraperSheets: ' + facility.nextSheetName + ' シートを新規作成しました。');
+      }
+      var nextFormula = '=IMPORTHTML("' + facility.url + '","table",3)';
+      nextSheet.getRange('A1').setFormula(nextFormula);
+      console.log('[INFO] setupScraperSheets: ' + facility.nextSheetName + ' に設定: ' + nextFormula);
+    }
   }
 
   console.log('[INFO] setupScraperSheets: 完了。IMPORTHTML の読み込みが完了してから scrapeAllFacilities() を実行してください。');
@@ -277,8 +287,27 @@ function scrapeFacilitySchedule(facility, ss) {
     return 0;
   }
 
-  // パース
+  // パース(当月シート)
   var schedules = parseScraperSheetValues(values, facility.facilityName);
+
+  // 翌月シートも読み込んでマージ(D-023: 翌月スケジュール検知対応)
+  if (facility.nextSheetName) {
+    var nextSheet = ss.getSheetByName(facility.nextSheetName);
+    if (nextSheet) {
+      try {
+        var nextValues = nextSheet.getDataRange().getValues();
+        if (nextValues && nextValues.length > 0) {
+          var nextSchedules = parseScraperSheetValues(nextValues, facility.facilityName, 1);
+          if (nextSchedules.length > 0) {
+            console.log('[INFO] scrapeFacilitySchedule: ' + facility.facilityName + ' 翌月シートから ' + nextSchedules.length + ' 件取得。');
+            schedules = schedules.concat(nextSchedules);
+          }
+        }
+      } catch (nextErr) {
+        logError(nextErr, { phase: 'scrapeFacilitySchedule.nextSheet', facilityId: facility.facilityId });
+      }
+    }
+  }
 
   if (schedules.length === 0) {
     // パース結果が 0 件はシート構造変化の可能性があるため警告ログのみ(エラーにしない)
@@ -370,13 +399,19 @@ function _saveScrapedMonths(facilityId, schedules) {
  *
  * @param {Array<Array>} values - sheet.getDataRange().getValues() の戻り値(2D 配列)
  * @param {string} facilityName - 施設名(返却オブジェクトの facilityName に使用)
+ * @param {number} [monthOffset=0] - 開始月を何ヶ月ずらすか。翌月シートを読む場合は 1 を渡す(D-023)
  * @returns {Array<{date: string, startTime: string, endTime: string, facilityName: string, note: string}>}
  */
-function parseScraperSheetValues(values, facilityName) {
+function parseScraperSheetValues(values, facilityName, monthOffset) {
   var results = [];
   var now = new Date();
   var year = now.getFullYear();
-  var month = now.getMonth() + 1; // getMonth() は 0-based なので +1
+  var month = now.getMonth() + 1 + (monthOffset || 0); // getMonth() は 0-based なので +1
+  // 月が 12 を超えた場合は翌年 1 月に繰り上げる
+  if (month > 12) {
+    month -= 12;
+    year += 1;
+  }
 
   // ─── バドミントン列インデックスをヘッダー行から探す ───
   // 最初の HEADER_SEARCH_LIMIT 行以内で「バドミントン」を含む列を探す
@@ -534,6 +569,25 @@ function checkAndScrapeIfUpdated() {
         changedFacilities.push(facility.facilityId);
         console.log('[INFO] checkAndScrapeIfUpdated: ' + facility.facilityName + ' の更新を検知しました。');
       }
+
+      // 翌月シートのハッシュも監視(D-023: 翌月スケジュール検知対応)
+      if (facility.nextSheetName) {
+        var nextSheet = ss.getSheetByName(facility.nextSheetName);
+        if (nextSheet) {
+          var nextValues = nextSheet.getDataRange().getValues();
+          var nextHash = _computeSha256Hex(JSON.stringify(nextValues));
+          var nextFacilityKey = facility.facilityId + '_NEXT';
+          newHashes[nextFacilityKey] = nextHash;
+
+          var prevNextHash = getProperty(HASH_KEY_PREFIX + nextFacilityKey);
+          if (prevNextHash !== nextHash) {
+            if (changedFacilities.indexOf(facility.facilityId) === -1) {
+              changedFacilities.push(facility.facilityId);
+            }
+            console.log('[INFO] checkAndScrapeIfUpdated: ' + facility.facilityName + ' の翌月シートの更新を検知しました。');
+          }
+        }
+      }
     } catch (err) {
       logError(err, { phase: 'checkAndScrapeIfUpdated.hash', facilityId: facility.facilityId });
       // 取得失敗の施設は変化なしとして扱う(前回データを維持)
@@ -559,19 +613,7 @@ function checkAndScrapeIfUpdated() {
       logError(notifyErr, { phase: 'checkAndScrapeIfUpdated.notify' });
     }
 
-    try {
-      var currentMonth = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM');
-      var autoDistributedMonth = getProperty('SURVEY_AUTO_DISTRIBUTED_MONTH') || '';
-      if (autoDistributedMonth !== currentMonth) {
-        handleDistributeSurvey();
-        PropertiesService.getScriptProperties().setProperty('SURVEY_AUTO_DISTRIBUTED_MONTH', currentMonth);
-        console.log('[INFO] checkAndScrapeIfUpdated: アンケートを自動配信しました(' + currentMonth + ')。');
-      } else {
-        console.log('[INFO] checkAndScrapeIfUpdated: アンケートは今月(' + currentMonth + ')既に自動配信済み。スキップします。');
-      }
-    } catch (distributeErr) {
-      logError(distributeErr, { phase: 'checkAndScrapeIfUpdated.distribute' });
-    }
+    // アンケート自動配信は全施設揃い時のみ実行するため _checkAndNotifyNewMonths 内で行う(D-024)
   } else {
     console.log('[INFO] checkAndScrapeIfUpdated: 更新なし。何もしません。');
   }
@@ -932,6 +974,21 @@ function _checkAndNotifyNewMonths() {
     return;
   }
   props.setProperty(ALL_FACILITIES_NOTIFIED_MONTH_KEY, allNotifiedMonth);
+
+  // アンケート自動配信(D-024): 全施設揃い通知の直後に実行する
+  // ガード: SURVEY_AUTO_DISTRIBUTED_MONTH が今回の新月と一致していれば送信済みのためスキップ
+  var surveyDistributedMonth = getProperty('SURVEY_AUTO_DISTRIBUTED_MONTH') || '';
+  if (surveyDistributedMonth !== allNotifiedMonth) {
+    try {
+      handleDistributeSurvey();
+      props.setProperty('SURVEY_AUTO_DISTRIBUTED_MONTH', allNotifiedMonth);
+      console.log('[INFO] _checkAndNotifyNewMonths: アンケートを自動配信しました(' + allNotifiedMonth + ')。');
+    } catch (distributeErr) {
+      logError(distributeErr, { phase: '_checkAndNotifyNewMonths.distribute' });
+    }
+  } else {
+    console.log('[INFO] _checkAndNotifyNewMonths: アンケートは ' + allNotifiedMonth + ' 分が配信済み。スキップします。');
+  }
 }
 
 /**

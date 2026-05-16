@@ -500,6 +500,55 @@ describe('parseScraperSheetValues', () => {
     expect(result[0]).toHaveProperty('facilityName');
     expect(result[0]).toHaveProperty('note');
   });
+
+  // --- monthOffset: 翌月シート対応(D-023) ---
+
+  test('monthOffset=1 を指定すると翌月(6月)としてパースされる', () => {
+    // 現在月 = 5月(モック)、monthOffset=1 なので開始月 = 6月
+    const values = [
+      ['日', '曜日', 'バドミントン'],
+      ['1日', '月', '〇9-11'],
+      ['15日', '月', '〇13-15']
+    ];
+    const result = parseScraperSheetValues(values, 'テスト体育館', 1);
+    expect(result).toHaveLength(2);
+    expect(result[0].date).toBe('2026-06-01');
+    expect(result[1].date).toBe('2026-06-15');
+  });
+
+  test('monthOffset=1 を 12月に使うと翌年1月にロールオーバーする', () => {
+    // Date モックを 12月に差し替え
+    const origDate = global.Date;
+    const Dec = class extends Date {
+      constructor(...args) {
+        if (args.length === 0) { super(2026, 11, 1); } else { super(...args); }
+      }
+      getFullYear() { return 2026; }
+      getMonth() { return 11; } // 0-based → 12月
+    };
+    global.Date = Dec;
+
+    const values = [
+      ['日', '曜日', 'バドミントン'],
+      ['5日', '月', '〇9-11']
+    ];
+    const result = parseScraperSheetValues(values, 'テスト体育館', 1);
+    expect(result).toHaveLength(1);
+    expect(result[0].date).toBe('2027-01-05'); // 翌年1月
+
+    global.Date = origDate;
+  });
+
+  test('施設案内テキスト(日付行なし)を渡すと結果 0 件になる', () => {
+    // 翌月未公開時の table 3 は施設案内が入る → スキップされて 0 件
+    const values = [
+      ['開館時間', '月～土曜日：9時～21時'],
+      ['休館日', '毎月第２木曜日'],
+      ['交通手段', 'バス停から徒歩10分']
+    ];
+    const result = parseScraperSheetValues(values, 'テスト体育館', 1);
+    expect(result).toHaveLength(0);
+  });
 });
 
 // ─────────────────────────────────────────────────────────────
@@ -508,9 +557,9 @@ describe('parseScraperSheetValues', () => {
 
 describe('_checkAndNotifyNewMonths', () => {
   // FACILITIES 定数(scraper.js から読み込まれたグローバル)を参照する。
-  // テストでは enabled: true な施設(420, 413, 495)を前提とする。
+  // テストでは enabled: true な施設(420, 413)を前提とする。
 
-  const ENABLED_IDS = [420, 413, 495];
+  const ENABLED_IDS = [420, 413];
 
   /**
    * 指定施設の SCRAPED_MONTHS を PropertiesService に書き込むヘルパー
@@ -584,7 +633,7 @@ describe('_checkAndNotifyNewMonths', () => {
   test('全 enabled 施設の LAST_NOTIFIED_MONTH が同じになったとき全施設揃い通知を送る', () => {
     _propStore['LINE_GROUP_ID'] = 'Cxxxx_test_group';
 
-    // 3施設すべてに2026-06の予定が公開済み
+    // 2施設すべてに2026-06の予定が公開済み
     ENABLED_IDS.forEach(id => {
       setScrapedMonths(id, ['2026-05', '2026-06']);
       setLastNotified(id, '2026-05'); // まだ05までしか通知していない
@@ -592,8 +641,8 @@ describe('_checkAndNotifyNewMonths', () => {
 
     _checkAndNotifyNewMonths();
 
-    // 3施設分の個別通知 + 全施設揃い通知の計4回呼ばれる
-    expect(pushText).toHaveBeenCalledTimes(4);
+    // 2施設分の個別通知 + 全施設揃い通知の計3回呼ばれる
+    expect(pushText).toHaveBeenCalledTimes(3);
 
     // 全施設揃い通知のメッセージに「6月」が含まれる
     const allReadyCalls = pushText.mock.calls.filter(call =>
@@ -624,15 +673,12 @@ describe('_checkAndNotifyNewMonths', () => {
   test('一部施設の LAST_NOTIFIED_MONTH が揃っていない場合は全施設揃い通知を送らない', () => {
     _propStore['LINE_GROUP_ID'] = 'Cxxxx_test_group';
 
-    // 施設420は06通知済み、413と495は05止まり
+    // 施設420は06通知済み、413は05止まり
     setScrapedMonths(420, ['2026-06']);
     setLastNotified(420, '2026-06');
 
     setScrapedMonths(413, ['2026-05']);
     setLastNotified(413, '2026-05');
-
-    setScrapedMonths(495, ['2026-05']);
-    setLastNotified(495, '2026-05');
 
     _checkAndNotifyNewMonths();
 
@@ -658,5 +704,189 @@ describe('_checkAndNotifyNewMonths', () => {
 
     // 通知失敗なので LAST_NOTIFIED_MONTH は更新されない
     expect(getLastNotified(420)).toBe('2026-05');
+  });
+
+  // --- アンケート自動配信（D-024: 全施設揃い時のみ）---
+
+  test('全施設揃い通知の直後に handleDistributeSurvey が呼ばれる', () => {
+    _propStore['LINE_GROUP_ID'] = 'Cxxxx_test_group';
+
+    // 2施設とも06が揃っている、かつ今月分のアンケートはまだ未配信
+    ENABLED_IDS.forEach(id => {
+      setScrapedMonths(id, ['2026-06']);
+      setLastNotified(id, '2026-05');
+    });
+
+    _checkAndNotifyNewMonths();
+
+    expect(handleDistributeSurvey).toHaveBeenCalledTimes(1);
+    // SURVEY_AUTO_DISTRIBUTED_MONTH が新月（06）でセットされる
+    expect(_propStore['SURVEY_AUTO_DISTRIBUTED_MONTH']).toBe('2026-06');
+  });
+
+  test('1施設しか揃っていない場合は handleDistributeSurvey を呼ばない', () => {
+    _propStore['LINE_GROUP_ID'] = 'Cxxxx_test_group';
+
+    // 420 のみ06が揃っている、413 は05止まり
+    setScrapedMonths(420, ['2026-06']);
+    setLastNotified(420, '2026-05');
+    setScrapedMonths(413, ['2026-05']);
+    setLastNotified(413, '2026-05');
+
+    _checkAndNotifyNewMonths();
+
+    expect(handleDistributeSurvey).not.toHaveBeenCalled();
+  });
+
+  test('全施設揃いでも SURVEY_AUTO_DISTRIBUTED_MONTH が同じ月なら handleDistributeSurvey を呼ばない', () => {
+    _propStore['LINE_GROUP_ID'] = 'Cxxxx_test_group';
+    // 既に06分のアンケートは配信済み
+    _propStore['SURVEY_AUTO_DISTRIBUTED_MONTH'] = '2026-06';
+    _propStore['ALL_FACILITIES_NOTIFIED_MONTH'] = '2026-06';
+
+    ENABLED_IDS.forEach(id => {
+      setScrapedMonths(id, ['2026-06']);
+      setLastNotified(id, '2026-06');
+    });
+
+    _checkAndNotifyNewMonths();
+
+    // 全施設揃い通知も配信も両方スキップ
+    expect(handleDistributeSurvey).not.toHaveBeenCalled();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+// テスト 5: checkAndScrapeIfUpdated — 翌月シート検知(D-023)
+// ─────────────────────────────────────────────────────────────
+
+describe('checkAndScrapeIfUpdated — 翌月シートのハッシュ変化検知', () => {
+  // SpreadsheetApp モックヘルパー
+  function makeSheetMock(data) {
+    return {
+      getDataRange: () => ({ getValues: () => data })
+    };
+  }
+
+  // MEMBERS_SPREADSHEET_ID を設定し、施設シートをモックする
+  function setupSsMock({ mainData420, nextData420, mainData413, nextData413 }) {
+    _propStore['MEMBERS_SPREADSHEET_ID'] = 'spreadsheet-id';
+    global.getProperty.mockImplementation((key) =>
+      _propStore[key] !== undefined ? _propStore[key] : null
+    );
+
+    const sheetMap = {};
+    if (mainData420) sheetMap['scraper-420'] = makeSheetMock(mainData420);
+    if (nextData420) sheetMap['scraper-420-next'] = makeSheetMock(nextData420);
+    if (mainData413) sheetMap['scraper-413'] = makeSheetMock(mainData413);
+    if (nextData413) sheetMap['scraper-413-next'] = makeSheetMock(nextData413);
+
+    global.SpreadsheetApp.openById.mockReturnValue({
+      getSheetByName: (name) => sheetMap[name] || null
+    });
+  }
+
+  // _computeSha256Hex は scraper.js 内部関数。GAS Utilities がないため
+  // テスト環境では JSON.stringify の文字列長を代用してハッシュの「変化」だけを確認する。
+  // 実際の検知ロジックテストは「changedFacilities が正しく埋まるか」で確認する。
+
+  const MAY_DATA = [
+    ['日', '曜日', 'バドミントン'],
+    ['1日', '木', '〇9-11']
+  ];
+  const FACILITY_INFO_DATA = [
+    ['開館時間', '月～土曜日：9時～21時'],
+    ['休館日', '毎月第２木曜日']
+  ];
+  const JUNE_DATA = [
+    ['日', '曜日', 'バドミントン'],
+    ['1日', '日', '〇13-15']
+  ];
+
+  beforeEach(() => {
+    // _computeSha256Hex が GAS Utilities に依存するため、テスト用に JSON.stringify ベースで上書き
+    global.Utilities = {
+      computeDigest: jest.fn(() => new Array(32).fill(0)),
+      DigestAlgorithm: { SHA_256: 'SHA_256' }
+    };
+    // scraper.js の _computeSha256Hex はグローバルに展開済みなので
+    // Utilities.computeDigest の戻り値で一意なハッシュが得られる。
+    // ここではデータ内容が異なれば別ハッシュになることを確認するため、
+    // JSON.stringify ベースの実装に差し替える。
+    global._computeSha256Hex = (text) => {
+      // 簡易ハッシュ: 文字列の内容が変われば値が変わる
+      let hash = 0;
+      for (let i = 0; i < text.length; i++) {
+        hash = ((hash << 5) - hash) + text.charCodeAt(i);
+        hash |= 0;
+      }
+      return 'hash_' + hash;
+    };
+  });
+
+  test('翌月シートが施設案内→6月スケジュールに変化したとき施設が changedFacilities に入る', () => {
+    const mayHash = global._computeSha256Hex(JSON.stringify(MAY_DATA));
+    const facilityInfoHash = global._computeSha256Hex(JSON.stringify(FACILITY_INFO_DATA));
+
+    // 施設420: 当月シートは変化なし、翌月シートは施設案内だったものが6月に変わる
+    _propStore['HASH_FACILITY_420'] = mayHash;
+    _propStore['HASH_FACILITY_420_NEXT'] = facilityInfoHash; // 前回は施設案内
+
+    // 施設413: 両シートとも変化なし
+    _propStore['HASH_FACILITY_413'] = mayHash;
+    _propStore['HASH_FACILITY_413_NEXT'] = facilityInfoHash;
+
+    // 今回: 420の翌月シートに6月スケジュールが入った
+    setupSsMock({
+      mainData420: MAY_DATA,
+      nextData420: JUNE_DATA,       // ← 変化あり
+      mainData413: MAY_DATA,
+      nextData413: FACILITY_INFO_DATA  // ← 変化なし
+    });
+
+    const result = checkAndScrapeIfUpdated();
+
+    // 施設420の翌月シートが変化したため updated=true
+    expect(result.updated).toBe(true);
+    expect(result.changedFacilities).toContain(420);
+    // 施設413は変化なし
+    expect(result.changedFacilities).not.toContain(413);
+  });
+
+  test('当月・翌月シートどちらも変化なければ updated=false', () => {
+    const mayHash = global._computeSha256Hex(JSON.stringify(MAY_DATA));
+    const infoHash = global._computeSha256Hex(JSON.stringify(FACILITY_INFO_DATA));
+
+    _propStore['HASH_FACILITY_420'] = mayHash;
+    _propStore['HASH_FACILITY_420_NEXT'] = infoHash;
+    _propStore['HASH_FACILITY_413'] = mayHash;
+    _propStore['HASH_FACILITY_413_NEXT'] = infoHash;
+
+    setupSsMock({
+      mainData420: MAY_DATA,
+      nextData420: FACILITY_INFO_DATA,
+      mainData413: MAY_DATA,
+      nextData413: FACILITY_INFO_DATA
+    });
+
+    const result = checkAndScrapeIfUpdated();
+
+    expect(result.updated).toBe(false);
+    expect(result.changedFacilities).toHaveLength(0);
+  });
+
+  test('翌月シートのハッシュが新しいキー名(HASH_FACILITY_420_NEXT)で保存される', () => {
+    setupSsMock({
+      mainData420: MAY_DATA,
+      nextData420: FACILITY_INFO_DATA,
+      mainData413: MAY_DATA,
+      nextData413: FACILITY_INFO_DATA
+    });
+
+    checkAndScrapeIfUpdated();
+
+    // 翌月ハッシュキーが保存されている
+    expect(_propStore['HASH_FACILITY_420_NEXT']).toBeDefined();
+    expect(_propStore['HASH_FACILITY_413_NEXT']).toBeDefined();
   });
 });
