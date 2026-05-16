@@ -8,10 +8,12 @@
     "pull": "clasp pull",
     "open": "clasp open",
     "logs": "clasp logs",
-    "status": "clasp status"
+    "status": "clasp status",
+    "test": "jest"
   },
   "devDependencies": {
-    "@google/clasp": "^2.4.2"
+    "@google/clasp": "^2.4.2",
+    "jest": "^29.0.0"
   },
   "engines": {
     "node": ">=18.0.0"

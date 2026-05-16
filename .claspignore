@@ -11,6 +11,9 @@ package.json
 package-lock.json
 yarn.lock
 
+# === テストコード(GAS にデプロイしない) ===
+tests/**
+
 # === ドキュメント類(全 .md ファイル) ===
 **/*.md
 
