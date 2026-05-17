@@ -1,0 +1,674 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>コート予約</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Hiragino Sans', 'Noto Sans JP', sans-serif;
+      background: #f5f5f5; color: #333; min-height: 100vh;
+    }
+    .header {
+      background: #06C755; color: #fff; padding: 16px; text-align: center;
+    }
+    .header h1 { font-size: 18px; font-weight: bold; }
+    .header .subtitle { font-size: 13px; margin-top: 4px; opacity: 0.85; }
+
+    .screen { display: none; padding: 16px; }
+    .screen.active { display: block; }
+
+    .card {
+      background: #fff; border-radius: 8px; padding: 16px; margin-bottom: 12px;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+    }
+
+    .section-title {
+      font-size: 15px; font-weight: bold; color: #06C755;
+      margin-bottom: 12px; padding-bottom: 6px; border-bottom: 2px solid #06C755;
+    }
+
+    .btn-list { display: flex; flex-direction: column; gap: 8px; }
+    .btn-choice {
+      padding: 12px 16px; border: 2px solid #ddd; border-radius: 8px;
+      background: #fff; font-size: 14px; text-align: left; cursor: pointer;
+      transition: border-color 0.15s, background 0.15s;
+    }
+    .btn-choice:active, .btn-choice.selected {
+      border-color: #06C755; background: #f0faf3; color: #06C755;
+    }
+    .btn-choice .label { font-weight: bold; }
+    .btn-choice .sub { font-size: 12px; color: #888; margin-top: 2px; }
+
+    .btn-primary {
+      width: 100%; padding: 14px; background: #06C755; color: #fff;
+      border: none; border-radius: 8px; font-size: 16px; font-weight: bold;
+      cursor: pointer; margin-top: 12px;
+    }
+    .btn-primary:disabled { background: #aaa; cursor: not-allowed; }
+    .btn-secondary {
+      width: 100%; padding: 12px; background: #fff; color: #555;
+      border: 1px solid #ccc; border-radius: 8px; font-size: 14px;
+      cursor: pointer; margin-top: 8px;
+    }
+
+    .pattern-img {
+      width: 100%; border-radius: 6px; margin-bottom: 12px;
+      display: none;
+    }
+    .pattern-img.loaded { display: block; }
+
+    .confirm-row {
+      display: flex; justify-content: space-between; padding: 8px 0;
+      border-bottom: 1px solid #f0f0f0; font-size: 14px;
+    }
+    .confirm-row:last-child { border-bottom: none; }
+    .confirm-row .key { color: #888; }
+    .confirm-row .val { font-weight: bold; max-width: 60%; text-align: right; }
+
+    .status-box {
+      text-align: center; padding: 32px 16px;
+    }
+    .status-icon { font-size: 56px; margin-bottom: 12px; }
+    .status-msg { font-size: 18px; font-weight: bold; margin-bottom: 8px; }
+    .status-sub { font-size: 13px; color: #888; }
+
+    .loading {
+      text-align: center; padding: 48px 16px; color: #888;
+    }
+    .spinner {
+      width: 36px; height: 36px; border: 4px solid #ddd;
+      border-top-color: #06C755; border-radius: 50%;
+      animation: spin 0.8s linear infinite; margin: 0 auto 12px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .error-msg {
+      background: #fff0f0; border: 1px solid #ffcccc; border-radius: 6px;
+      padding: 12px; color: #c00; font-size: 13px; margin-bottom: 12px;
+    }
+
+    .step-bar {
+      display: flex; justify-content: space-between; margin-bottom: 16px;
+      padding: 0 4px;
+    }
+    .step { flex: 1; text-align: center; font-size: 11px; color: #aaa; position: relative; }
+    .step.active { color: #06C755; font-weight: bold; }
+    .step.done { color: #06C755; }
+    .step-num {
+      width: 22px; height: 22px; border-radius: 50%; border: 2px solid #ddd;
+      display: inline-flex; align-items: center; justify-content: center;
+      font-size: 11px; margin-bottom: 3px; background: #fff;
+    }
+    .step.active .step-num { border-color: #06C755; background: #06C755; color: #fff; }
+    .step.done .step-num { border-color: #06C755; background: #06C755; color: #fff; }
+
+    .priority-badge {
+      display: inline-block; background: #06C755; color: #fff;
+      border-radius: 10px; font-size: 11px; padding: 1px 6px; margin-right: 4px;
+    }
+    .priority-list { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+    .priority-item {
+      display: flex; align-items: center; gap: 8px;
+      padding: 8px 10px; background: #f8f8f8; border-radius: 6px; font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>コート予約</h1>
+    <div class="subtitle" id="slotLabel">読み込み中...</div>
+  </div>
+
+  <!-- スクリーン0: 読み込み中 -->
+  <div id="screen-loading" class="screen active">
+    <div class="loading">
+      <div class="spinner"></div>
+      <div>読み込み中...</div>
+    </div>
+  </div>
+
+  <!-- スクリーン1: 施設・パターン選択 -->
+  <div id="screen-courseGroup" class="screen">
+    <div style="padding:16px">
+      <div class="step-bar" id="stepBar1"></div>
+      <div class="card">
+        <div class="section-title">施設・パターンを選択</div>
+        <div id="error-cg" class="error-msg" style="display:none"></div>
+        <div class="btn-list" id="courseGroupList"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- スクリーン2: 解禁済み → コート選択 / 未解禁 → コート優先順位 -->
+  <div id="screen-court" class="screen">
+    <div style="padding:16px">
+      <div class="step-bar" id="stepBar2"></div>
+      <div class="card">
+        <div class="section-title" id="courtScreenTitle">コートを選択</div>
+        <div id="error-court" class="error-msg" style="display:none"></div>
+        <img id="patternImg" class="pattern-img" alt="割り振り図" />
+        <div class="loading" id="scanLoading" style="display:none">
+          <div class="spinner"></div><div>空きコートを検索中...</div>
+        </div>
+        <div class="btn-list" id="courtList"></div>
+        <!-- 未解禁フロー用: 優先順位表示 -->
+        <div id="priorityArea" style="display:none">
+          <div style="font-size:13px;color:#666;margin-bottom:8px">
+            コートを優先順位順にタップしてください（最大3つ）
+          </div>
+          <div class="priority-list" id="priorityList"></div>
+        </div>
+        <button class="btn-primary" id="btnCourtNext" disabled>次へ</button>
+        <button class="btn-secondary" id="btnCourtBack">戻る</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- スクリーン4: 確認 -->
+  <div id="screen-confirm" class="screen">
+    <div style="padding:16px">
+      <div class="card">
+        <div class="section-title">予約内容の確認</div>
+        <div id="confirmRows"></div>
+        <div id="error-confirm" class="error-msg" style="display:none"></div>
+        <button class="btn-primary" id="btnConfirm">この内容で予約する</button>
+        <button class="btn-secondary" id="btnConfirmBack">戻る</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- スクリーン5: 完了 / エラー -->
+  <div id="screen-done" class="screen">
+    <div style="padding:16px">
+      <div class="card">
+        <div class="status-box" id="doneBox"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- LIFF SDK -->
+  <script src="https://static.line-scdn.net/liff/edge/versions/2.22.3/sdk.js"></script>
+  <script src="liff.config.js"></script>
+  <script>
+    // LINE Developers で予約用 LIFF を登録後、取得した LIFF ID をここに入力してください
+    const LIFF_ID = '';
+
+    // §14-9 施設・パターン別の固定コート名（facilityId_pattern → コート名配列）
+    const COURT_NAMES = {
+      '420_A': ['バドミントン 1', 'バドミントン 2', 'バドミントン 3', 'バドミントン 4', 'バドミントン 5', 'バドミントン 6'],
+      '420_B': ['バドミントン 1', 'バドミントン 2', 'バドミントン 3'],
+      '413_A': ['バドミントン 1', 'バドミントン 2', 'バドミントン 3'],
+      '413_B': ['バドミントン 1', 'バドミントン 2', 'バドミントン 3', 'バドミントン 4'],
+      '413_C': ['バドミントン 1', 'バドミントン 2'],
+      '429_A': ['バドミントン 9', 'バドミントン 10', 'バドミントン 11'],
+      '429_B': ['バドミントン 10', 'バドミントン 11'],
+      '429_C': ['バドミントン 1', 'バドミントン 2', 'バドミントン 3', 'バドミントン 4', 'バドミントン 5', 'バドミントン 6', 'バドミントン 7'],
+      '429_D': ['バドミントン 1', 'バドミントン 2', 'バドミントン 3', 'バドミントン 4', 'バドミントン 5', 'バドミントン 6', 'バドミントン 7', 'バドミントン 8', 'バドミントン 9', 'バドミントン 10', 'バドミントン 11']
+    };
+
+    // ──────────────────────────────────────────
+    // アプリ状態
+    // ──────────────────────────────────────────
+    const state = {
+      slotKey:        '',   // 'YYYY-MM-DD|HH:mm'
+      isUnlocked:     false, // true=解禁済み / false=未解禁
+      dateLabel:      '',
+      slotStart:      '',
+      slotEnd:        '',
+      courseGroups:   [],
+      reserverInfo:   null, // { index, name } — サーバー側で lineUserId 照合済み(§14-11)
+
+      selectedCourseGroup: null, // { facilityId, facilityName, courseGroupId, courseGroupLabel }
+      selectedCourts:      [],   // 解禁済み: 1件 / 未解禁: 最大3件(優先順位)
+      selectedCourtObj:    null, // 解禁済みのみ: { courseTimeId, courtName, patternName, facilityName, imageUrl }
+
+      idToken: '',
+    };
+
+    // ──────────────────────────────────────────
+    // 画面遷移
+    // ──────────────────────────────────────────
+    function showScreen(id) {
+      document.querySelectorAll('.screen').forEach(function(s) { s.classList.remove('active'); });
+      document.getElementById(id).classList.add('active');
+    }
+
+    function renderStepBar(containerId, currentStep, totalSteps) {
+      const labels = ['施設選択', 'コート', '確認'];
+      const el = document.getElementById(containerId);
+      if (!el) return;
+      el.innerHTML = labels.slice(0, totalSteps).map(function(lbl, i) {
+        const n = i + 1;
+        let cls = 'step';
+        if (n < currentStep) cls += ' done';
+        else if (n === currentStep) cls += ' active';
+        return '<div class="' + cls + '">' +
+               '<div><div class="step-num">' + (n < currentStep ? '✓' : n) + '</div></div>' +
+               '<div>' + lbl + '</div>' +
+               '</div>';
+      }).join('');
+    }
+
+    // ──────────────────────────────────────────
+    // 初期化
+    // ──────────────────────────────────────────
+    async function init() {
+      showScreen('screen-loading');
+
+      // LIFF 初期化
+      try {
+        await liff.init({ liffId: LIFF_ID });
+      } catch (e) {
+        showError('LIFF の初期化に失敗しました: ' + e.message);
+        return;
+      }
+
+      if (!liff.isLoggedIn()) {
+        liff.login();
+        return;
+      }
+
+      // ID Token 取得
+      state.idToken = liff.getIDToken() || '';
+      if (!state.idToken) {
+        showError('IDトークンを取得できませんでした。再度ログインしてください。');
+        return;
+      }
+
+      // slotKey を URL パラメータから取得
+      const urlParams = new URLSearchParams(liff.state || window.location.search);
+      state.slotKey = urlParams.get('slotKey') || '';
+      if (!state.slotKey) {
+        showError('予約情報（slotKey）が見つかりません。LINEの予約ボタンから開き直してください。');
+        return;
+      }
+
+      // 初期データ取得
+      let initData;
+      try {
+        const res = await fetchGas('GET', null, {
+          liff: 'reserveGetData',
+          slotKey: state.slotKey,
+          idToken: state.idToken
+        });
+        if (!res.ok || !res.data) throw new Error(res.error || '初期データ取得失敗');
+        initData = res.data;
+      } catch (e) {
+        showError('データの読み込みに失敗しました: ' + e.message);
+        return;
+      }
+
+      state.dateLabel    = initData.dateLabel    || '';
+      state.slotStart    = initData.slotStart    || '';
+      state.slotEnd      = initData.slotEnd      || '';
+      state.courseGroups = initData.courseGroups || [];
+      state.reserverInfo = initData.reserverInfo || null;
+
+      // 解禁チェック: GAS サーバー側（Asia/Tokyo 時刻）で計算した値をそのまま使う
+      // クライアント端末の new Date() で判定すると端末の時刻を変更することで
+      // 未解禁スロットを解禁済みとして扱えてしまう（CWE-807 対策）
+      state.isUnlocked = !!initData.isUnlocked;
+
+      // スロットラベル更新
+      document.getElementById('slotLabel').textContent =
+        state.dateLabel + ' ' + state.slotStart + '〜' + state.slotEnd;
+
+      // 施設・パターン選択画面へ
+      showCourseGroupScreen();
+    }
+
+    // ──────────────────────────────────────────
+    // スクリーン1: 施設・パターン選択
+    // ──────────────────────────────────────────
+    function showCourseGroupScreen() {
+      renderStepBar('stepBar1', 1, 3);
+
+      const list = document.getElementById('courseGroupList');
+      list.innerHTML = '';
+
+      if (state.courseGroups.length === 0) {
+        list.innerHTML = '<div class="error-msg">利用可能な施設・パターン情報がありません。<br>ScriptProperties の設定をご確認ください。</div>';
+        showScreen('screen-courseGroup');
+        return;
+      }
+
+      // 施設・パターンが1種類だけなら自動スキップ
+      if (state.courseGroups.length === 1) {
+        state.selectedCourseGroup = state.courseGroups[0];
+        showCourtScreen();
+        return;
+      }
+
+      state.courseGroups.forEach(function(cg) {
+        const btn = document.createElement('button');
+        btn.className = 'btn-choice';
+        btn.innerHTML = '<div class="label">' + esc(cg.facilityName) + '</div>' +
+                        '<div class="sub">パターン ' + esc(cg.courseGroupLabel) + '</div>';
+        btn.addEventListener('click', function() {
+          state.selectedCourseGroup = cg;
+          showCourtScreen();
+        });
+        list.appendChild(btn);
+      });
+
+      document.getElementById('error-cg').style.display = 'none';
+      showScreen('screen-courseGroup');
+    }
+
+    // ──────────────────────────────────────────
+    // スクリーン2: コート選択（解禁済み）/ 優先順位（未解禁）
+    // ──────────────────────────────────────────
+    async function showCourtScreen() {
+      renderStepBar('stepBar2', 2, 3);
+      document.getElementById('error-court').style.display = 'none';
+      document.getElementById('btnCourtNext').disabled = true;
+      document.getElementById('priorityArea').style.display = 'none';
+      document.getElementById('courtList').innerHTML = '';
+
+      const cg = state.selectedCourseGroup;
+
+      // 割り振り図を表示（ScriptProperties キャッシュから）
+      // ※ imageUrl は reserveScanCourts の結果で取得するため、ここでは空
+      const imgEl = document.getElementById('patternImg');
+      imgEl.classList.remove('loaded');
+
+      document.getElementById('btnCourtBack').onclick = function() { showCourseGroupScreen(); };
+
+      showScreen('screen-court');
+
+      if (state.isUnlocked) {
+        // 解禁済み: scan してコート一覧を表示
+        document.getElementById('courtScreenTitle').textContent = 'コートを選択';
+        document.getElementById('scanLoading').style.display = 'block';
+        document.getElementById('courtList').innerHTML = '';
+
+        let scanData;
+        try {
+          const res = await fetchGas('GET', null, {
+            liff: 'reserveScanCourts',
+            slotKey: state.slotKey,
+            courseGroupId: String(cg.courseGroupId),
+            idToken: state.idToken
+          });
+          if (!res.ok || !res.data) throw new Error(res.error || 'スキャン失敗');
+          scanData = res.data;
+        } catch (e) {
+          document.getElementById('scanLoading').style.display = 'none';
+          showElError('error-court', 'コートの検索に失敗しました: ' + e.message);
+          return;
+        }
+
+        document.getElementById('scanLoading').style.display = 'none';
+
+        if (!scanData.courts || scanData.courts.length === 0) {
+          showElError('error-court', 'このパターンに空きコートが見つかりませんでした。別の施設・パターンをお試しください。');
+          document.getElementById('btnCourtNext').disabled = true;
+          return;
+        }
+
+        // 最初のコートの画像を表示
+        const firstCourt = scanData.courts[0];
+        if (firstCourt.imageUrl) {
+          imgEl.src = firstCourt.imageUrl;
+          imgEl.classList.add('loaded');
+        }
+
+        const list = document.getElementById('courtList');
+        scanData.courts.forEach(function(court) {
+          const btn = document.createElement('button');
+          btn.className = 'btn-choice';
+          btn.innerHTML = '<div class="label">' + esc(court.courtName) + '</div>';
+          btn.addEventListener('click', function() {
+            list.querySelectorAll('.btn-choice').forEach(function(b) { b.classList.remove('selected'); });
+            btn.classList.add('selected');
+            state.selectedCourtObj = court;
+            state.selectedCourts = [court.courseTimeId];
+            document.getElementById('btnCourtNext').disabled = false;
+          });
+          list.appendChild(btn);
+        });
+
+        document.getElementById('btnCourtNext').onclick = function() { showConfirmScreen(); };
+
+      } else {
+        // 未解禁: 固定コート情報を使って優先順位設定
+        document.getElementById('courtScreenTitle').textContent = 'コート優先順位を設定（最大3つ）';
+
+        // §14-9 の固定コート名を facilityId + '_' + courseGroupLabel で引く
+        const cgKey = String(cg.facilityId) + '_' + String(cg.courseGroupLabel);
+        const courtNames = (COURT_NAMES[cgKey] || []).slice();
+        if (courtNames.length === 0) {
+          showElError('error-court', '施設・パターン（' + cgKey + '）のコート情報が見つかりません。管理者にお問い合わせください。');
+          return;
+        }
+
+        // 選択済みコート優先順位: コート名文字列の配列（修正4: 型統一）
+        // localStorageへの保存は廃止（修正3）。端末をまたいだ引き継ぎは
+        // GAS ScriptProperties に保存済みの値を handleLiffReserveGetData から受け取る想定。
+        // （現状 initData に savedPriority が返ってくる拡張余地を残す）
+        var savedPriorityFromServer = (initData.savedPriority || []);
+        state.selectedCourts = savedPriorityFromServer
+          .filter(function(v) { return typeof v === 'string' && v !== ''; })
+          .slice(0, 3);
+
+        const priorityArea = document.getElementById('priorityArea');
+        priorityArea.style.display = 'block';
+        const priorityList = document.getElementById('priorityList');
+
+        function renderPriority() {
+          priorityList.innerHTML = state.selectedCourts.map(function(name, i) {
+            return '<div class="priority-item">' +
+                   '<span class="priority-badge">' + (i + 1) + '位</span>' +
+                   '<span>' + esc(String(name)) + '</span>' +
+                   '<button style="margin-left:auto;font-size:11px;color:#c00;background:none;border:none;cursor:pointer" ' +
+                   'data-idx="' + i + '">削除</button>' +
+                   '</div>';
+          }).join('') || '<div style="color:#aaa;font-size:13px">コートを選択してください</div>';
+
+          priorityList.querySelectorAll('[data-idx]').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+              state.selectedCourts.splice(parseInt(btn.dataset.idx), 1);
+              renderPriority();
+              document.getElementById('btnCourtNext').disabled = state.selectedCourts.length === 0;
+            });
+          });
+          document.getElementById('btnCourtNext').disabled = state.selectedCourts.length === 0;
+        }
+
+        const list = document.getElementById('courtList');
+        list.innerHTML = '';
+        courtNames.forEach(function(name) {
+          const btn = document.createElement('button');
+          btn.className = 'btn-choice';
+          btn.innerHTML = '<div class="label">' + esc(name) + '</div>';
+          btn.addEventListener('click', function() {
+            if (state.selectedCourts.indexOf(name) >= 0) return; // 重複防止
+            if (state.selectedCourts.length >= 3) {
+              showElError('error-court', '優先順位は最大3つまでです。');
+              return;
+            }
+            document.getElementById('error-court').style.display = 'none';
+            state.selectedCourts.push(name); // コート名文字列を追加（修正4）
+            renderPriority();
+          });
+          list.appendChild(btn);
+        });
+
+        renderPriority();
+
+        document.getElementById('btnCourtNext').onclick = function() {
+          // localStorageへの保存は廃止（修正3）
+          // 優先順位は GAS ScriptProperties に保存する（handleLiffReserveQueueSubmit 内で実施）
+          showConfirmScreen();
+        };
+      }
+    }
+
+    // ──────────────────────────────────────────
+    // スクリーン3: 確認(旧スクリーン4)
+    // ──────────────────────────────────────────
+    function showConfirmScreen() {
+      const cg           = state.selectedCourseGroup;
+      const reserverName = state.reserverInfo ? state.reserverInfo.name : '（不明）';
+
+      const rows = [
+        { key: '日時',   val: state.dateLabel + ' ' + state.slotStart + '〜' + state.slotEnd },
+        { key: '施設',   val: cg.facilityName },
+        { key: 'パターン', val: cg.courseGroupLabel },
+      ];
+
+      if (state.isUnlocked && state.selectedCourtObj) {
+        rows.push({ key: 'コート', val: state.selectedCourtObj.courtName });
+        rows.push({ key: '予約者', val: reserverName });
+      } else {
+        rows.push({ key: '優先コート', val: state.selectedCourts.map(function(id, i) {
+          return (i + 1) + '位: ' + id;
+        }).join(' / ') });
+        rows.push({ key: '予約者', val: reserverName });
+        rows.push({ key: '予約日', val: '7日前の朝7:00に自動予約します' });
+      }
+
+      document.getElementById('confirmRows').innerHTML = rows.map(function(r) {
+        return '<div class="confirm-row"><span class="key">' + esc(r.key) + '</span>' +
+               '<span class="val">' + esc(r.val) + '</span></div>';
+      }).join('');
+
+      document.getElementById('error-confirm').style.display = 'none';
+
+      document.getElementById('btnConfirm').disabled = false;
+      document.getElementById('btnConfirm').onclick = function() { doSubmit(); };
+      document.getElementById('btnConfirmBack').onclick = function() { showCourtScreen(); };
+
+      showScreen('screen-confirm');
+    }
+
+    // ──────────────────────────────────────────
+    // 予約実行 / キュー登録
+    // ──────────────────────────────────────────
+    async function doSubmit() {
+      document.getElementById('btnConfirm').disabled = true;
+      document.getElementById('error-confirm').style.display = 'none';
+
+      const cg = state.selectedCourseGroup;
+
+      try {
+        let res;
+        if (state.isUnlocked) {
+          // 即時予約 — reserverIndex は送らない(サーバー側で lineUserId 照合・§14-11)
+          res = await fetchGas('POST', {
+            liff:         'reserveSubmit',
+            idToken:      state.idToken,
+            slotKey:      state.slotKey,
+            facilityId:   cg.facilityId,
+            courseTimeId: state.selectedCourtObj.courseTimeId
+          }, null);
+        } else {
+          // キュー登録 — reserverIndex は送らない(サーバー側で lineUserId 照合・§14-11)
+          const priorities = state.selectedCourts; // コート名文字列の配列（修正4）
+          res = await fetchGas('POST', {
+            liff:           'reserveQueueSubmit',
+            idToken:        state.idToken,
+            slotKey:        state.slotKey,
+            facilityId:     cg.facilityId,
+            courseGroupId:  cg.courseGroupId,
+            courtPriority1: priorities[0] || '',  // コート名文字列（修正4）
+            courtPriority2: priorities[1] || '',
+            courtPriority3: priorities[2] || ''
+          }, null);
+        }
+
+        if (res.ok && res.data && res.data.success !== false) {
+          showDoneScreen(true, res.data);
+        } else {
+          const errMsg = (res.data && res.data.error) || (res.error) || '予約に失敗しました';
+          if (errMsg.indexOf('すでに予約済み') >= 0) {
+            showDoneScreen(false, null, 'このコートはすでに予約済みです。別のコートをお試しください。');
+          } else {
+            showElError('error-confirm', errMsg);
+            document.getElementById('btnConfirm').disabled = false;
+          }
+        }
+      } catch (e) {
+        showElError('error-confirm', '通信エラーが発生しました: ' + e.message);
+        document.getElementById('btnConfirm').disabled = false;
+      }
+    }
+
+    // ──────────────────────────────────────────
+    // スクリーン5: 完了 / エラー
+    // ──────────────────────────────────────────
+    function showDoneScreen(success, data, customMsg) {
+      let html;
+      if (success && state.isUnlocked) {
+        html = '<div class="status-icon">✅</div>' +
+               '<div class="status-msg">予約が完了しました！</div>' +
+               '<div class="status-sub">' +
+               esc(state.dateLabel) + ' ' + esc(state.slotStart) + '〜' + esc(state.slotEnd) + '<br>' +
+               'グループトークに通知が届きます</div>';
+      } else if (success && !state.isUnlocked) {
+        const dateLabel = (data && data.reservableDateLabel) ? data.reservableDateLabel : '7日前';
+        html = '<div class="status-icon">📝</div>' +
+               '<div class="status-msg">予約待ちに登録しました</div>' +
+               '<div class="status-sub">' +
+               esc(dateLabel) + ' 7:00 に自動予約します<br>' +
+               'グループトークに通知が届きます</div>';
+      } else {
+        html = '<div class="status-icon">❌</div>' +
+               '<div class="status-msg">予約できませんでした</div>' +
+               '<div class="status-sub">' + esc(customMsg || '手動でご確認ください') + '</div>';
+      }
+      document.getElementById('doneBox').innerHTML = html;
+      showScreen('screen-done');
+    }
+
+    // ──────────────────────────────────────────
+    // ユーティリティ
+    // ──────────────────────────────────────────
+    async function fetchGas(method, body, params) {
+      let url = GAS_API_URL;
+      if (params) {
+        const qs = Object.keys(params).map(function(k) {
+          return encodeURIComponent(k) + '=' + encodeURIComponent(params[k]);
+        }).join('&');
+        url += (url.indexOf('?') >= 0 ? '&' : '?') + qs;
+      }
+
+      const options = {
+        method: method,
+        headers: { 'Content-Type': 'application/json' }
+      };
+      if (body) options.body = JSON.stringify(body);
+
+      const resp = await fetch(url, options);
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      return resp.json();
+    }
+
+    function showError(msg) {
+      document.getElementById('screen-loading').innerHTML =
+        '<div style="padding:32px 16px"><div class="error-msg">' + esc(msg) + '</div></div>';
+    }
+
+    function showElError(elId, msg) {
+      const el = document.getElementById(elId);
+      el.textContent = msg;
+      el.style.display = 'block';
+    }
+
+    function esc(str) {
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    // ──────────────────────────────────────────
+    // 起動
+    // ──────────────────────────────────────────
+    init();
+  </script>
+</body>
+</html>
