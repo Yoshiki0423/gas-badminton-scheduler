@@ -3,4 +3,4 @@
  *
  * GAS デプロイ URL を更新したとき、このファイルだけ書き換えれば両ページに反映される。
  */
-var GAS_API_URL = 'https://script.google.com/macros/s/AKfycbyed9q9jWEl6ED_8Fpde3brqMcvKoQgiDnU24l31BcI5eHP2DPchHyE5S2FTwPwNAAcPA/exec';
+var GAS_API_URL = 'https://script.google.com/macros/s/AKfycbyhgw1r2RCAyQt5IyG80NLR-ak9607TUun9ma4cNMFboCuOrqbyEWNG5AALqGf_bZ82dQ/exec';
