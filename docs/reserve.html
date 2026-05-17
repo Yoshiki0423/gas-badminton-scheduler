@@ -147,6 +147,7 @@
       <div class="step-bar" id="stepBar2"></div>
       <div class="card">
         <div class="section-title" id="courtScreenTitle">コートを選択</div>
+        <div id="courtScreenSubtitle" style="font-size:0.8rem;color:#666;margin-top:2px;margin-bottom:8px;"></div>
         <div id="error-court" class="error-msg" style="display:none"></div>
         <img id="patternImg" class="pattern-img" alt="割り振り図" />
         <div class="loading" id="scanLoading" style="display:none">
@@ -206,6 +207,16 @@
       '429_C': ['バドミントン 1', 'バドミントン 2', 'バドミントン 3', 'バドミントン 4', 'バドミントン 5', 'バドミントン 6', 'バドミントン 7'],
       '429_D': ['バドミントン 1', 'バドミントン 2', 'バドミントン 3', 'バドミントン 4', 'バドミントン 5', 'バドミントン 6', 'バドミントン 7', 'バドミントン 8', 'バドミントン 9', 'バドミントン 10', 'バドミントン 11']
     };
+
+    // patternName("中体育室 B", "大体育室 A", "Aパターン"等) → 単純ラベル("A","B","C","D")
+    function extractSimpleLabel(patternName) {
+      if (!patternName) return '';
+      var m = patternName.match(/([A-D])\s*$/);
+      if (m) return m[1];
+      var m2 = patternName.match(/^([A-D])パターン/);
+      if (m2) return m2[1];
+      return '';
+    }
 
     // ──────────────────────────────────────────
     // アプリ状態
@@ -344,7 +355,7 @@
           state.courseGroups.map(async function(cg) {
             const cgKey = cg.facilityId + '|' + (cg.courseGroupLabel || String(cg.courseGroupId));
             if (state.scanCache[cgKey]) {
-              return { cg: cg, hasCourts: state.scanCache[cgKey].courts.length > 0 };
+              return { cg: cg, scanData: state.scanCache[cgKey] };
             }
             try {
               const res = await fetchGas('GET', null, {
@@ -354,21 +365,33 @@
                 courseGroupId:  String(cg.courseGroupId),
                 idToken: state.idToken
               });
-              if (res.ok && res.data && res.data.courts) {
+              if (res.ok && res.data && res.data.courts && res.data.courts.length > 0) {
                 state.scanCache[cgKey] = res.data;
-                return { cg: cg, hasCourts: res.data.courts.length > 0 };
+                return { cg: cg, scanData: res.data };
               }
-              return { cg: cg, hasCourts: false };
+              return { cg: cg, scanData: null };
             } catch (e) {
-              return { cg: cg, hasCourts: false };
+              return { cg: cg, scanData: null };
             }
           })
         );
 
-        const validGroups = scanResults
-          .filter(function(r) { return r.hasCourts; })
-          .map(function(r) { return r.cg; });
-        state.courseGroups = validGroups.length > 0 ? validGroups : state.courseGroups;
+        // patternName から実際のパターン("A"/"B" 等)を取り出して (施設, パターン) で重複除去
+        const dedupedMap = {};
+        const dedupedGroups = [];
+        scanResults.forEach(function(r) {
+          if (!r.scanData || !r.scanData.courts || r.scanData.courts.length === 0) return;
+          const effectiveLabel = extractSimpleLabel(r.scanData.courts[0].patternName) || r.cg.courseGroupLabel;
+          const key = r.cg.facilityId + '|' + effectiveLabel;
+          if (!dedupedMap.hasOwnProperty(key)) {
+            dedupedMap[key] = true;
+            const newCg = Object.assign({}, r.cg, { courseGroupLabel: effectiveLabel });
+            dedupedGroups.push(newCg);
+            // 実効キーでもキャッシュを登録しておく（showCourtScreen で再利用）
+            state.scanCache[key] = r.scanData;
+          }
+        });
+        state.courseGroups = dedupedGroups.length > 0 ? dedupedGroups : state.courseGroups;
         list.innerHTML = '';
       }
 
@@ -418,6 +441,8 @@
       if (state.isUnlocked) {
         // 解禁済み: scan してコート一覧を表示
         document.getElementById('courtScreenTitle').textContent = 'コートを選択';
+        document.getElementById('courtScreenSubtitle').textContent =
+          cg.facilityName + '　パターン' + (cg.courseGroupLabel || '');
         document.getElementById('courtList').innerHTML = '';
 
         const cgKey = cg.facilityId + '|' + (cg.courseGroupLabel || String(cg.courseGroupId));

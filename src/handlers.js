@@ -1551,6 +1551,106 @@ function _callScanLambda(date, startTime, courseGroupIds) {
   }
 }
 
+/**
+ * Lambda の getImages アクションを呼んで割り振り図 URL を取得する(内部用・F-6)
+ *
+ * @param {number} courseGroupId
+ * @returns {{ success: boolean, imageUrl: string }}
+ * @throws {Error} AWS_RESERVE_URL 未設定 / HTTP エラー / JSON パースエラー
+ */
+/**
+ * patternName（Lambda が返す文字列）を A/B/C/D の単純ラベルに変換する
+ * 例: "中体育室 B" → "B", "大体育室 A" → "A", "Aパターン" → "A", "A" → "A"
+ */
+function _patternNameToSimpleLabel(patternName) {
+  if (!patternName) return '';
+  // 末尾の英字: "中体育室 B" → "B"
+  var m = patternName.match(/([A-D])\s*$/);
+  if (m) return m[1];
+  // 先頭の Xパターン: "Aパターン" → "A"
+  var m2 = patternName.match(/^([A-D])パターン/);
+  if (m2) return m2[1];
+  return '';
+}
+
+function _callGetImagesLambda(courseGroupId) {
+  var awsUrl   = getProperty('AWS_RESERVE_URL');
+  var apiToken = getProperty('RESERVE_API_TOKEN');
+  if (!awsUrl) {
+    throw new Error('_callGetImagesLambda: AWS_RESERVE_URL が ScriptProperties に設定されていません');
+  }
+
+  var response = UrlFetchApp.fetch(awsUrl, {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { 'X-Api-Token': apiToken || '' },
+    payload: JSON.stringify({ action: 'getImages', courseGroupId: courseGroupId }),
+    muteHttpExceptions: true
+  });
+
+  var statusCode = response.getResponseCode();
+  var responseText = response.getContentText();
+  if (statusCode < 200 || statusCode >= 300) {
+    throw new Error('_callGetImagesLambda: HTTP エラー status=' + statusCode + ' body=' + responseText);
+  }
+
+  try {
+    return JSON.parse(responseText);
+  } catch (e) {
+    throw new Error('_callGetImagesLambda: JSON パースエラー: ' + responseText);
+  }
+}
+
+/**
+ * 全施設の courseGroupId ごとに Lambda getImages を呼んで
+ * ScriptProperties（PATTERN_IMG_{facilityId}_{courseGroupId}）に割り振り図 URL をキャッシュする。
+ *
+ * 毎月スケジュール公開後に手動 or トリガーで実行する。
+ */
+function updatePatternImages() {
+  var targets = [
+    { facilityId: '420', idsPropKey: 'TOYA_COURSE_GROUP_IDS',    labelsPropKey: 'TOYA_COURSE_GROUP_LABELS' },
+    { facilityId: '413', idsPropKey: 'HIGASHI_COURSE_GROUP_IDS', labelsPropKey: 'HIGASHI_COURSE_GROUP_LABELS' },
+    { facilityId: '429', idsPropKey: 'KAMEDA_COURSE_GROUP_IDS',  labelsPropKey: 'KAMEDA_COURSE_GROUP_LABELS' }
+  ];
+
+  for (var ti = 0; ti < targets.length; ti++) {
+    var t = targets[ti];
+    var idsStr    = getProperty(t.idsPropKey) || '';
+    var labelsStr = getProperty(t.labelsPropKey) || '';
+    if (!idsStr || !labelsStr) {
+      console.warn('[WARN] updatePatternImages: ' + t.idsPropKey + ' または ' + t.labelsPropKey + ' が未設定のためスキップ');
+      continue;
+    }
+    var ids    = idsStr.split(',').map(function(s) { return parseInt(s.trim(), 10); }).filter(function(n) { return !isNaN(n); });
+    var labels = labelsStr.split(',').map(function(s) { return s.trim(); });
+
+    // ラベルごとに最初の courseGroupId を選んで getImages を呼ぶ
+    var usedLabels = {};
+    for (var ii = 0; ii < ids.length; ii++) {
+      var label = labels[ii] || '';
+      if (!label || usedLabels.hasOwnProperty(label) || label.indexOf('/') >= 0) continue;
+      usedLabels[label] = true;
+
+      var cgId = ids[ii];
+      try {
+        var imgResult = _callGetImagesLambda(cgId);
+        if (imgResult && imgResult.success && imgResult.imageUrl) {
+          var key = 'PATTERN_IMG_' + t.facilityId + '_' + label;
+          PropertiesService.getScriptProperties().setProperty(key, imgResult.imageUrl);
+          console.log('[INFO] updatePatternImages: ' + key + ' = ' + imgResult.imageUrl);
+        } else {
+          console.warn('[WARN] updatePatternImages: courseGroupId=' + cgId + ' label=' + label + ' imageUrl なし');
+        }
+      } catch (e) {
+        console.warn('[WARN] updatePatternImages: courseGroupId=' + cgId + ' label=' + label + ' エラー: ' + e.message);
+      }
+    }
+  }
+
+  console.log('[INFO] updatePatternImages: 完了');
+}
+
 // ── 旧 postback フロー専用関数は F-6 LIFF方式移行により全削除 ──
 // 削除対象: _doSelectCourtReserve / PATTERN_IMAGE_MAP / _getPatternImageUrl /
 //           _buildCourtSelectionFlex / _buildFacilitySelectionFlex /
@@ -1765,18 +1865,37 @@ function handleLiffReserveScanCourts(slotKey, courseGroupId, courseGroupIds) {
   }
 
   // 画像URL を ScriptProperties から補完する（Lambda は画像URLを返さない）
-  // キー: PATTERN_IMG_{facilityId}_{patternName}
-  // ※ facilityId は courts[0].facilityName を _FACILITY_NAMES の逆引きで解決
+  // キー: PATTERN_IMG_{facilityId}_{label} （例: PATTERN_IMG_420_A）
+  // ※ facilityId は facilityName の逆引き、label は courseGroupId から ScriptProperties を逆引き
   var facilityNameToId = {};
   var fnKeys = Object.keys(_FACILITY_NAMES);
   for (var ki = 0; ki < fnKeys.length; ki++) {
     facilityNameToId[_FACILITY_NAMES[fnKeys[ki]]] = fnKeys[ki];
   }
 
+  // courseGroupId → label のマップを構築
+  var cgIdToLabel = {};
+  var imgTargets = [
+    { facilityId: '420', idsPropKey: 'TOYA_COURSE_GROUP_IDS',    labelsPropKey: 'TOYA_COURSE_GROUP_LABELS' },
+    { facilityId: '413', idsPropKey: 'HIGASHI_COURSE_GROUP_IDS', labelsPropKey: 'HIGASHI_COURSE_GROUP_LABELS' },
+    { facilityId: '429', idsPropKey: 'KAMEDA_COURSE_GROUP_IDS',  labelsPropKey: 'KAMEDA_COURSE_GROUP_LABELS' }
+  ];
+  for (var iti = 0; iti < imgTargets.length; iti++) {
+    var it = imgTargets[iti];
+    var idsArr    = (getProperty(it.idsPropKey) || '').split(',').map(function(s) { return parseInt(s.trim(), 10); });
+    var labelsArr = (getProperty(it.labelsPropKey) || '').split(',').map(function(s) { return s.trim(); });
+    for (var li = 0; li < idsArr.length; li++) {
+      if (!isNaN(idsArr[li]) && labelsArr[li]) {
+        cgIdToLabel[idsArr[li]] = labelsArr[li];
+      }
+    }
+  }
+
   var courts = scanResult.courts.map(function(c) {
-    var fId      = facilityNameToId[c.facilityName] || '';
-    var imgKey   = fId && c.patternName ? 'PATTERN_IMG_' + fId + '_' + c.patternName : '';
-    var imageUrl = imgKey ? (getProperty(imgKey) || '') : '';
+    var fId        = facilityNameToId[c.facilityName] || '';
+    var simpleLabel = _patternNameToSimpleLabel(c.patternName || '');
+    var imgKey     = fId && simpleLabel ? 'PATTERN_IMG_' + fId + '_' + simpleLabel : '';
+    var imageUrl   = imgKey ? (getProperty(imgKey) || '') : '';
     return {
       courseTimeId: c.courseTimeId,
       courtName:    c.courtName,
