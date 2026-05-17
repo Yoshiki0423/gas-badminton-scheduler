@@ -1,21 +1,61 @@
 /**
- * @fileoverview F-1-1 メンバー自動登録機能 / F-5 グループトーク対応 — イベントハンドラー
+ * @fileoverview F-1-1〜F-6 — イベントハンドラー
  *
- * follow / unfollow / join / memberJoined イベントを受け取って、
+ * follow / unfollow / join / memberJoined / message / postback イベントを受け取って、
  * 実際の業務処理(スプレッドシート更新 + メッセージ送信)を行うファイルです。
  *
  * 各関数の役割を 1 行で:
- *   - handleFollow(event)               : 新メンバー登録 + 歓迎メッセージ(1対1用・後方互換)
- *   - handleUnfollow(event)             : メンバーを inactive に変更(削除はしない)
- *   - handleJoin(event)                 : グループ参加時にグループ ID を保存する(F-5)
- *   - handleMemberJoined(event)         : グループへの新メンバー参加時に自動登録する(F-5)
- *   - handleDistributeSurvey()          : グループトークに 2 ボタン Flex Message を Push 配信(F-1-3 / F-3-6 / F-5)
- *   - handleSendReminders()             : 未回答メンバーに個別 Push を再送(F-1-5 / F-3-6・変更なし)
- *   - handleLiffGetData(userId)         : F-4 グリッドフォーム用データ取得(日付×スロット構造)
- *   - handleLiffSubmitFast(userId, answers) : F-4 回答一括送信(新データモデル)
- *   - handleLiffGetAllResponses()       : F-4 LIFF 回答状況確認ページ用データ取得
- *   - _checkAndNotifyViableSlots()      : 4人以上即通知チェック(F-5)
+ *   - handleFollow(event)                        : 新メンバー登録 + 歓迎メッセージ(1対1用・後方互換)
+ *   - handleUnfollow(event)                      : メンバーを inactive に変更(削除はしない)
+ *   - handleJoin(event)                          : グループ参加時にグループ ID を保存する(F-5)
+ *   - handleMemberJoined(event)                  : グループへの新メンバー参加時に自動登録する(F-5)
+ *   - handleDistributeSurvey()                   : グループトークに 2 ボタン Flex Message を Push 配信(F-1-3 / F-3-6 / F-5)
+ *   - handleSendReminders()                      : 未回答メンバーに個別 Push を再送(F-1-5 / F-3-6)
+ *   - handleLiffGetData(userId)                  : F-4 グリッドフォーム用データ取得(日付×スロット構造)
+ *   - handleLiffSubmitFast(userId, answers)      : F-4 回答一括送信(新データモデル)
+ *   - handleLiffGetAllResponses()                : F-4 LIFF 回答状況確認ページ用データ取得
+ *   - _checkAndNotifyViableSlots()               : 4人以上即通知チェック(F-5 / F-6: ボタン付きFlexメッセージ)
+ *   - handlePostback(event)                      : postback イベント処理 — 予約フロー全体を管理(F-6)
+ *   - _doImmediateReserve(...)                   : 7日以内スロットの即時予約フロー(scan→選択Flex表示)(F-6)
+ *   - _enqueueReservation(...)                   : 8日以上先スロットをキューに登録(F-6)
+ *   - _doSelectCourtReserve(...)                 : コート確定後に Lambda 予約を実行(F-6)
+ *   - _doSelectFacilityReserve(...)              : 施設選択後に再 scan してコート選択Flexを表示(F-6)
+ *   - _callReserveLambda(slotKey, facilityId, courseTimeId) : AWS Lambda 経由で予約フォームを送信(F-6)
+ *   - _callScanLambda(date, startTime, courseGroupIds)      : AWS Lambda 経由で空きコートを取得(F-6)
+ *   - _buildReserveBubble(slotKey, canCount, facilityId)    : 「予約する」ボタン付き Flex Bubble(F-6)
+ *   - _buildCourtSelectionFlex(...)              : コート選択用 Flex Bubble(F-6)
+ *   - _buildFacilitySelectionFlex(...)           : 施設選択用 Flex Bubble(F-6)
+ *   - _buildReserveConfirmFlex(...)              : 予約確認用 Flex Bubble(F-6)
  */
+
+// ─────────────────────────────────────────────
+// モジュールレベル定数(各関数で重複定義していたものを一元管理)
+// ─────────────────────────────────────────────
+
+/**
+ * スロット開始時刻 → 終了時刻 のマッピング
+ * 全ファイルで共通して使う 2 時間枠の定義。
+ * @type {Object}
+ */
+var _SLOT_ENDS = {
+  '09:00': '11:00', '11:00': '13:00', '13:00': '15:00',
+  '15:00': '17:00', '17:00': '19:00', '19:00': '21:00'
+};
+
+/**
+ * 施設 ID → 施設名 のマッピング
+ * @type {Object}
+ */
+var _FACILITY_NAMES = {
+  '420': '鳥屋野総合体育館',
+  '413': '東総合スポーツセンター'
+};
+
+/**
+ * 曜日ラベル配列(インデックス 0 = 日曜)
+ * @type {string[]}
+ */
+var _WEEKDAYS = ['日', '月', '火', '水', '木', '金', '土'];
 
 /**
  * follow イベント処理 — F-1-1 の本体
@@ -604,10 +644,6 @@ function _checkAllRespondedAndNotify() {
  */
 function _buildSlotResultMessage(viableSlots, canCounts, undecidedCounts) {
   var lines = ['【日程調整 結果】'];
-  var SLOT_ENDS = {
-    '09:00': '11:00', '11:00': '13:00', '13:00': '15:00',
-    '15:00': '17:00', '17:00': '19:00', '19:00': '21:00'
-  };
 
   if (viableSlots.length === 0) {
     lines.push('');
@@ -623,16 +659,15 @@ function _buildSlotResultMessage(viableSlots, canCounts, undecidedCounts) {
       var parts = viableSlots[i].split('|');
       var date = parts[0];
       var slotStart = parts[1];
-      var slotEnd = SLOT_ENDS[slotStart] || '?';
+      var slotEnd = _SLOT_ENDS[slotStart] || '?';
       var canCount = canCounts[viableSlots[i]] || 0;
       var undecidedCount = undecidedCounts[viableSlots[i]] || 0;
       var total = canCount + undecidedCount;
 
-      var weekdays = ['日', '月', '火', '水', '木', '金', '土'];
       var d = new Date(date + 'T00:00:00+09:00');
       var m = d.getMonth() + 1;
       var day = d.getDate();
-      var w = weekdays[d.getDay()];
+      var w = _WEEKDAYS[d.getDay()];
 
       var countStr = total + '人: ○' + canCount;
       if (undecidedCount > 0) { countStr += ' △' + undecidedCount; }
@@ -657,11 +692,10 @@ function _buildSlotResultMessage(viableSlots, canCounts, undecidedCounts) {
  * @private
  */
 function _formatDateTimeLabel(schedule) {
-  var weekdays = ['日', '月', '火', '水', '木', '金', '土'];
   var date = new Date(schedule.date + 'T00:00:00+09:00');
   var m = date.getMonth() + 1;
   var d = date.getDate();
-  var w = weekdays[date.getDay()];
+  var w = _WEEKDAYS[date.getDay()];
   return m + '/' + d + '(' + w + ') ' + schedule.startTime + '〜' + schedule.endTime;
 }
 
@@ -877,14 +911,13 @@ function handleLiffGetData(userId) {
   dateOrder.sort();  // 日付昇順
 
   var SLOT_STARTS = ['09:00', '11:00', '13:00', '15:00', '17:00', '19:00'];
-  var weekdays = ['日', '月', '火', '水', '木', '金', '土'];
 
   var dates = dateOrder.map(function (dateStr) {
     var daySchedules = dateMap[dateStr];
     var d = new Date(dateStr + 'T00:00:00+09:00');
     var m = d.getMonth() + 1;
     var day = d.getDate();
-    var w = weekdays[d.getDay()];
+    var w = _WEEKDAYS[d.getDay()];
     var dateLabel = m + '/' + day + '(' + w + ')';
 
     // 施設情報1行: "📍東総合 13〜21 / 鳥屋野 終日"
@@ -929,11 +962,7 @@ function handleLiffGetData(userId) {
 function _isSlotAvailable(slotStart, daySchedules) {
   if (!daySchedules || daySchedules.length === 0) return false;
 
-  var SLOT_END_MAP = {
-    '09:00': '11:00', '11:00': '13:00', '13:00': '15:00',
-    '15:00': '17:00', '17:00': '19:00', '19:00': '21:00'
-  };
-  var slotEnd = SLOT_END_MAP[slotStart];
+  var slotEnd = _SLOT_ENDS[slotStart];
   if (!slotEnd) return false;
 
   for (var i = 0; i < daySchedules.length; i++) {
@@ -1133,23 +1162,27 @@ function handleLiffGetAllResponses() {
 }
 
 // ─────────────────────────────────────────────
-// F-5: 4人以上即通知
+// F-5: 4人以上即通知 / F-6: 予約ボタン付き Flex メッセージ
 // ─────────────────────────────────────────────
 
 /**
- * LIFF 回答送信後に「4人以上即通知」チェックを実行する(F-5 / Code.js から呼ばれる)
+ * LIFF 回答送信後に「4人以上即通知」チェックを実行する(F-5 / F-6 対応版)
+ *
+ * F-6 変更点:
+ *   テキスト通知から「予約する」ボタン付き Flex メッセージに変更。
+ *   スロットが1件なら bubble 1枚、複数なら carousel(最大 10件)で送信する。
  *
  * 処理フロー:
  *   1. getAllSlotResponses() で全回答を取得
  *   2. スロットごとに can 票数を集計
  *   3. MIN_ATTENDEES(4) 以上のスロットを抽出
  *   4. 各スロットについて ScriptProperties の VIABLE_NOTIFIED_SLOT_<date>|<slotStart> を確認
- *   5. まだ通知していないスロットがあればグループに 1 通まとめて通知
+ *   5. まだ通知していないスロットがあればグループに Flex メッセージで通知
  *   6. 通知したスロットに VIABLE_NOTIFIED_SLOT_* = 'true' を保存
  *
  * 設計上の注意:
  *   - グループ ID が未設定の場合はログのみ・処理をスキップ(エラーにしない)
- *   - 複数スロットが同時に条件を満たした場合は 1 通にまとめて送る
+ *   - 複数スロットが同時に条件を満たした場合は carousel にまとめて 1 通送る
  *   - このチェックは「can 票数のみ」で判定する(undecided は含めない)
  *   - 例外が発生しても呼び出し元の回答送信処理には影響しないよう try-catch で囲む
  *
@@ -1197,35 +1230,36 @@ function _checkAndNotifyViableSlots() {
 
     newlyViableSlots.sort();  // 日付・時刻順
 
-    // (3) 通知メッセージを組み立てる
-    var SLOT_ENDS = {
-      '09:00': '11:00', '11:00': '13:00', '13:00': '15:00',
-      '15:00': '17:00', '17:00': '19:00', '19:00': '21:00'
-    };
-    var weekdays = ['日', '月', '火', '水', '木', '金', '土'];
-
-    var lines = ['4人以上参加できる時間帯が見つかりました！🏸', ''];
+    // (3) スロットごとに「予約する」ボタン付き Flex Bubble を作り、carousel にまとめる
+    var facilityId = getProperty('DEFAULT_FACILITY_ID') || '420';
+    var bubbles = [];
     for (var n = 0; n < newlyViableSlots.length; n++) {
-      var parts = newlyViableSlots[n].split('|');
-      var date = parts[0];
-      var slotStart = parts[1];
-      var slotEnd = SLOT_ENDS[slotStart] || '?';
-      var canCount = canCounts[newlyViableSlots[n]] || 0;
-
-      var d = new Date(date + 'T00:00:00+09:00');
-      var m = d.getMonth() + 1;
-      var day = d.getDate();
-      var w = weekdays[d.getDay()];
-
-      lines.push('・' + m + '/' + day + '(' + w + ') ' + slotStart + '〜' + slotEnd +
-                 '（○' + canCount + '人）');
+      bubbles.push(_buildReserveBubble(newlyViableSlots[n], canCounts[newlyViableSlots[n]], facilityId));
     }
-    var message = lines.join('\n');
+
+    // LINE Carousel の上限（10件）に制限
+    if (bubbles.length > 10) {
+      bubbles = bubbles.slice(0, 10);
+    }
+
+    var flexContents;
+    var altText = '4人以上参加できる時間帯が見つかりました！予約しますか？';
+    if (bubbles.length === 1) {
+      flexContents = bubbles[0];
+    } else {
+      flexContents = {
+        type: 'carousel',
+        contents: bubbles
+      };
+    }
 
     // (4) グループに通知
-    pushText(groupId, message);
+    withRetry(function () {
+      return pushFlexMessage(groupId, altText, flexContents);
+    }, { maxAttempts: DEFAULT_MAX_ATTEMPTS, baseDelayMs: 1000, label: 'pushViableSlotsFlex' });
+
     console.log('[INFO] _checkAndNotifyViableSlots: ' + newlyViableSlots.length +
-                ' スロットをグループに通知しました');
+                ' スロットをグループに Flex メッセージで通知しました');
 
     // (5) 通知済みフラグを保存
     for (var f = 0; f < newlyViableSlots.length; f++) {
@@ -1236,5 +1270,1032 @@ function _checkAndNotifyViableSlots() {
   } catch (err) {
     logError(err, { phase: '_checkAndNotifyViableSlots' });
     // 呼び出し元(回答送信)の処理を止めないため、例外は再 throw しない
+  }
+}
+
+/**
+ * 「予約する」ボタン付きの Flex Bubble を組み立てる(内部用・F-6)
+ *
+ * 生成する Bubble の構成:
+ *   header: 「4人以上確定！」(緑背景)
+ *   body  : 日時・参加人数
+ *   footer: 「予約する」ボタン(postback アクション)
+ *
+ * postback data 形式: action=reserve&slotKey=YYYY-MM-DD|HH:mm&facilityId=420
+ *
+ * @param {string} slotKey    - 'YYYY-MM-DD|HH:mm' 形式
+ * @param {number} canCount   - can 票数
+ * @param {string} facilityId - 施設 ID 文字列(例: '420')
+ * @returns {Object} LINE Flex Message の bubble オブジェクト
+ * @private
+ */
+function _buildReserveBubble(slotKey, canCount, facilityId) {
+  var parts = slotKey.split('|');
+  var date = parts[0];
+  var slotStart = parts[1];
+  var slotEnd = _SLOT_ENDS[slotStart] || '?';
+  var facilityName = _FACILITY_NAMES[String(facilityId)] || ('施設ID:' + facilityId);
+
+  var d = new Date(date + 'T00:00:00+09:00');
+  var m = d.getMonth() + 1;
+  var day = d.getDate();
+  var w = _WEEKDAYS[d.getDay()];
+  var dateLabel = m + '月' + day + '日(' + w + ')';
+
+  var postbackData = 'action=reserve&slotKey=' +
+    encodeURIComponent(slotKey) + '&facilityId=' + encodeURIComponent(facilityId);
+
+  return {
+    type: 'bubble',
+    header: {
+      type: 'box',
+      layout: 'vertical',
+      backgroundColor: '#06C755',
+      contents: [{
+        type: 'text',
+        text: '4人以上確定！🏸',
+        weight: 'bold',
+        size: 'lg',
+        color: '#FFFFFF'
+      }]
+    },
+    body: {
+      type: 'box',
+      layout: 'vertical',
+      spacing: 'sm',
+      contents: [
+        {
+          type: 'text',
+          text: dateLabel,
+          weight: 'bold',
+          size: 'xl'
+        },
+        {
+          type: 'text',
+          text: slotStart + '〜' + slotEnd,
+          size: 'lg',
+          color: '#333333'
+        },
+        {
+          type: 'text',
+          text: facilityName,
+          size: 'sm',
+          color: '#888888',
+          wrap: true
+        },
+        {
+          type: 'text',
+          text: '参加確定: ' + canCount + '人',
+          size: 'sm',
+          color: '#06C755'
+        }
+      ]
+    },
+    footer: {
+      type: 'box',
+      layout: 'vertical',
+      contents: [{
+        type: 'button',
+        style: 'primary',
+        color: '#06C755',
+        action: {
+          type: 'postback',
+          label: '予約する',
+          data: postbackData,
+          displayText: '予約します'
+        }
+      }]
+    }
+  };
+}
+
+// ─────────────────────────────────────────────
+// F-6: postback ハンドラー / AWS Lambda 呼び出し
+// ─────────────────────────────────────────────
+
+/**
+ * postback イベント処理 — F-6 予約フロー全体を管理する
+ *
+ * 処理フロー:
+ *   1. postback データを parse して action / slotKey / facilityId を取り出す
+ *   2. RESERVE_ENABLED フラグが 'true' でなければ機能全体を無効にする
+ *   3. action に応じて各サブフローへ分岐する:
+ *      - reserve       : 「予約する」ボタン初回タップ → scan → 施設/コート選択Flex 表示
+ *      - selectFacility: 施設選択 → 再 scan → コート選択Flex 表示
+ *      - selectCourt   : コート選択 → 予約確認Flex 表示
+ *      - confirmReserve: 予約確認後 → _callReserveLambda() で実際に予約実行
+ *   4. 利用日が今日から 7 日以内 → _doImmediateReserve() で即時予約フロー
+ *   5. 利用日が 8 日以上先 → _enqueueReservation() でキューに登録
+ *
+ * グループ ID の取得方法:
+ *   event.source.groupId を優先し、なければ ScriptProperties の LINE_GROUP_ID を使う。
+ *
+ * @param {Object} event - LINE postback イベント
+ * @returns {void}
+ */
+function handlePostback(event) {
+  // RESERVE_ENABLED フラグが 'true' でなければ機能全体を無効にする(TBD-18 実機検証完了まで)
+  if (getProperty('RESERVE_ENABLED') !== 'true') {
+    var guardGroupId = (event && event.source && event.source.groupId)
+      ? event.source.groupId
+      : getProperty('LINE_GROUP_ID');
+    if (guardGroupId) {
+      try {
+        pushText(guardGroupId, '⚠️ 自動予約機能は現在準備中です。手動でご予約ください。');
+      } catch (_) {}
+    }
+    console.log('[INFO] handlePostback: RESERVE_ENABLED が true でないためスキップします');
+    return;
+  }
+
+  var data = (event && event.postback && event.postback.data) ? event.postback.data : '';
+  if (!data) {
+    console.warn('[WARN] handlePostback: postback.data が空です');
+    return;
+  }
+
+  var params = _parsePostbackData(data);
+
+  // action=reserve / selectCourt / selectFacility / confirmReserve 以外は無視
+  var validActions = { reserve: true, selectCourt: true, selectFacility: true, confirmReserve: true };
+  if (!validActions[params.action]) {
+    console.log('[INFO] handlePostback: 未対応の action=' + params.action);
+    return;
+  }
+
+  var slotKey    = params.slotKey    || '';
+  var facilityId = params.facilityId || '420';
+
+  if (!slotKey) {
+    logError(new Error('handlePostback: slotKey が空です'), { phase: 'handlePostback.validate', data: data });
+    return;
+  }
+
+  // グループ ID を取得(event.source.groupId > ScriptProperties の優先順)
+  var groupId = (event && event.source && event.source.groupId)
+    ? event.source.groupId
+    : getProperty('LINE_GROUP_ID');
+
+  if (!groupId) {
+    logError(new Error('handlePostback: LINE_GROUP_ID が未設定です'), { phase: 'handlePostback.groupId' });
+    return;
+  }
+
+  // (3) 二重予約防止チェック（confirmReserve・selectCourt のみ対象）
+  if (params.action === 'confirmReserve' || params.action === 'selectCourt') {
+    var reservedFlagKey = 'RESERVED_SLOT_' + slotKey;
+    var alreadyReserved = getProperty(reservedFlagKey);
+    if (alreadyReserved === 'true') {
+      try {
+        pushText(groupId, 'このスロットはすでに予約済みです。\n別の日時をご確認ください。');
+      } catch (pushErr) {
+        logError(pushErr, { phase: 'handlePostback.alreadyReserved.push' });
+      }
+      console.log('[INFO] handlePostback: 二重予約防止 slotKey=' + slotKey);
+      return;
+    }
+  }
+
+  // action=confirmReserve: 確認Flex後の実際の予約実行
+  if (params.action === 'confirmReserve') {
+    var confirmCourseTimeId = parseInt(params.courseTimeId, 10);
+    if (!confirmCourseTimeId) {
+      logError(new Error('handlePostback: courseTimeId が空です'), { phase: 'handlePostback.confirmReserve', data: data });
+      return;
+    }
+    _doSelectCourtReserve(groupId, slotKey, facilityId, confirmCourseTimeId);
+    return;
+  }
+
+  // action=selectCourt: コート選択 → 予約確認Flexを表示
+  if (params.action === 'selectCourt') {
+    var selectedCourseTimeId = parseInt(params.courseTimeId, 10);
+    if (!selectedCourseTimeId) {
+      logError(new Error('handlePostback: courseTimeId が空です'), { phase: 'handlePostback.selectCourt', data: data });
+      return;
+    }
+    var courtPatternName  = params.patternName  || '';
+    var courtFacilityName = params.facilityName || '';
+    // slotKey から日時ラベルを生成
+    var scPipeIdx  = slotKey.indexOf('|');
+    var scUseDate  = slotKey.substring(0, scPipeIdx);
+    var scStart    = slotKey.substring(scPipeIdx + 1);
+    var scBubble   = _buildReserveConfirmFlex(
+      slotKey, facilityId, selectedCourseTimeId,
+      courtPatternName, courtFacilityName, scUseDate, scStart
+    );
+    try {
+      withRetry(function() {
+        return pushFlexMessage(groupId, '予約内容を確認してください', scBubble);
+      }, { maxAttempts: DEFAULT_MAX_ATTEMPTS, baseDelayMs: 1000, label: 'pushConfirmFlex' });
+    } catch (flexErr) {
+      logError(flexErr, { phase: 'handlePostback.selectCourt.confirmFlex', slotKey: slotKey });
+    }
+    return;
+  }
+
+  // action=selectFacility: 施設選択 → その courseGroupId のコート選択Flexを表示
+  if (params.action === 'selectFacility') {
+    var sfCourseGroupId = parseInt(params.courseGroupId, 10);
+    if (!sfCourseGroupId) {
+      logError(new Error('handlePostback: courseGroupId が空です'), { phase: 'handlePostback.selectFacility', data: data });
+      return;
+    }
+    _doSelectFacilityReserve(groupId, slotKey, facilityId, sfCourseGroupId);
+    return;
+  }
+
+  // action=reserve: 「予約する」ボタン初回タップ → scan → 施設/コート選択Flex
+  // 二重予約防止チェック（action=reserve でも確認する）
+  var rfKey = 'RESERVED_SLOT_' + slotKey;
+  if (getProperty(rfKey) === 'true') {
+    try {
+      pushText(groupId, 'このスロットはすでに予約済みです。\n別の日時をご確認ください。');
+    } catch (pushErr) {
+      logError(pushErr, { phase: 'handlePostback.reserve.alreadyReserved.push' });
+    }
+    return;
+  }
+
+  // slotKey から利用日(date)を取り出す
+  var pipeIdx = slotKey.indexOf('|');
+  if (pipeIdx < 0) {
+    logError(new Error('handlePostback: slotKey の形式が不正です: ' + slotKey), { phase: 'handlePostback.slotKeyParse' });
+    return;
+  }
+  var useDate = slotKey.substring(0, pipeIdx);
+  var slotStart = slotKey.substring(pipeIdx + 1);
+
+  // 今日から何日後か計算
+  var todayStr = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM-dd');
+  var todayDate  = new Date(todayStr + 'T00:00:00+09:00');
+  var targetDate = new Date(useDate  + 'T00:00:00+09:00');
+  var diffDays = Math.round((targetDate.getTime() - todayDate.getTime()) / (1000 * 60 * 60 * 24));
+
+  var facilityName = _FACILITY_NAMES[String(facilityId)] || ('施設ID:' + facilityId);
+
+  if (diffDays <= 7) {
+    // (4) 7日以内 → 即時予約フロー（scan → 施設/コート選択Flex）
+    _doImmediateReserve(groupId, slotKey, facilityId, facilityName, useDate, slotStart);
+  } else {
+    // (5) 8日以上先 → キューに登録して予約待ち通知
+    _enqueueReservation(groupId, slotKey, facilityId, facilityName, useDate, slotStart);
+  }
+}
+
+/**
+ * 即時予約処理(内部用・F-6)
+ *
+ * Lambda(scan)を呼んで空きコートを調べ、施設/コート選択 Flex を表示する。
+ * 施設が1種類なら直接コート選択Flex、2種類以上なら施設選択Flexを表示する。
+ *
+ * @param {string} groupId
+ * @param {string} slotKey
+ * @param {string} facilityId
+ * @param {string} facilityName
+ * @param {string} useDate     - 'YYYY-MM-DD'
+ * @param {string} slotStart   - 'HH:mm'
+ * @private
+ */
+function _doImmediateReserve(groupId, slotKey, facilityId, facilityName, useDate, slotStart) {
+  var slotEnd = _SLOT_ENDS[slotStart] || '?';
+  var d = new Date(useDate + 'T00:00:00+09:00');
+  var m = d.getMonth() + 1;
+  var day = d.getDate();
+  var w = _WEEKDAYS[d.getDay()];
+  var dateLabel = m + '月' + day + '日(' + w + ')';
+
+  // scan で空きコートを調べる
+  // courseGroupIds は ScriptProperties から取得（週ごとに更新が必要）
+  // 例: TOYA_COURSE_GROUP_IDS = "14879,14881,14882,14883,14884,14885,14886"
+  //     HIGASHI_COURSE_GROUP_IDS = "14791"
+  var idPropKey = String(facilityId) === '420' ? 'TOYA_COURSE_GROUP_IDS' : 'HIGASHI_COURSE_GROUP_IDS';
+  var idPropVal = getProperty(idPropKey) || '';
+  var courseGroupIds = idPropVal
+    ? idPropVal.split(',').map(function (s) { return parseInt(s.trim(), 10); }).filter(function (n) { return !isNaN(n); })
+    : [];
+
+  var scanResult;
+  try {
+    scanResult = _callScanLambda(useDate, slotStart, courseGroupIds);
+  } catch (scanErr) {
+    logError(scanErr, { phase: '_doImmediateReserve.scan', slotKey: slotKey });
+    try {
+      pushText(groupId,
+        '❌ 空きコートの検索中にエラーが発生しました。\n' +
+        dateLabel + ' ' + slotStart + '〜' + slotEnd + '\n' +
+        '手動で予約をお試しください。'
+      );
+    } catch (_) {}
+    return;
+  }
+
+  if (!scanResult || !scanResult.success || !scanResult.courts || scanResult.courts.length === 0) {
+    try {
+      pushText(groupId,
+        '😢 空きコートが見つかりませんでした。\n' +
+        dateLabel + ' ' + slotStart + '〜' + slotEnd + '\n' +
+        facilityName + '\n\n' +
+        '手動でご確認ください。'
+      );
+    } catch (_) {}
+    return;
+  }
+
+  var courts = scanResult.courts;
+
+  // facilityName でグループ化する
+  // groups = { '鳥屋野総合体育館': [ { court... }, ... ], '東総合スポーツセンター': [...] }
+  var groups = {};
+  var groupOrder = []; // 施設名の登場順を保持する
+  for (var gi = 0; gi < courts.length; gi++) {
+    var c = courts[gi];
+    var gKey = c.facilityName || facilityName; // Lambda が facilityName を返さない場合の fallback
+    if (!groups[gKey]) {
+      groups[gKey] = [];
+      groupOrder.push(gKey);
+    }
+    groups[gKey].push(c);
+  }
+
+  var facilityCount = groupOrder.length;
+
+  if (facilityCount <= 1) {
+    // 施設が1種類（または facilityName 未設定で混在） → コート選択Flexを表示
+    var singleFacilityName = groupOrder[0] || facilityName;
+    var singleCourts = groups[singleFacilityName] || courts;
+    // patternName は全コートで同じはずなのでの最初の値を使う
+    var singlePatternName = (singleCourts[0] && singleCourts[0].patternName) || '';
+    try {
+      var selFlex = _buildCourtSelectionFlex(
+        slotKey, facilityId, singleFacilityName, singlePatternName,
+        dateLabel, slotStart, slotEnd, singleCourts
+      );
+      withRetry(function() {
+        return pushFlexMessage(groupId,
+          'コートを選んでください（' + singleCourts.length + '面空きあり）', selFlex);
+      }, { maxAttempts: DEFAULT_MAX_ATTEMPTS, baseDelayMs: 1000, label: 'pushCourtSelection' });
+    } catch (flexErr) {
+      logError(flexErr, { phase: '_doImmediateReserve.courtSelection', slotKey: slotKey });
+    }
+  } else {
+    // 施設が2種類以上 → 施設選択Flexを表示
+    try {
+      var facFlex = _buildFacilitySelectionFlex(
+        slotKey, facilityId, dateLabel, slotStart, slotEnd, groups, groupOrder
+      );
+      withRetry(function() {
+        return pushFlexMessage(groupId,
+          '施設を選んでください（' + facilityCount + '施設に空きあり）', facFlex);
+      }, { maxAttempts: DEFAULT_MAX_ATTEMPTS, baseDelayMs: 1000, label: 'pushFacilitySelection' });
+    } catch (flexErr) {
+      logError(flexErr, { phase: '_doImmediateReserve.facilitySelection', slotKey: slotKey });
+    }
+  }
+}
+
+/**
+ * 予約待ちキューへの登録処理(内部用・F-6)
+ *
+ * reserve-queue シートにエントリを追加し、グループに「X月X日7:00に自動予約」を通知する。
+ *
+ * @param {string} groupId
+ * @param {string} slotKey
+ * @param {string} facilityId
+ * @param {string} facilityName
+ * @param {string} useDate     - 'YYYY-MM-DD'
+ * @param {string} slotStart   - 'HH:mm'
+ * @private
+ */
+function _enqueueReservation(groupId, slotKey, facilityId, facilityName, useDate, slotStart) {
+  // 予約可能日 = 利用日の 7 日前
+  var targetDate = new Date(useDate + 'T00:00:00+09:00');
+  targetDate.setDate(targetDate.getDate() - 7);
+  var reservableDate = Utilities.formatDate(targetDate, 'Asia/Tokyo', 'yyyy-MM-dd');
+
+  var slotEnd = _SLOT_ENDS[slotStart] || '?';
+
+  // 利用日のラベル
+  var d = new Date(useDate + 'T00:00:00+09:00');
+  var m = d.getMonth() + 1;
+  var day = d.getDate();
+  var w = _WEEKDAYS[d.getDay()];
+  var dateLabel = m + '月' + day + '日(' + w + ')';
+
+  // 予約可能日(X月X日)のラベル — 通知文で使う
+  var rd = new Date(reservableDate + 'T00:00:00+09:00');
+  var rm = rd.getMonth() + 1;
+  var rday = rd.getDate();
+  var rw = _WEEKDAYS[rd.getDay()];
+  var reservableDateLabel = rm + '月' + rday + '日(' + rw + ')';
+
+  try {
+    addReserveQueue({
+      slotKey:       slotKey,
+      facilityId:    facilityId,
+      facilityName:  facilityName,
+      reservableDate: reservableDate,
+      status:        'pending'
+    });
+
+    pushText(groupId,
+      '🕐 予約待ちに登録しました。\n' +
+      dateLabel + ' ' + slotStart + '〜' + slotEnd + '\n' +
+      facilityName + '\n\n' +
+      reservableDateLabel + ' 7:00 に自動予約します。'
+    );
+    console.log('[INFO] _enqueueReservation: キュー登録完了 slotKey=' + slotKey +
+                ' reservableDate=' + reservableDate);
+  } catch (err) {
+    logError(err, { phase: '_enqueueReservation', slotKey: slotKey });
+    try {
+      pushText(groupId, '❌ 予約待ち登録中にエラーが発生しました。手動でご確認ください。');
+    } catch (_) {}
+  }
+}
+
+/**
+ * AWS Lambda 経由でバド卓ねっとの予約フォームを送信する(内部用・F-6)
+ *
+ * 【楽観的ロック方式の冪等性保証】
+ *   1. Lambda 呼び出し「前」に RESERVED_SLOT_{slotKey} を 'true' にセットする
+ *      (先にフラグを立てることで、GAS が二重に Lambda を呼ばないようにする)
+ *   2. Lambda が成功 → フラグは 'true' のまま維持する
+ *   3. Lambda が失敗(例外 or success=false) → フラグを 'false' に戻す
+ *      (次回の processReserveQueue や再実行で再試行できるように解放する)
+ *
+ * ※ 注意: フラグのセットと Lambda 呼び出しの間に GAS プロセスがクラッシュした場合は
+ *   フラグが 'true' のままになる可能性がある(過剰ロック)。
+ *   その場合は ScriptProperties の RESERVED_SLOT_{slotKey} を手動で 'false' に戻すこと。
+ *
+ * ※ Code.js の processReserveQueue から呼ぶ場合は、事前に _callScanLambda で
+ *   courseTimeId を取得してから渡すこと（キューフロー用の scan は Code.js 側の責務）。
+ *
+ * Lambda へのリクエスト(JSON):
+ *   { courseTimeId, name, tel, email }
+ *
+ * Lambda からのレスポンス(JSON):
+ *   { success: true/false, message: "...", uncertain?: true }
+ *
+ * ScriptProperties から取得するキー:
+ *   AWS_RESERVE_URL   : API Gateway URL
+ *   RESERVE_API_TOKEN : Lambda との合言葉トークン（X-Api-Token ヘッダーに付与）
+ *   RESERVE_NAME      : 予約代表者の氏名
+ *   RESERVE_TEL       : 予約代表者の電話番号（RESERVE_PHONE でも可）
+ *   RESERVE_EMAIL     : 予約代表者のメールアドレス
+ *
+ * @param {string} slotKey      - 'YYYY-MM-DD|HH:mm' 形式（二重予約防止フラグのキーに使用）
+ * @param {string} facilityId   - 施設 ID（ログ用）
+ * @param {number} courseTimeId - 予約する時間枠 ID（_callScanLambda で取得した値）
+ * @returns {{ success: boolean, message: string }}
+ * @throws {Error} AWS_RESERVE_URL 未設定 / courseTimeId 未指定 / HTTP エラー / JSON パースエラー
+ */
+function _callReserveLambda(slotKey, facilityId, courseTimeId) {
+  var awsUrl       = getProperty('AWS_RESERVE_URL');
+  var reserveName  = getProperty('RESERVE_NAME');
+  var reserveTel   = getProperty('RESERVE_TEL') || getProperty('RESERVE_PHONE');
+  var reserveEmail = getProperty('RESERVE_EMAIL');
+
+  if (!awsUrl) {
+    throw new Error('_callReserveLambda: AWS_RESERVE_URL が ScriptProperties に設定されていません');
+  }
+  if (!courseTimeId) {
+    throw new Error('_callReserveLambda: courseTimeId が指定されていません');
+  }
+  if (!reserveName || !reserveTel || !reserveEmail) {
+    throw new Error('_callReserveLambda: RESERVE_NAME / RESERVE_TEL（または RESERVE_PHONE）/ RESERVE_EMAIL のいずれかが未設定です');
+  }
+
+  // ── 楽観的ロック: Lambda 呼び出し前にフラグを 'true' にセット ──
+  // バド卓ねっとはログイン不要のため「マイページの予約一覧」で確認できない。
+  // GAS 側のフラグを使って二重呼び出しを防ぐ。
+  var reservedFlagKey = 'RESERVED_SLOT_' + slotKey;
+  PropertiesService.getScriptProperties().setProperty(reservedFlagKey, 'true');
+  console.log('[INFO] _callReserveLambda: 楽観的ロック設定。key=' + reservedFlagKey +
+              ' courseTimeId=' + courseTimeId);
+
+  var requestBody = JSON.stringify({
+    courseTimeId: courseTimeId,
+    name:         reserveName,
+    tel:          reserveTel,
+    email:        reserveEmail
+  });
+
+  // X-Api-Token ヘッダーを付与して不正呼び出しを防ぐ(RESERVE_API_TOKEN を ScriptProperties に登録すること)
+  var apiToken = getProperty('RESERVE_API_TOKEN');
+
+  var response;
+  try {
+    response = UrlFetchApp.fetch(awsUrl, {
+      method: 'post',
+      contentType: 'application/json',
+      headers: {
+        'X-Api-Token': apiToken || ''
+      },
+      payload: requestBody,
+      muteHttpExceptions: true
+    });
+  } catch (fetchErr) {
+    // 通信自体が失敗 → フラグを解放して再試行を可能にする
+    PropertiesService.getScriptProperties().setProperty(reservedFlagKey, 'false');
+    console.warn('[WARN] _callReserveLambda: 通信エラー。楽観的ロック解放。key=' + reservedFlagKey +
+                 ' error=' + fetchErr.message);
+    throw new Error('_callReserveLambda: Lambda への通信に失敗しました: ' + fetchErr.message);
+  }
+
+  var statusCode = response.getResponseCode();
+  var responseText = response.getContentText();
+
+  if (statusCode < 200 || statusCode >= 300) {
+    // HTTP エラー → フラグを解放して再試行を可能にする
+    PropertiesService.getScriptProperties().setProperty(reservedFlagKey, 'false');
+    console.warn('[WARN] _callReserveLambda: Lambda HTTP エラー。楽観的ロック解放。key=' + reservedFlagKey +
+                 ' status=' + statusCode);
+    throw new Error('_callReserveLambda: Lambda HTTP エラー status=' + statusCode + ' body=' + responseText);
+  }
+
+  var result;
+  try {
+    result = JSON.parse(responseText);
+  } catch (parseErr) {
+    // JSON パースエラー → フラグを解放して再試行を可能にする
+    PropertiesService.getScriptProperties().setProperty(reservedFlagKey, 'false');
+    console.warn('[WARN] _callReserveLambda: JSON パースエラー。楽観的ロック解放。key=' + reservedFlagKey);
+    throw new Error('_callReserveLambda: Lambda レスポンスの JSON パースに失敗しました: ' + responseText);
+  }
+
+  if (!result.success) {
+    if (result.uncertain) {
+      // 判定不能(uncertain=true): 実際に予約できた可能性があるため、フラグは 'true' のまま維持する
+      // 再送による二重予約を防ぐため、解放しない。手動でバド卓ねっとを確認してもらう。
+      console.warn('[WARN] _callReserveLambda: Lambda が uncertain を返した。フラグは維持。key=' + reservedFlagKey +
+                   ' message=' + result.message);
+    } else {
+      // 確実な失敗 → フラグを解放して再試行を可能にする
+      PropertiesService.getScriptProperties().setProperty(reservedFlagKey, 'false');
+      console.warn('[WARN] _callReserveLambda: Lambda が failure を返した。楽観的ロック解放。key=' + reservedFlagKey +
+                   ' message=' + result.message);
+    }
+  }
+  // success=true の場合はフラグは 'true' のまま維持する(呼び出し元で二重呼び出し防止に使う)
+
+  return result;
+}
+
+/**
+ * Lambda の scan アクションを呼んで空きコートの一覧を取得する(内部用・F-6)
+ *
+ * @param {string}   date          - 'YYYY-MM-DD' 形式の利用日
+ * @param {string}   startTime     - 'HH:mm' 形式の開始時刻（例: '15:00'）
+ * @param {number[]} courseGroupIds - スキャン対象のコースグループ ID 配列
+ * @returns {{ success: boolean, courts: Array<{courtName: string, courseTimeId: number, courseGroupId: number, facilityName: string, patternName: string}> }}
+ * @throws {Error} AWS_RESERVE_URL 未設定 / HTTP エラー / JSON パースエラー
+ */
+function _callScanLambda(date, startTime, courseGroupIds) {
+  var awsUrl   = getProperty('AWS_RESERVE_URL');
+  var apiToken = getProperty('RESERVE_API_TOKEN');
+  if (!awsUrl) {
+    throw new Error('_callScanLambda: AWS_RESERVE_URL が ScriptProperties に設定されていません');
+  }
+
+  var response = UrlFetchApp.fetch(awsUrl, {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { 'X-Api-Token': apiToken || '' },
+    payload: JSON.stringify({ action: 'scan', date: date, startTime: startTime, courseGroupIds: courseGroupIds }),
+    muteHttpExceptions: true
+  });
+
+  var statusCode = response.getResponseCode();
+  var responseText = response.getContentText();
+  if (statusCode < 200 || statusCode >= 300) {
+    throw new Error('_callScanLambda: HTTP エラー status=' + statusCode + ' body=' + responseText);
+  }
+
+  try {
+    return JSON.parse(responseText);
+  } catch (e) {
+    throw new Error('_callScanLambda: JSON パースエラー: ' + responseText);
+  }
+}
+
+/**
+ * コート選択後の即時予約処理(内部用・F-6)
+ *
+ * handlePostback の action=confirmReserve から呼ばれる。
+ * Lambda を呼んで予約し、結果をグループに通知する。
+ *
+ * @param {string} groupId
+ * @param {string} slotKey      - 'YYYY-MM-DD|HH:mm' 形式
+ * @param {string} facilityId
+ * @param {number} courseTimeId - ユーザーが選択したコートの courseTimeId
+ * @private
+ */
+function _doSelectCourtReserve(groupId, slotKey, facilityId, courseTimeId) {
+  var pipeIdx = slotKey.indexOf('|');
+  var useDate   = slotKey.substring(0, pipeIdx);
+  var slotStart = slotKey.substring(pipeIdx + 1);
+  var slotEnd      = _SLOT_ENDS[slotStart] || '?';
+  var facilityName = _FACILITY_NAMES[String(facilityId)] || ('施設ID:' + facilityId);
+
+  var d   = new Date(useDate + 'T00:00:00+09:00');
+  var m   = d.getMonth() + 1;
+  var day = d.getDate();
+  var w   = _WEEKDAYS[d.getDay()];
+  var dateLabel = m + '月' + day + '日(' + w + ')';
+
+  try {
+    var lambdaResult = _callReserveLambda(slotKey, facilityId, courseTimeId);
+    if (lambdaResult && lambdaResult.success) {
+      pushText(groupId,
+        '✅ 予約が完了しました！\n' +
+        dateLabel + ' ' + slotStart + '〜' + slotEnd + '\n' +
+        facilityName
+      );
+      console.log('[INFO] _doSelectCourtReserve: 予約成功 slotKey=' + slotKey + ' courseTimeId=' + courseTimeId);
+    } else {
+      var errMsg = (lambdaResult && lambdaResult.message) ? lambdaResult.message : '不明なエラー';
+      pushText(groupId,
+        '❌ 予約に失敗しました。\n' +
+        dateLabel + ' ' + slotStart + '〜' + slotEnd + '\n' +
+        '理由: ' + errMsg + '\n' +
+        '手動で予約をお試しください。'
+      );
+    }
+  } catch (err) {
+    logError(err, { phase: '_doSelectCourtReserve', slotKey: slotKey });
+    try {
+      pushText(groupId,
+        '❌ 予約処理中にエラーが発生しました。\n' +
+        dateLabel + ' ' + slotStart + '〜' + slotEnd + '\n' +
+        '手動で予約をお試しください。'
+      );
+    } catch (_) {}
+  }
+}
+
+/**
+ * パターン名 → 画像URL マッピング(内部定数・F-6)
+ *
+ * patternName が「大体育室 A」「大体育室　A」のような形式の場合は
+ * 末尾のアルファベット（A/B/C）を抽出してキーにする。
+ */
+var PATTERN_IMAGE_MAP = {
+  '鳥屋野総合体育館': {
+    'A': 'https://niigata-kaikou.jp/storage/schedule/202604/69ce2999c79b6.jpg',
+    'B': 'https://niigata-kaikou.jp/storage/schedule/202604/69ce299e94a72.jpg'
+  },
+  '東総合スポーツセンター': {
+    'A': 'https://niigata-kaikou.jp/storage/schedule/202603/69c895f89f57c.jpg',
+    'B': 'https://niigata-kaikou.jp/storage/schedule/202603/69c895fda7225.jpg',
+    'C': 'https://niigata-kaikou.jp/storage/schedule/202603/69c8960389849.jpg'
+  }
+};
+
+/**
+ * patternName から画像URLを取得する(内部用)
+ *
+ * 「大体育室 A」「B」「A」「9-13時 B / 13-15時 C / 15-21時 A」(抽出後)
+ * など末尾のアルファベット1文字をキーにする。
+ *
+ * @param {string} facilityName
+ * @param {string} patternName  - 例: 'A' / '大体育室 A' / ''
+ * @returns {string} 画像URL（取得できない場合は空文字列）
+ */
+function _getPatternImageUrl(facilityName, patternName) {
+  if (!facilityName || !patternName) return '';
+  var facilityMap = PATTERN_IMAGE_MAP[facilityName];
+  if (!facilityMap) return '';
+
+  // まず patternName をそのままキーとして試みる
+  if (facilityMap[patternName]) return facilityMap[patternName];
+
+  // 末尾のアルファベット（A/B/C）を抽出してキーにする
+  var m = patternName.match(/([A-C])\s*$/i);
+  if (m) {
+    var key = m[1].toUpperCase();
+    return facilityMap[key] || '';
+  }
+  return '';
+}
+
+/**
+ * コート選択用の Flex Bubble を組み立てる(内部用・F-6)
+ *
+ * 空きコートの数だけ「コート名」ボタンを並べた Bubble を返す。
+ * ボタンを押すと postback で action=selectCourt が飛ぶ（確認Flexを表示）。
+ * patternName に対応する画像がある場合は hero セクションに表示する。
+ *
+ * @param {string}   slotKey
+ * @param {string}   facilityId
+ * @param {string}   facilityName
+ * @param {string}   patternName  - パターン名（例: 'A' / '大体育室 A' / ''）
+ * @param {string}   dateLabel    - 表示用日付文字列（例: '5月19日(月)'）
+ * @param {string}   slotStart
+ * @param {string}   slotEnd
+ * @param {Array}    courts       - scan の返り値 courts 配列
+ * @returns {Object} LINE Flex Message の bubble オブジェクト
+ * @private
+ */
+function _buildCourtSelectionFlex(slotKey, facilityId, facilityName, patternName, dateLabel, slotStart, slotEnd, courts) {
+  var imageUrl = _getPatternImageUrl(facilityName, patternName);
+
+  var buttons = [];
+  for (var i = 0; i < courts.length; i++) {
+    var court = courts[i];
+    var postbackData = 'action=selectCourt' +
+      '&slotKey='       + encodeURIComponent(slotKey) +
+      '&facilityId='    + encodeURIComponent(facilityId) +
+      '&courseTimeId='  + encodeURIComponent(String(court.courseTimeId)) +
+      '&patternName='   + encodeURIComponent(patternName || '') +
+      '&facilityName='  + encodeURIComponent(facilityName || '');
+    buttons.push({
+      type: 'button',
+      style: 'primary',
+      color: '#06C755',
+      height: 'sm',
+      action: {
+        type: 'postback',
+        label: court.courtName,
+        data: postbackData,
+        displayText: court.courtName + 'を選択'
+      }
+    });
+  }
+
+  var headerPatternText = patternName
+    ? ('コートを選んでください（' + patternName + '）')
+    : 'コートを選んでください';
+
+  var bubble = {
+    type: 'bubble',
+    header: {
+      type: 'box',
+      layout: 'vertical',
+      backgroundColor: '#1E88E5',
+      contents: [{ type: 'text', text: headerPatternText, weight: 'bold', size: 'lg', color: '#FFFFFF', wrap: true }]
+    },
+    body: {
+      type: 'box',
+      layout: 'vertical',
+      spacing: 'sm',
+      contents: [
+        { type: 'text', text: dateLabel,               weight: 'bold', size: 'xl' },
+        { type: 'text', text: slotStart + '〜' + slotEnd, size: 'lg', color: '#333333' },
+        { type: 'text', text: facilityName,            size: 'sm',    color: '#888888', wrap: true }
+      ]
+    },
+    footer: {
+      type: 'box',
+      layout: 'vertical',
+      spacing: 'sm',
+      contents: buttons
+    }
+  };
+
+  // 画像がある場合は hero セクションを追加する
+  if (imageUrl) {
+    bubble.hero = {
+      type: 'image',
+      url: imageUrl,
+      size: 'full',
+      aspectRatio: '20:13',
+      aspectMode: 'cover'
+    };
+  }
+
+  return bubble;
+}
+
+/**
+ * 施設選択用の Flex Bubble を組み立てる(内部用・F-6)
+ *
+ * 施設ごとにボタンを並べた Bubble を返す。同じ施設で複数 courseGroupId がある場合は
+ * courseGroupId ごとにボタンを出す。
+ * ボタンを押すと postback で action=selectFacility が飛ぶ。
+ *
+ * @param {string}   slotKey
+ * @param {string}   facilityId
+ * @param {string}   dateLabel
+ * @param {string}   slotStart
+ * @param {string}   slotEnd
+ * @param {Object}   groups      - { facilityName: [court, ...], ... }
+ * @param {Array}    groupOrder  - 施設名の登場順配列
+ * @returns {Object} LINE Flex Message の bubble オブジェクト
+ * @private
+ */
+function _buildFacilitySelectionFlex(slotKey, facilityId, dateLabel, slotStart, slotEnd, groups, groupOrder) {
+  var buttons = [];
+
+  for (var fi = 0; fi < groupOrder.length; fi++) {
+    var fName = groupOrder[fi];
+    var fCourts = groups[fName];
+
+    // 同一施設内で courseGroupId ごとにまとめる
+    var cgGroups = {};
+    var cgOrder = [];
+    for (var ci = 0; ci < fCourts.length; ci++) {
+      var cgId = String(fCourts[ci].courseGroupId);
+      if (!cgGroups[cgId]) {
+        cgGroups[cgId] = [];
+        cgOrder.push(cgId);
+      }
+      cgGroups[cgId].push(fCourts[ci]);
+    }
+
+    for (var cgi = 0; cgi < cgOrder.length; cgi++) {
+      var cgKey    = cgOrder[cgi];
+      var cgCourts = cgGroups[cgKey];
+      // パターン名は同グループ内で同じはず
+      var pName    = (cgCourts[0] && cgCourts[0].patternName) ? cgCourts[0].patternName : '';
+      var label    = pName ? (fName + ' / ' + pName) : fName;
+      // LINE ボタンのラベルは40文字以内
+      if (label.length > 40) label = label.substring(0, 38) + '…';
+
+      var postbackData = 'action=selectFacility' +
+        '&slotKey='       + encodeURIComponent(slotKey) +
+        '&facilityId='    + encodeURIComponent(facilityId) +
+        '&courseGroupId=' + encodeURIComponent(cgKey);
+
+      buttons.push({
+        type: 'button',
+        style: 'primary',
+        color: '#1E88E5',
+        height: 'sm',
+        action: {
+          type: 'postback',
+          label: label,
+          data: postbackData,
+          displayText: label + 'を選択'
+        }
+      });
+    }
+  }
+
+  return {
+    type: 'bubble',
+    header: {
+      type: 'box',
+      layout: 'vertical',
+      backgroundColor: '#1E88E5',
+      contents: [{ type: 'text', text: '施設を選んでください', weight: 'bold', size: 'lg', color: '#FFFFFF' }]
+    },
+    body: {
+      type: 'box',
+      layout: 'vertical',
+      spacing: 'sm',
+      contents: [
+        { type: 'text', text: dateLabel,                  weight: 'bold', size: 'xl' },
+        { type: 'text', text: slotStart + '〜' + slotEnd, size: 'lg',    color: '#333333' }
+      ]
+    },
+    footer: {
+      type: 'box',
+      layout: 'vertical',
+      spacing: 'sm',
+      contents: buttons
+    }
+  };
+}
+
+/**
+ * 予約確認用の Flex Bubble を組み立てる(内部用・F-6)
+ *
+ * 選んだコート・施設・日時を表示し、「予約します」ボタンを提供する。
+ * ボタンを押すと postback で action=confirmReserve が飛ぶ（実際の予約実行）。
+ *
+ * @param {string} slotKey
+ * @param {string} facilityId
+ * @param {number} courseTimeId
+ * @param {string} patternName
+ * @param {string} facilityName
+ * @param {string} useDate       - 'YYYY-MM-DD'
+ * @param {string} slotStart     - 'HH:mm'
+ * @returns {Object} LINE Flex Message の bubble オブジェクト
+ * @private
+ */
+function _buildReserveConfirmFlex(slotKey, facilityId, courseTimeId, patternName, facilityName, useDate, slotStart) {
+  var slotEnd = _SLOT_ENDS[slotStart] || '?';
+
+  var d = new Date(useDate + 'T00:00:00+09:00');
+  var dateLabel = (d.getMonth() + 1) + '月' + d.getDate() + '日(' + _WEEKDAYS[d.getDay()] + ')';
+
+  var imageUrl = _getPatternImageUrl(facilityName, patternName);
+
+  var postbackData = 'action=confirmReserve' +
+    '&slotKey='      + encodeURIComponent(slotKey) +
+    '&facilityId='   + encodeURIComponent(facilityId) +
+    '&courseTimeId=' + encodeURIComponent(String(courseTimeId));
+
+  var bodyContents = [
+    { type: 'text', text: dateLabel,                  weight: 'bold', size: 'xl' },
+    { type: 'text', text: slotStart + '〜' + slotEnd, size: 'lg',    color: '#333333' },
+    { type: 'text', text: facilityName,               size: 'sm',    color: '#888888', wrap: true }
+  ];
+  if (patternName) {
+    bodyContents.push({ type: 'text', text: 'パターン: ' + patternName, size: 'sm', color: '#555555' });
+  }
+
+  var bubble = {
+    type: 'bubble',
+    header: {
+      type: 'box',
+      layout: 'vertical',
+      backgroundColor: '#06C755',
+      contents: [{ type: 'text', text: '予約内容の確認', weight: 'bold', size: 'lg', color: '#FFFFFF' }]
+    },
+    body: {
+      type: 'box',
+      layout: 'vertical',
+      spacing: 'sm',
+      contents: bodyContents
+    },
+    footer: {
+      type: 'box',
+      layout: 'vertical',
+      contents: [{
+        type: 'button',
+        style: 'primary',
+        color: '#06C755',
+        action: {
+          type: 'postback',
+          label: '予約します',
+          data: postbackData,
+          displayText: 'この内容で予約します'
+        }
+      }]
+    }
+  };
+
+  if (imageUrl) {
+    bubble.hero = {
+      type: 'image',
+      url: imageUrl,
+      size: 'full',
+      aspectRatio: '20:13',
+      aspectMode: 'cover'
+    };
+  }
+
+  return bubble;
+}
+
+/**
+ * 施設選択後のコート選択処理(内部用・F-6)
+ *
+ * 選択された courseGroupId のコートだけを再 scan して _buildCourtSelectionFlex を表示する。
+ * （postback 越しに scanResult を保持できないため再スキャンする）
+ *
+ * @param {string} groupId
+ * @param {string} slotKey
+ * @param {string} facilityId
+ * @param {number} courseGroupId
+ * @private
+ */
+function _doSelectFacilityReserve(groupId, slotKey, facilityId, courseGroupId) {
+  var pipeIdx  = slotKey.indexOf('|');
+  var useDate  = slotKey.substring(0, pipeIdx);
+  var slotStart = slotKey.substring(pipeIdx + 1);
+  var slotEnd   = _SLOT_ENDS[slotStart] || '?';
+
+  var d = new Date(useDate + 'T00:00:00+09:00');
+  var dateLabel = (d.getMonth() + 1) + '月' + d.getDate() + '日(' + _WEEKDAYS[d.getDay()] + ')';
+
+  var scanResult;
+  try {
+    scanResult = _callScanLambda(useDate, slotStart, [courseGroupId]);
+  } catch (scanErr) {
+    logError(scanErr, { phase: '_doSelectFacilityReserve.scan', slotKey: slotKey });
+    try {
+      pushText(groupId, '❌ コート情報の取得中にエラーが発生しました。もう一度お試しください。');
+    } catch (_) {}
+    return;
+  }
+
+  if (!scanResult || !scanResult.success || !scanResult.courts || scanResult.courts.length === 0) {
+    try {
+      pushText(groupId,
+        '😢 この施設の空きコートが見つかりませんでした。\n' +
+        dateLabel + ' ' + slotStart + '〜' + slotEnd + '\n' +
+        '手動でご確認ください。'
+      );
+    } catch (_) {}
+    return;
+  }
+
+  var courts = scanResult.courts;
+  var fName  = (courts[0] && courts[0].facilityName) || '';
+  var pName  = (courts[0] && courts[0].patternName)  || '';
+
+  try {
+    var selFlex = _buildCourtSelectionFlex(
+      slotKey, facilityId, fName, pName, dateLabel, slotStart, slotEnd, courts
+    );
+    withRetry(function() {
+      return pushFlexMessage(groupId,
+        'コートを選んでください（' + courts.length + '面空きあり）', selFlex);
+    }, { maxAttempts: DEFAULT_MAX_ATTEMPTS, baseDelayMs: 1000, label: 'pushCourtSelectionAfterFacility' });
+  } catch (flexErr) {
+    logError(flexErr, { phase: '_doSelectFacilityReserve.courtFlex', slotKey: slotKey });
   }
 }

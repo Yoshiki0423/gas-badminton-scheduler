@@ -5,6 +5,11 @@
  * 上位の handlers.js は LINE の生エンドポイント URL や認証ヘッダーを意識せず、
  * 関数を呼ぶだけで済むように設計しています。
  *
+ * ログレベルの表記ルール:
+ *   - 警告ログは console.log('[WARN] ...') に統一する
+ *   - 情報ログは console.log('[INFO] ...') に統一する
+ *   (console.warn / console.error は logError() 経由のエラーログのみ使用)
+ *
  * 提供する関数:
  *   - replyText(replyToken, text)             : Reply API で平文を返信
  *   - pushFlexMessage(userId, altText, flex)  : Push API で Flex Message を 1 件送信(F-1-3)
@@ -176,19 +181,22 @@ function getLineProfile(userId) {
 }
 
 /**
- * Push API で userId 宛に平文テキストを 1 件送信する
+ * Push API で平文テキストを 1 件送信する
  *
  * pushFlexMessage との違い: メッセージ形式が plain text のみ。
  * F-1-5(リマインド)/ F-1-7(結果通知)で使用する。
  *
- * @param {string} userId - 送信先 LINE ユーザー ID
+ * F-5 以降はグループトークへの送信が主用途のため、
+ * 送信先にユーザー ID・グループ ID のどちらも渡せる。
+ *
+ * @param {string} to - 送信先 ID(LINE ユーザー ID またはグループ ID)
  * @param {string} text - 送信するテキスト(\n で改行可)
  * @returns {{statusCode: number, body: string}}
  * @throws {Error} HTTP 200 系以外のとき
  */
-function pushText(userId, text) {
-  if (!userId) {
-    throw new Error('pushText: userId is required');
+function pushText(to, text) {
+  if (!to) {
+    throw new Error('pushText: to is required');
   }
   if (!text) {
     throw new Error('pushText: text is required');
@@ -200,7 +208,7 @@ function pushText(userId, text) {
   }
 
   var payload = {
-    to: userId,
+    to: to,
     messages: [{ type: 'text', text: text }]
   };
 
@@ -282,13 +290,13 @@ function computeLineSignature(secret, body) {
  */
 function verifyLineIdToken(idToken) {
   if (!idToken) {
-    console.warn('[WARN] verifyLineIdToken: idToken is empty');
+    console.log('[WARN] verifyLineIdToken: idToken is empty');
     return null;
   }
 
   var channelId = getProperty('LINE_CHANNEL_ID');
   if (!channelId) {
-    console.warn('[WARN] verifyLineIdToken: LINE_CHANNEL_ID is not set in Script Properties');
+    console.log('[WARN] verifyLineIdToken: LINE_CHANNEL_ID is not set in Script Properties');
     return null;
   }
 
@@ -310,7 +318,7 @@ function verifyLineIdToken(idToken) {
 
     if (statusCode < 200 || statusCode >= 300) {
       // 検証失敗(期限切れ・改ざんなど)は null で返す(例外にしない)
-      console.warn('[WARN] verifyLineIdToken: verification failed status=' + statusCode +
+      console.log('[WARN] verifyLineIdToken: verification failed status=' + statusCode +
                    ' body=' + body.substring(0, 200));
       return null;
     }
@@ -319,14 +327,14 @@ function verifyLineIdToken(idToken) {
     try {
       parsed = JSON.parse(body);
     } catch (parseError) {
-      console.warn('[WARN] verifyLineIdToken: failed to parse response body');
+      console.log('[WARN] verifyLineIdToken: failed to parse response body');
       return null;
     }
 
     // 成功レスポンスの "sub" フィールドが userId
     // "name" フィールドが displayName
     if (!parsed || !parsed.sub) {
-      console.warn('[WARN] verifyLineIdToken: response missing "sub" field');
+      console.log('[WARN] verifyLineIdToken: response missing "sub" field');
       return null;
     }
 

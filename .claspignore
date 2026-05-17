@@ -48,3 +48,6 @@ docs/**
 
 # === Claude Code の内部ファイル(ワークツリーやメモリを GAS に送らない) ===
 .claude/**
+
+# === AWS Lambda コード(GAS にデプロイしない・Lambda コンソールに手動アップロード) ===
+lambda/**

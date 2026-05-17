@@ -25,6 +25,13 @@
  *   - getAllSlotResponses()                                 : 全レコードを返す(集計用)
  *   - getSlotResponsesByUserId(userId)                     : ユーザーの回答を { 'YYYY-MM-DD|HH:mm': 'can'|'undecided' } 形式で返す
  *   - resetResponsesSheet()                                : シートをリセットして新ヘッダーを設定
+ *
+ *   ── reserve-queue シート(F-6) ──
+ *   - getReserveQueueSheet()                      : reserve-queue シートを取得・初期化
+ *   - addReserveQueue(entry)                      : エントリを追加(reservationQueueId は自動採番)
+ *   - getReserveQueueEntries(status)              : status で絞り込んで取得
+ *   - updateReserveQueueStatus(reservationQueueId, status) : status と updatedAt を更新
+ *
  * メンバーシート構造(D-007 で確定):
  *   A: userId       (LINE ユーザー ID・主キー・テキスト書式)
  *   B: displayName  (LINE 表示名)
@@ -49,6 +56,16 @@
  *   E: answer       ("can"=行ける / "undecided"=未定・行けない場合は行なし)
  *   F: createdAt    (初回回答日時 ISO 8601 + Asia/Tokyo)
  *   G: updatedAt    (最終更新日時 ISO 8601 + Asia/Tokyo)
+ *
+ * reserve-queue シート構造(F-6 / D-011 命名規則):
+ *   A: reservationQueueId (主キー・"RQ_" + タイムスタンプ + ランダム4桁 形式)
+ *   B: slotKey            (YYYY-MM-DD|HH:mm)
+ *   C: facilityId         (施設ID)
+ *   D: facilityName       (施設名)
+ *   E: reservableDate     (予約可能日・YYYY-MM-DD)
+ *   F: status             ("pending" / "reserved" / "failed")
+ *   G: createdAt          (ISO 8601 + Asia/Tokyo)
+ *   H: updatedAt          (ISO 8601 + Asia/Tokyo)
  *
  * 命名規則(D-011):
  *   - シート名は全小文字 + ハイフン区切り or 単一単語(`members`, `schedules` 等)
@@ -1032,4 +1049,333 @@ function _generateResponseId() {
   var rand = Math.floor(Math.random() * 10000);
   var randPadded = ('0000' + rand).slice(-4);
   return 'RES_' + timestamp + '_' + randPadded;
+}
+
+// ─────────────────────────────────────────────
+// F-6: reserve-queue シート 定数
+// ─────────────────────────────────────────────
+
+/**
+ * reserve-queue シート名(D-011 命名規則:全小文字+ハイフン区切り)
+ *
+ * 「予約待ちキュー」シート。利用日が 8 日以上先で「予約する」ボタンが押されたとき、
+ * 予約可能日(利用日の 7 日前)まで待機するためのエントリを保存する。
+ */
+var RESERVE_QUEUE_SHEET_NAME = 'reserve-queue';
+
+/**
+ * reserve-queue シートのヘッダー行(D-011 命名規則:lowerCamelCase)
+ *
+ * F-6 仕様 §F-6-4 で確定した 8 列構造。
+ */
+var RESERVE_QUEUE_HEADER = [
+  'reservationQueueId', // A: 主キー(RQ_yyyyMMddHHmmss_XXXX 形式)
+  'slotKey',            // B: 日付+スロット開始時刻(YYYY-MM-DD|HH:mm)
+  'facilityId',         // C: 施設ID(niigata-kaikou.jp の数値ID)
+  'facilityName',       // D: 施設名
+  'reservableDate',     // E: 予約可能日(YYYY-MM-DD・利用日の 7 日前)
+  'status',             // F: 状態("pending" / "reserved" / "failed")
+  'createdAt',          // G: 登録日時(ISO 8601 + Asia/Tokyo)
+  'updatedAt'           // H: 最終更新日時(ISO 8601 + Asia/Tokyo)
+];
+
+/** reserve-queue 列インデックス(1-based・getRange 用) */
+var RQCOL_RESERVATION_QUEUE_ID = 1;
+var RQCOL_SLOT_KEY             = 2;
+var RQCOL_FACILITY_ID          = 3;
+var RQCOL_FACILITY_NAME        = 4;
+var RQCOL_RESERVABLE_DATE      = 5;
+var RQCOL_STATUS               = 6;
+var RQCOL_CREATED_AT           = 7;
+var RQCOL_UPDATED_AT           = 8;
+
+// ─────────────────────────────────────────────
+// F-6: reserve-queue シート 関数
+// ─────────────────────────────────────────────
+
+/**
+ * reserve-queue シートを取得し、存在しない場合はヘッダー付きで作成する(F-6)
+ *
+ * 他のシート取得関数(getMembersSheet / getSchedulesSheet 等)と同じパターン。
+ * スプレッドシート ID は MEMBERS_SPREADSHEET_ID から取得する
+ * (すべてのシートを同一スプレッドシートファイルに集約する設計)。
+ *
+ * @returns {GoogleAppsScript.Spreadsheet.Sheet}
+ * @throws {Error} スプレッドシート ID 未設定 or シートが開けない場合
+ */
+function getReserveQueueSheet() {
+  var spreadsheetId = getProperty('MEMBERS_SPREADSHEET_ID');
+  if (!spreadsheetId) {
+    throw new Error('MEMBERS_SPREADSHEET_ID is not set in Script Properties');
+  }
+
+  var ss;
+  try {
+    ss = SpreadsheetApp.openById(spreadsheetId);
+  } catch (openError) {
+    throw new Error('Failed to open spreadsheet (id=' + spreadsheetId + '): ' + openError.message);
+  }
+
+  var sheet = ss.getSheetByName(RESERVE_QUEUE_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(RESERVE_QUEUE_SHEET_NAME);
+    _initializeReserveQueueSheet(sheet);
+  } else if (sheet.getLastRow() === 0) {
+    _initializeReserveQueueSheet(sheet);
+  }
+
+  return sheet;
+}
+
+/**
+ * reserve-queue シートを初期化する(ヘッダー + 列フォーマット)(内部用)
+ *
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet
+ * @private
+ */
+function _initializeReserveQueueSheet(sheet) {
+  sheet.getRange(1, 1, 1, RESERVE_QUEUE_HEADER.length).setValues([RESERVE_QUEUE_HEADER]);
+  sheet.getRange(1, 1, 1, RESERVE_QUEUE_HEADER.length).setFontWeight('bold');
+  sheet.setFrozenRows(1);
+
+  // slotKey / reservableDate 列はテキスト書式に固定(日付変換防止)
+  sheet.getRange(1, RQCOL_SLOT_KEY,        sheet.getMaxRows(), 1).setNumberFormat('@');
+  sheet.getRange(1, RQCOL_FACILITY_ID,     sheet.getMaxRows(), 1).setNumberFormat('@');
+  sheet.getRange(1, RQCOL_RESERVABLE_DATE, sheet.getMaxRows(), 1).setNumberFormat('@');
+
+  sheet.setColumnWidth(RQCOL_RESERVATION_QUEUE_ID, 220);
+  sheet.setColumnWidth(RQCOL_SLOT_KEY,             180);
+  sheet.setColumnWidth(RQCOL_FACILITY_ID,           80);
+  sheet.setColumnWidth(RQCOL_FACILITY_NAME,         180);
+  sheet.setColumnWidth(RQCOL_RESERVABLE_DATE,       120);
+  sheet.setColumnWidth(RQCOL_STATUS,                 80);
+  sheet.setColumnWidth(RQCOL_CREATED_AT,            200);
+  sheet.setColumnWidth(RQCOL_UPDATED_AT,            200);
+}
+
+/**
+ * reserve-queue にエントリを追加する(F-6)
+ *
+ * reservationQueueId の採番ルール:
+ *   "RQ_" + yyyyMMddHHmmss(Asia/Tokyo) + "_" + 4桁ランダム数字
+ *   例: RQ_20260516143022_4831
+ *
+ * 同一 slotKey の pending エントリが既に存在する場合は追加しない
+ * (二重登録防止・ただし reserved / failed は別エントリとして扱わない)。
+ *
+ * @param {{
+ *   slotKey:        string, - 'YYYY-MM-DD|HH:mm' 形式(必須)
+ *   facilityId:     string, - 施設 ID(必須)
+ *   facilityName:   string, - 施設名(必須)
+ *   reservableDate: string, - 予約可能日 YYYY-MM-DD(必須)
+ *   status?:        string  - 初期ステータス(省略時 'pending')
+ * }} entry
+ * @returns {{ reservationQueueId: string, row: number, skipped: boolean }}
+ *   skipped=true の場合は既存 pending エントリがあったため追加しなかった
+ * @throws {Error} 必須フィールド未入力 or スプレッドシート書き込み失敗
+ */
+function addReserveQueue(entry) {
+  if (!entry || !entry.slotKey || !entry.facilityId || !entry.facilityName || !entry.reservableDate) {
+    throw new Error('addReserveQueue: slotKey / facilityId / facilityName / reservableDate は必須です');
+  }
+
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(10 * 1000)) {
+    throw new Error('addReserveQueue: could not acquire lock');
+  }
+
+  try {
+    var sheet = getReserveQueueSheet();
+    var nowIso = _toIsoTokyo(new Date());
+    var status = entry.status || 'pending';
+
+    // 同一 slotKey の pending が既にあれば追加しない(二重登録防止)
+    if (status === 'pending') {
+      var existingRow = _findReserveQueueRow(sheet, entry.slotKey, 'pending');
+      if (existingRow > 0) {
+        console.log('[INFO] addReserveQueue: 既存 pending エントリがあります。追加をスキップします。slotKey=' + entry.slotKey);
+        var existingId = String(sheet.getRange(existingRow, RQCOL_RESERVATION_QUEUE_ID).getValue());
+        return { reservationQueueId: existingId, row: existingRow, skipped: true };
+      }
+    }
+
+    var reservationQueueId = _generateReservationQueueId();
+    var newRow = sheet.getLastRow() + 1;
+
+    sheet.getRange(newRow, 1, 1, RESERVE_QUEUE_HEADER.length).setValues([[
+      reservationQueueId,
+      entry.slotKey,
+      String(entry.facilityId),
+      entry.facilityName,
+      entry.reservableDate,
+      status,
+      nowIso,
+      nowIso
+    ]]);
+    SpreadsheetApp.flush();
+
+    console.log('[INFO] addReserveQueue: 登録完了 reservationQueueId=' + reservationQueueId +
+                ' slotKey=' + entry.slotKey + ' reservableDate=' + entry.reservableDate);
+    return { reservationQueueId: reservationQueueId, row: newRow, skipped: false };
+
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * reserve-queue エントリを status で絞り込んで取得する(F-6)
+ *
+ * 返却するオブジェクトの形:
+ *   [{
+ *     reservationQueueId: "RQ_20260516143022_4831",
+ *     slotKey: "2026-05-25|13:00",
+ *     facilityId: "420",
+ *     facilityName: "鳥屋野総合体育館",
+ *     reservableDate: "2026-05-18",
+ *     status: "pending",
+ *     createdAt: "2026-05-16T14:30:22+09:00",
+ *     updatedAt: "2026-05-16T14:30:22+09:00",
+ *     row: 2  // シートの行番号(updateReserveQueueStatus で使う)
+ *   }, ...]
+ *
+ * @param {string} [status] - 絞り込む status 値('pending' / 'reserved' / 'failed')。
+ *   省略 or 空文字の場合はすべてのエントリを返す。
+ * @returns {Array<Object>}
+ */
+function getReserveQueueEntries(status) {
+  var sheet = getReserveQueueSheet();
+  var lastRow = sheet.getLastRow();
+
+  if (lastRow < 2) return [];
+
+  var values = sheet.getRange(2, 1, lastRow - 1, RESERVE_QUEUE_HEADER.length).getValues();
+  var result = [];
+
+  for (var i = 0; i < values.length; i++) {
+    var row = values[i];
+    var rowStatus = String(row[RQCOL_STATUS - 1]);
+
+    // status が指定されていて一致しない行はスキップ
+    if (status && rowStatus !== status) continue;
+
+    result.push({
+      reservationQueueId: String(row[RQCOL_RESERVATION_QUEUE_ID - 1]),
+      slotKey:            String(row[RQCOL_SLOT_KEY             - 1]),
+      facilityId:         String(row[RQCOL_FACILITY_ID          - 1]),
+      facilityName:       String(row[RQCOL_FACILITY_NAME        - 1]),
+      reservableDate:     String(row[RQCOL_RESERVABLE_DATE      - 1]),
+      status:             rowStatus,
+      createdAt:          String(row[RQCOL_CREATED_AT           - 1]),
+      updatedAt:          String(row[RQCOL_UPDATED_AT           - 1]),
+      row:                i + 2  // 1-based の行番号(ヘッダー行 1 + データ offset)
+    });
+  }
+
+  return result;
+}
+
+/**
+ * reserve-queue エントリの status と updatedAt を更新する(F-6)
+ *
+ * reservationQueueId で対象行を特定して status と updatedAt を更新する。
+ * 見つからない場合は警告ログを出して false を返す(エラーにしない)。
+ *
+ * @param {string} reservationQueueId - 更新対象の主キー
+ * @param {string} newStatus          - 新しい status 値('reserved' / 'failed' 等)
+ * @returns {{ found: boolean, row: number }}
+ */
+function updateReserveQueueStatus(reservationQueueId, newStatus) {
+  if (!reservationQueueId) {
+    throw new Error('updateReserveQueueStatus: reservationQueueId は必須です');
+  }
+  if (!newStatus) {
+    throw new Error('updateReserveQueueStatus: newStatus は必須です');
+  }
+
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(10 * 1000)) {
+    throw new Error('updateReserveQueueStatus: could not acquire lock');
+  }
+
+  try {
+    var sheet = getReserveQueueSheet();
+    var lastRow = sheet.getLastRow();
+
+    if (lastRow < 2) {
+      console.warn('[WARN] updateReserveQueueStatus: シートにデータがありません。id=' + reservationQueueId);
+      return { found: false, row: -1 };
+    }
+
+    // A 列(reservationQueueId)を一括取得して対象行を探す
+    var idValues = sheet.getRange(2, RQCOL_RESERVATION_QUEUE_ID, lastRow - 1, 1).getValues();
+    var foundRow = -1;
+
+    for (var i = 0; i < idValues.length; i++) {
+      if (String(idValues[i][0]) === reservationQueueId) {
+        foundRow = i + 2;  // 1-based
+        break;
+      }
+    }
+
+    if (foundRow < 0) {
+      console.warn('[WARN] updateReserveQueueStatus: 対象 ID が見つかりません。id=' + reservationQueueId);
+      return { found: false, row: -1 };
+    }
+
+    var nowIso = _toIsoTokyo(new Date());
+    sheet.getRange(foundRow, RQCOL_STATUS).setValue(newStatus);
+    sheet.getRange(foundRow, RQCOL_UPDATED_AT).setValue(nowIso);
+    SpreadsheetApp.flush();
+
+    console.log('[INFO] updateReserveQueueStatus: 更新完了 id=' + reservationQueueId +
+                ' status=' + newStatus + ' row=' + foundRow);
+    return { found: true, row: foundRow };
+
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * slotKey と status で既存行を探す(内部用・重複登録防止のために addReserveQueue が使う)
+ *
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet
+ * @param {string} slotKey
+ * @param {string} status
+ * @returns {number} 1-based の行番号。見つからなければ -1。
+ * @private
+ */
+function _findReserveQueueRow(sheet, slotKey, status) {
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return -1;
+
+  var numRows = lastRow - 1;
+  var slotKeys  = sheet.getRange(2, RQCOL_SLOT_KEY, numRows, 1).getValues();
+  var statuses  = sheet.getRange(2, RQCOL_STATUS,   numRows, 1).getValues();
+
+  for (var i = 0; i < numRows; i++) {
+    if (String(slotKeys[i][0]) === slotKey && String(statuses[i][0]) === status) {
+      return i + 2;
+    }
+  }
+  return -1;
+}
+
+/**
+ * reservationQueueId を採番する(内部用)
+ *
+ * 形式: "RQ_" + yyyyMMddHHmmss(Asia/Tokyo) + "_" + 4桁ランダム数字
+ * 例: RQ_20260516143022_4831
+ * D-011 / D-012 命名規則に準拠(scheduleId / responseId と同じパターン)。
+ *
+ * @returns {string}
+ * @private
+ */
+function _generateReservationQueueId() {
+  var now = new Date();
+  var timestamp = Utilities.formatDate(now, 'Asia/Tokyo', 'yyyyMMddHHmmss');
+  var rand = Math.floor(Math.random() * 10000);
+  var randPadded = ('0000' + rand).slice(-4);
+  return 'RQ_' + timestamp + '_' + randPadded;
 }

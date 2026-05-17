@@ -103,6 +103,19 @@ var ALL_FACILITIES_NOTIFIED_MONTH_KEY = 'ALL_FACILITIES_NOTIFIED_MONTH';
 /** checkAndScrapeIfUpdated を呼ぶトリガーの関数名 */
 var TRIGGER_FUNCTION_NAME = 'checkAndScrapeIfUpdated';
 
+/**
+ * ScriptProperties キー: 鳥屋野総合体育館(facilityId=420)の courseGroupId 一覧
+ * 値の形式: "14879,14881,14882" のようなカンマ区切り数値文字列
+ * _doImmediateReserve / _callScanLambda が参照する(handlers.js)
+ */
+var PROP_TOYA_COURSE_GROUP_IDS = 'TOYA_COURSE_GROUP_IDS';
+
+/**
+ * ScriptProperties キー: 東総合スポーツセンター(facilityId=413)の courseGroupId 一覧
+ * 値の形式: "14791,14793" のようなカンマ区切り数値文字列
+ */
+var PROP_HIGASHI_COURSE_GROUP_IDS = 'HIGASHI_COURSE_GROUP_IDS';
+
 /** 毎朝トリガーを起動する時刻(0-23) */
 var TRIGGER_HOUR = 7;
 
@@ -239,6 +252,13 @@ function scrapeAllFacilities(skipDailyCheck) {
   }
 
   console.log('[INFO] scrapeAllFacilities 完了: totalSaved=' + totalSaved);
+
+  // ─── courseGroupId を更新(F-6 対応) ───
+  // scrapeAllFacilities を直接呼び出した場合もIDを最新化する
+  // checkAndScrapeIfUpdated 経由の場合は重複実行になるが、
+  // updateCourseGroupIds 内部の「更新前件数と変化なし」ログで確認できるため許容する
+  updateCourseGroupIds();
+
   return { totalSaved: totalSaved, facilityResults: facilityResults };
 }
 
@@ -626,6 +646,10 @@ function checkAndScrapeIfUpdated() {
     }
   }
 
+  // ─── courseGroupId を更新(F-6 対応) ───
+  // updateCourseGroupIds は内部でエラーをキャッチするため、ここでは try/catch 不要
+  updateCourseGroupIds();
+
   return { updated: changedFacilities.length > 0, changedFacilities: changedFacilities };
 }
 
@@ -670,11 +694,17 @@ function setupDailyTrigger() {
  *
  * 除外条件: × 始まり / ー / - / 空文字 / 「休館日」を含む / ー のみ
  *
- * @param {string} text - セルのテキスト(String().trim() 後)
+ * 注意: 呼び出し元で String(cell).trim() した後の値を渡すこと。
+ *       関数内でも trim を実施するため、trim を忘れた場合でも安全に動作する。
+ *
+ * @param {string} text - セルのテキスト
  * @returns {boolean} true なら除外
  * @private
  */
 function _isExcluded(text) {
+  // 関数内でも trim して、呼び出し元の trim 漏れに対して堅牢にする
+  text = String(text || '').trim();
+
   if (!text) {
     return true;
   }
@@ -866,6 +896,147 @@ function _incrementFailCountAndNotifyIfNeeded(facility) {
 }
 
 // ─────────────────────────────────────────────
+// F-6: courseGroupId 自動更新
+// ─────────────────────────────────────────────
+
+/** courseGroupId 取得用シートの名前(固定) */
+var COURSE_ID_SHEET_NAME = 'courseids';
+
+/**
+ * courseGroupId 取得用の IMPORTXML シートをセットアップする
+ *
+ * 背景(D-016 拡張):
+ *   niigata-kaikou.jp は XSERVER WAF が GAS の IP をブロックするため
+ *   UrlFetchApp.fetch() が HTTP 501 で失敗する。
+ *   IMPORTXML はこの制限を受けないことが確認されたため、
+ *   IMPORTHTML 方式(setupScraperSheets)と同じパターンで回避する。
+ *
+ * シート構造:
+ *   A1 = 鳥屋野(facilityId=420)の IMPORTXML 式
+ *   B1 = 東総合(facilityId=413)の IMPORTXML 式
+ *   結果として A列・B列それぞれに "/schedule/course/数字/1 or 2" の文字列が縦並びで入る
+ *
+ * 冪等性:
+ *   A1・B1 に既に式が設定されていれば再設定しない。
+ *   毎回 updateCourseGroupIds() から呼ばれるため、余分な書き込みを避ける。
+ *
+ * @returns {GoogleAppsScript.Spreadsheet.Sheet} courseids シート
+ */
+function _setupCourseIdSheet() {
+  var spreadsheetId = getProperty('MEMBERS_SPREADSHEET_ID');
+  if (!spreadsheetId) {
+    throw new Error('MEMBERS_SPREADSHEET_ID が設定されていません。スクリプトプロパティを確認してください。');
+  }
+  var ss = SpreadsheetApp.openById(spreadsheetId);
+
+  // シートを取得 or 作成(setupScraperSheets と同じパターン)
+  var sheet = ss.getSheetByName(COURSE_ID_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(COURSE_ID_SHEET_NAME);
+    console.log('[INFO] _setupCourseIdSheet: ' + COURSE_ID_SHEET_NAME + ' シートを新規作成しました。');
+  }
+
+  // 既に式が入っていれば再設定しない(冪等)
+  var a1Val = sheet.getRange('A1').getFormula();
+  var b1Val = sheet.getRange('B1').getFormula();
+
+  var toyaFormula   = '=IMPORTXML("https://niigata-kaikou.jp/facility/420/schedule","//a[contains(@href,\'/schedule/course/\')]/@href")';
+  var higashiFormula = '=IMPORTXML("https://niigata-kaikou.jp/facility/413/schedule","//a[contains(@href,\'/schedule/course/\')]/@href")';
+
+  if (!a1Val) {
+    sheet.getRange('A1').setFormula(toyaFormula);
+    console.log('[INFO] _setupCourseIdSheet: A1 に鳥屋野の IMPORTXML 式を設定しました。');
+  }
+  if (!b1Val) {
+    sheet.getRange('B1').setFormula(higashiFormula);
+    console.log('[INFO] _setupCourseIdSheet: B1 に東総合の IMPORTXML 式を設定しました。');
+  }
+
+  return sheet;
+}
+
+/**
+ * バド卓ねっとの施設スケジュールページから courseGroupId 一覧を取得し
+ * ScriptProperties に上書き保存する
+ *
+ * 背景(F-6):
+ *   _doImmediateReserve / _callScanLambda(handlers.js)は予約時に
+ *   TOYA_COURSE_GROUP_IDS / HIGASHI_COURSE_GROUP_IDS を参照する。
+ *   これらの ID は施設・日付ごとに異なる連番で、従来は手動登録していた。
+ *   本関数でスクレイピング時に自動更新することで手動作業を排除する。
+ *
+ * 取得方法(IMPORTXML 方式・旧 UrlFetchApp から変更):
+ *   niigata-kaikou.jp は XSERVER WAF が GAS の IP をブロックするため
+ *   UrlFetchApp.fetch() が HTTP 501 で失敗することが判明(D-016)。
+ *   _setupCourseIdSheet() で courseids シートに設定した IMPORTXML 式が
+ *   "/schedule/course/数字/1 or 2" の href 値を列として展開する。
+ *   GAS から sheet.getRange().getValues() で読み込み、末尾が "/1" の行のみ抽出する。
+ *
+ * エラーポリシー:
+ *   courseGroupId が 0 件の場合は ScriptProperties を更新しない(フェイルセーフ)。
+ *
+ * @returns {void}
+ */
+function updateCourseGroupIds() {
+  var sheet = _setupCourseIdSheet();
+
+  // IMPORTXML の評価が完了するまで待つ(数秒かかる場合がある)
+  SpreadsheetApp.flush();
+
+  var props = PropertiesService.getScriptProperties();
+
+  /** 更新対象の施設定義(列インデックスと ScriptProperties キーの対応) */
+  var targets = [
+    { colIndex: 0, facilityName: '鳥屋野総合体育館',      propKey: PROP_TOYA_COURSE_GROUP_IDS },
+    { colIndex: 1, facilityName: '東総合スポーツセンター', propKey: PROP_HIGASHI_COURSE_GROUP_IDS }
+  ];
+
+  // シート全体を一括取得して列ごとに処理する
+  var allValues = sheet.getDataRange().getValues();
+
+  for (var t = 0; t < targets.length; t++) {
+    var target = targets[t];
+    var ids = [];
+    var idSeen = {};
+
+    for (var r = 0; r < allValues.length; r++) {
+      var cellVal = allValues[r][target.colIndex];
+      // 値が文字列でなければスキップ(空セル・数値・エラー値対応)
+      if (typeof cellVal !== 'string') {
+        continue;
+      }
+      // "/schedule/course/数字/1" の形式のみバドミントン枠として抽出(末尾 /2 は卓球・除外)
+      var m = cellVal.match(/^\/schedule\/course\/(\d+)\/1$/);
+      if (!m) {
+        continue;
+      }
+      var idNum = parseInt(m[1], 10);
+      // 重複排除: 同じ ID が複数行に出現する場合がある
+      if (!isNaN(idNum) && !idSeen[idNum]) {
+        ids.push(idNum);
+        idSeen[idNum] = true;
+      }
+    }
+
+    // 更新前の件数をログに残す
+    var prevVal = props.getProperty(target.propKey) || '';
+    var prevCount = prevVal ? prevVal.split(',').length : 0;
+
+    if (ids.length === 0) {
+      console.log('[WARN] updateCourseGroupIds: ' + target.facilityName + ' の courseGroupId が 0 件でした。IMPORTXML の読み込みを確認してください。ScriptProperties は更新しません。');
+      continue;
+    }
+
+    // 昇順ソートして保存(予約システムの利用順と合わせる)
+    ids.sort(function (a, b) { return a - b; });
+    var newVal = ids.join(',');
+
+    props.setProperty(target.propKey, newVal);
+    console.log('[INFO] updateCourseGroupIds: ' + target.facilityName + ' 更新前=' + prevCount + '件 → 更新後=' + ids.length + '件 (' + newVal + ')');
+  }
+}
+
+// ─────────────────────────────────────────────
 // F-2-5: 新月検知・通知ロジック
 // ─────────────────────────────────────────────
 
@@ -1053,7 +1224,7 @@ function _notifyNewFacilityMonth(facility, yearMonth) {
   // F-5: グループに 1 通送信する
   var groupId = getProperty('LINE_GROUP_ID');
   if (!groupId) {
-    console.warn('[WARN] _notifyNewFacilityMonth: LINE_GROUP_ID が未設定です。通知をスキップします。' +
+    console.log('[WARN] _notifyNewFacilityMonth: LINE_GROUP_ID が未設定です。通知をスキップします。' +
                  ' facility=' + facility.facilityName + ' yearMonth=' + yearMonth);
     return;
   }
@@ -1099,7 +1270,7 @@ function _notifyAllFacilitiesReady(yearMonth) {
   // F-5: グループに 1 通送信する
   var groupId = getProperty('LINE_GROUP_ID');
   if (!groupId) {
-    console.warn('[WARN] _notifyAllFacilitiesReady: LINE_GROUP_ID が未設定です。通知をスキップします。' +
+    console.log('[WARN] _notifyAllFacilitiesReady: LINE_GROUP_ID が未設定です。通知をスキップします。' +
                  ' yearMonth=' + yearMonth);
     return;
   }

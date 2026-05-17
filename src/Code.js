@@ -22,9 +22,9 @@
  *     このプロジェクトでは回答フォームと回答状況確認ページを LIFF で提供する。
  *
  * 関連ファイル:
- *   - handlers.js  — follow / unfollow / LIFF ハンドラーの中身の処理
+ *   - handlers.js  — follow / unfollow / LIFF / postback ハンドラーの中身の処理
  *   - lineApi.js   — 署名検証・Reply API・プロフィール取得・ID Token 検証
- *   - sheets.js    — メンバーシートの読み書き
+ *   - sheets.js    — メンバーシート / reserve-queue シートの読み書き
  *   - utils.js     — リトライ・ログ・スクリプトプロパティ
  *   - liff.html    — LIFF 回答フォーム(F-3-4)
  *   - liffResults.html — LIFF 回答状況確認ページ(F-3-5)
@@ -320,12 +320,10 @@ function aggregateAndNotify() {
 }
 
 /**
- * responses シートを F-4 新データモデルにリセットする(手動実行用)
+ * responses シートを F-4 新データモデルにリセットする(手動実行用・F-4 移行時に実施済み)
  *
- * F-4 移行時に GAS エディタから 1 回だけ実行してください。
- * 既存の responses シートのデータ(旧形式・テスト用)をすべて削除し、
- * 新しい列構造(responseId / userId / date / slotStart / answer / createdAt / updatedAt)で
- * シートを作り直します。
+ * F-4 移行時に 1 回だけ実行した関数です。現在は通常使いません。
+ * もし responses シートを初期状態に戻したい場合のみ GAS エディタから実行してください。
  *
  * 注意: 実行すると responses シートの中身がすべて消えます。
  *
@@ -338,6 +336,8 @@ function resetResponsesSheetForF4() {
 
 /**
  * 1 イベントを正しい担当関数へ振り分ける(内部用)
+ *
+ * F-6 変更点: `postback` イベントを handlePostback() に振り分けを追加。
  *
  * @param {Object} event - LINE Webhook イベントオブジェクト 1 件
  * @private
@@ -366,6 +366,10 @@ function _routeEvent(event) {
       case 'memberJoined':
         // F-5: グループに新メンバーが参加したときに自動登録する
         handleMemberJoined(event);
+        break;
+      case 'postback':
+        // F-6: 「予約する」ボタンなどの postback アクションを処理する
+        handlePostback(event);
         break;
       default:
         console.log('[INFO] Unhandled event type: ' + event.type);
@@ -460,39 +464,303 @@ function _jsonResponse(obj) {
 }
 
 // ─────────────────────────────────────────────
-// テスト用関数(GAS エディタから手動実行するだけ。本番では呼ばない)
+// F-6: 予約待ちキュー処理 / トリガー登録
 // ─────────────────────────────────────────────
 
 /**
- * スクレイピングを強制実行するテスト用関数
+ * 予約待ちキューを処理する — 毎分起動・7:00〜7:10 の窓のみ実処理(F-6 / F-6-9)
+ *
+ * reserve-queue シートの pending エントリのうち、
+ * reservableDate が「今日以前」のものを処理する。
+ *
+ * F-6-9-1 速度最適化:
+ *   setupQueueTrigger() で everyMinutes(1) トリガーを設定しているため、
+ *   この関数は毎分呼ばれる。7:00〜7:10 の窓の外なら即 return することで、
+ *   余分な処理を最小限に抑える。7:00 ちょうどに起動できれば体育館予約争奪戦で有利になる。
+ *   （atHour(7) は 7:00〜8:00 のどこかで起動するため精度が足りなかった）
+ *
+ * 処理フロー:
+ *   1. RESERVE_ENABLED チェック（機能が有効でなければスキップ）
+ *   2. 時刻チェック（7:00〜7:10 の窓の外なら即 return）
+ *   3. reserve-queue の pending エントリを取得
+ *   4. reservableDate <= 今日 のエントリを対象として絞り込む
+ *   5. 各エントリで _callScanLambda() を呼んで空きコートを検索
+ *   6. 空きコートの courseTimeId を使って _callReserveLambda() で予約実行
+ *   7. 成功 → status を 'reserved' に更新 + グループ通知
+ *      （楽観的ロックは _callReserveLambda 内で設定される）
+ *   8. 失敗 → status を 'failed' に更新 + グループ通知
+ *
+ * @returns {{ processed: number, succeeded: number, failed: number, skipped: number, reason?: string }}
  */
-function testScrapeForce() {
-  var result = scrapeAllFacilities(true);
-  console.log(JSON.stringify(result));
-}
+function processReserveQueue() {
+  // RESERVE_ENABLED フラグが 'true' でなければ処理しない
+  if (getProperty('RESERVE_ENABLED') !== 'true') {
+    console.log('[INFO] processReserveQueue: RESERVE_ENABLED が true でないためスキップします');
+    return { processed: 0, succeeded: 0, failed: 0, skipped: 0 };
+  }
 
-/**
- * scraper-420 シートの中身をログに出すデバッグ用関数
- */
-function debugScraper420() {
-  var spreadsheetId = getProperty('MEMBERS_SPREADSHEET_ID');
-  var ss = SpreadsheetApp.openById(spreadsheetId);
-  var sheet = ss.getSheetByName('scraper-420');
-  var values = sheet.getDataRange().getValues();
+  // F-6-9-1: 7:00〜7:10 の窓の外なら即終了（毎分トリガーのオーバーヘッドを最小化）
+  // GAS のタイムゾーンは「スクリプトプロパティ」→「タイムゾーン」で Asia/Tokyo に設定済みの前提。
+  // getHours() / getMinutes() はスクリプトのタイムゾーン（Asia/Tokyo）の時刻を返す。
+  var now = new Date();
+  var jstHour = now.getHours();
+  var jstMinute = now.getMinutes();
+  if (jstHour !== 7 || jstMinute > 10) {
+    console.log('[INFO] processReserveQueue: 処理時間外（' + jstHour + ':' + ('0' + jstMinute).slice(-2) + '）スキップ');
+    return { processed: 0, skipped: 0, reason: '処理時間外' };
+  }
 
-  console.log('=== scraper-420 全行ダンプ ===');
-  for (var i = 0; i < values.length; i++) {
-    var row = values[i];
-    var col0 = String(row[0]);
-    var col2 = String(row[2]);
-    if (col0 || col2) {
-      console.log('行' + i + ': A=[' + col0 + '] C=[' + col2 + ']');
+  var todayStr = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM-dd');
+  var groupId = getProperty('LINE_GROUP_ID');
+
+  var entries = getReserveQueueEntries('pending');
+  if (entries.length === 0) {
+    console.log('[INFO] processReserveQueue: pending エントリが 0 件です。スキップします。');
+    return { processed: 0, succeeded: 0, failed: 0, skipped: 0 };
+  }
+
+  var processed = 0;
+  var succeeded = 0;
+  var failed = 0;
+  var skipped = 0;
+
+  for (var i = 0; i < entries.length; i++) {
+    var entry = entries[i];
+
+    // reservableDate が今日以前のエントリのみ処理する
+    if (entry.reservableDate > todayStr) {
+      console.log('[INFO] processReserveQueue: reservableDate 未到来のためスキップ。' +
+                  ' id=' + entry.reservationQueueId + ' reservableDate=' + entry.reservableDate);
+      skipped++;
+      continue;
+    }
+
+    processed++;
+
+    // 二重予約防止チェック
+    var reservedFlagKey = 'RESERVED_SLOT_' + entry.slotKey;
+    var alreadyReserved = getProperty(reservedFlagKey);
+    if (alreadyReserved === 'true') {
+      console.log('[INFO] processReserveQueue: すでに予約済みフラグあり。status を reserved に更新。' +
+                  ' slotKey=' + entry.slotKey);
+      updateReserveQueueStatus(entry.reservationQueueId, 'reserved');
+      succeeded++;
+      continue;
+    }
+
+    // スロット情報を分解
+    var pipeIdx = entry.slotKey.indexOf('|');
+    var useDate   = pipeIdx >= 0 ? entry.slotKey.substring(0, pipeIdx) : entry.slotKey;
+    var slotStart = pipeIdx >= 0 ? entry.slotKey.substring(pipeIdx + 1) : '';
+    var SLOT_ENDS = {
+      '09:00': '11:00', '11:00': '13:00', '13:00': '15:00',
+      '15:00': '17:00', '17:00': '19:00', '19:00': '21:00'
+    };
+    var slotEnd = SLOT_ENDS[slotStart] || '?';
+
+    var weekdays = ['日', '月', '火', '水', '木', '金', '土'];
+    var d = new Date(useDate + 'T00:00:00+09:00');
+    var m = d.getMonth() + 1;
+    var day = d.getDate();
+    var w = weekdays[d.getDay()];
+    var dateLabel = m + '月' + day + '日(' + w + ')';
+
+    try {
+      // ── Step 1: 施設 ID に対応するコースグループ ID を取得 ──
+      // REQUIREMENTS.md F-6-6 で定義済み: facilityId '420' = 鳥屋野、'413' = 東総合
+      // 未知の facilityId は警告ログを出してスキップする（将来の施設追加時の誤作動防止）
+      var facilityIdStr = String(entry.facilityId);
+      var idPropKey;
+      if (facilityIdStr === '420') {
+        idPropKey = 'TOYA_COURSE_GROUP_IDS';
+      } else if (facilityIdStr === '413') {
+        idPropKey = 'HIGASHI_COURSE_GROUP_IDS';
+      } else {
+        console.warn('[WARN] processReserveQueue: 未知の facilityId=' + facilityIdStr +
+                     ' のためスキップ。id=' + entry.reservationQueueId);
+        skipped++;
+        processed--;
+        continue;
+      }
+
+      // courseGroupIds は ScriptProperties から取得（コース番号は週ごとに変わる場合がある）
+      // 例: TOYA_COURSE_GROUP_IDS = "14879,14881,14882" / HIGASHI_COURSE_GROUP_IDS = "14791"
+      var idPropVal = getProperty(idPropKey) || '';
+      var courseGroupIds = idPropVal
+        ? idPropVal.split(',').map(function (s) { return parseInt(s.trim(), 10); })
+                             .filter(function (n) { return !isNaN(n); })
+        : [];
+
+      if (courseGroupIds.length === 0) {
+        // ScriptProperties に courseGroupIds が設定されていない → スキップして手動対応を促す
+        // pending 状態を維持する（設定後に次回の processReserveQueue 実行で自動リトライされる）
+        console.warn('[WARN] processReserveQueue: ' + idPropKey + ' が未設定のためこのエントリはスキップ。' +
+                     ' pending 状態を維持します（次回の processReserveQueue 実行時に再試行されます）。' +
+                     ' id=' + entry.reservationQueueId);
+        if (groupId) {
+          try {
+            pushText(groupId,
+              '⚠️ 自動予約の設定が未完了です。\n' +
+              dateLabel + ' ' + slotStart + '〜' + slotEnd + '\n' +
+              entry.facilityName + '\n' +
+              '管理者: ' + idPropKey + ' を ScriptProperties に設定してください。'
+            );
+          } catch (pushErr) {
+            logError(pushErr, { phase: 'processReserveQueue.push.noGroupIds', slotKey: entry.slotKey });
+          }
+        }
+        // failed にはせず skipped 扱い（設定後に再処理できるよう status は pending のまま）
+        skipped++;
+        processed--;
+        continue;
+      }
+
+      // ── Step 2: スキャンして空きコートの courseTimeId を取得 ──
+      var scanResult = _callScanLambda(useDate, slotStart, courseGroupIds);
+
+      if (!scanResult || !scanResult.courts || scanResult.courts.length === 0) {
+        // 空きコートが見つからなかった
+        console.warn('[WARN] processReserveQueue: 空きコートなし。' +
+                     ' id=' + entry.reservationQueueId + ' slotKey=' + entry.slotKey);
+        updateReserveQueueStatus(entry.reservationQueueId, 'failed');
+        failed++;
+
+        if (groupId) {
+          try {
+            pushText(groupId,
+              '❌ 空きコートが見つかりませんでした。（自動予約）\n' +
+              dateLabel + ' ' + slotStart + '〜' + slotEnd + '\n' +
+              entry.facilityName + '\n' +
+              '手動で予約をお試しください。'
+            );
+          } catch (pushErr) {
+            logError(pushErr, { phase: 'processReserveQueue.push.noCourts', slotKey: entry.slotKey });
+          }
+        }
+        continue;
+      }
+
+      // 最初に見つかった空きコートの courseTimeId を使って予約する
+      var courseTimeId = scanResult.courts[0].courseTimeId;
+      console.log('[INFO] processReserveQueue: スキャン成功。courseTimeId=' + courseTimeId +
+                  ' 空きコート数=' + scanResult.courts.length +
+                  ' id=' + entry.reservationQueueId);
+
+      // ── Step 3: Lambda 経由で予約実行 ──
+      // _callReserveLambda は内部で楽観的ロック（RESERVED_SLOT_* フラグを呼び出し前に 'true' にセット）
+      // を設定する。失敗時はフラグを 'false' に戻す。
+      var lambdaResult = _callReserveLambda(entry.slotKey, entry.facilityId, courseTimeId);
+
+      if (lambdaResult && lambdaResult.success) {
+        // 予約成功
+        updateReserveQueueStatus(entry.reservationQueueId, 'reserved');
+        succeeded++;
+
+        if (groupId) {
+          try {
+            pushText(groupId,
+              '✅ 予約が完了しました！（自動予約）\n' +
+              dateLabel + ' ' + slotStart + '〜' + slotEnd + '\n' +
+              entry.facilityName
+            );
+          } catch (pushErr) {
+            logError(pushErr, { phase: 'processReserveQueue.push.success', slotKey: entry.slotKey });
+          }
+        }
+        console.log('[INFO] processReserveQueue: 予約成功 id=' + entry.reservationQueueId +
+                    ' slotKey=' + entry.slotKey + ' courseTimeId=' + courseTimeId);
+
+      } else {
+        // Lambda が success=false を返した
+        var errMsg = (lambdaResult && lambdaResult.message) ? lambdaResult.message : '不明なエラー';
+        updateReserveQueueStatus(entry.reservationQueueId, 'failed');
+        failed++;
+
+        if (groupId) {
+          try {
+            pushText(groupId,
+              '❌ 自動予約に失敗しました。\n' +
+              dateLabel + ' ' + slotStart + '〜' + slotEnd + '\n' +
+              entry.facilityName + '\n' +
+              '理由: ' + errMsg + '\n' +
+              '手動で予約をお試しください。'
+            );
+          } catch (pushErr) {
+            logError(pushErr, { phase: 'processReserveQueue.push.failed', slotKey: entry.slotKey });
+          }
+        }
+        console.warn('[WARN] processReserveQueue: Lambda 失敗 id=' + entry.reservationQueueId +
+                     ' message=' + errMsg);
+      }
+
+    } catch (err) {
+      logError(err, { phase: 'processReserveQueue.lambda', id: entry.reservationQueueId });
+      updateReserveQueueStatus(entry.reservationQueueId, 'failed');
+      failed++;
+
+      if (groupId) {
+        try {
+          pushText(groupId,
+            '❌ 自動予約中にエラーが発生しました。\n' +
+            dateLabel + ' ' + slotStart + '〜' + slotEnd + '\n' +
+            entry.facilityName + '\n' +
+            '手動で予約をお試しください。'
+          );
+        } catch (pushErr) {
+          logError(pushErr, { phase: 'processReserveQueue.push.error', slotKey: entry.slotKey });
+        }
+      }
     }
   }
 
-  console.log('=== parseScraperSheetValues 結果 ===');
-  var parsed = parseScraperSheetValues(values, '鳥屋野総合体育館');
-  for (var j = 0; j < parsed.length; j++) {
-    console.log(JSON.stringify(parsed[j]));
+  console.log('[INFO] processReserveQueue 完了: processed=' + processed +
+              ' succeeded=' + succeeded + ' failed=' + failed + ' skipped=' + skipped);
+  return { processed: processed, succeeded: succeeded, failed: failed, skipped: skipped };
+}
+
+/**
+ * processReserveQueue を毎分実行するトリガーを設定する(F-6 / F-6-9)
+ *
+ * F-6-9-1 速度最適化:
+ *   従来の atHour(7) トリガーは 7:00〜8:00 のどこかで起動するため精度が足りない。
+ *   everyMinutes(1) に変更することで最悪でも 7:01:xx には起動できる。
+ *   processReserveQueue() 内の時刻チェック（7:00〜7:10 の窓）で不要な実行を即排除する。
+ *
+ * 使い方:
+ *   GAS エディタの「関数を選択」で setupQueueTrigger を選び「実行」ボタンを押す。
+ *   既存の atHour(7) トリガーがある場合は先にトリガー管理画面から手動削除してください。
+ *
+ * 注意:
+ *   everyMinutes(1) トリガーは GAS の実行回数制限を消費する。
+ *   processReserveQueue() 内で 7:00〜7:10 以外は即 return するため、
+ *   1日あたりの無駄な実行は最大 24×60-10=1430回だが、GAS の無料枠（1日90分）は
+ *   各実行がほぼ瞬時に終わるため問題ない（1回あたり数ms程度）。
+ *
+ * @returns {void}
+ */
+function setupQueueTrigger() {
+  var QUEUE_TRIGGER_FUNCTION = 'processReserveQueue';
+
+  var triggers = ScriptApp.getProjectTriggers();
+
+  // 既存の processReserveQueue トリガーをすべて削除してから再作成する
+  // （atHour → everyMinutes への変更を確実に反映するため）
+  var existingFound = false;
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === QUEUE_TRIGGER_FUNCTION) {
+      ScriptApp.deleteTrigger(triggers[i]);
+      existingFound = true;
+      console.log('[INFO] setupQueueTrigger: 既存トリガーを削除しました。');
+    }
   }
+
+  // everyMinutes(1) で新規作成（F-6-9-1: GASトリガーの精密化）
+  ScriptApp.newTrigger(QUEUE_TRIGGER_FUNCTION)
+    .timeBased()
+    .everyMinutes(1)
+    .create();
+
+  console.log('[INFO] setupQueueTrigger: processReserveQueue のトリガーを毎分実行に設定しました。' +
+              '（F-6-9-1 速度最適化・7:00〜7:10 の窓のみ実処理）' +
+              (existingFound ? ' 既存トリガーを置き換えました。' : ''));
 }

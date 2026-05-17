@@ -1,7 +1,7 @@
 # 要件定義書 — gas-badminton-scheduler
 
 **作成日**: 2026-05-10
-**バージョン**: v0.9(F-6 施設予約自動化仕様追記 — 2026-05-16)
+**バージョン**: v1.1(F-6 実装確定仕様反映 — 2026-05-16)
 **位置づけ**: ユーザーとの壁打ちで決まった内容を整理した正式ドキュメント。F-1-1(メンバー自動登録機能)実装完了 + 実機 AC-1 PASS 済。
 
 ---
@@ -292,21 +292,19 @@
 - 条件: 確定スロットの利用日が今日から7日以内（バド卓ねっとの予約可能期間内）
 - 処理フロー:
   1. 「予約する」ボタン押下 → LINEがGASにpostbackイベントを送る
-  2. GASがAWS Lambda（API Gateway経由）に予約リクエストを送る
+  2. GASがAWS Lambda（API Gateway経由）に scan リクエストを送り、空きコートを調べる
      - 用語補足: **AWS Lambda**(エーダブリューエス・ラムダ)= Amazon が提供するサーバーレス関数。サーバーを常時起動しておかずに、呼ばれたときだけ処理を動かせる仕組み
      - 用語補足: **API Gateway**(エーピーアイ・ゲートウェイ)= AWS Lambda を「URLでHTTPリクエストを受け付けられる」ようにする中継役のサービス
-  3. AWS Lambdaがバド卓ねっとの予約フォームを自動操作する
-     a. 施設のスケジュールページからコースIDを取得
-     b. 指定スロットの予約IDを取得
-     c. 予約フォームに氏名・電話番号・メールアドレスを自動入力して送信
-  4. GASが予約結果をグループに通知する
+  3. 空きコートが1面の場合は自動予約、複数ある場合はコート選択Flexをグループに送信
+  4. GASが reserve リクエストで AWS Lambda に予約を依頼する（バド卓ねっとはログイン不要。氏名・電話番号・メールアドレスのみ入力）
+  5. GASが予約結果をグループに通知する
 
 #### F-6-3. 予約待ちキュー
 - 条件: 確定スロットの利用日が今日から8日以上先（まだ予約できない期間）
 - 処理フロー:
   1. 「予約する」ボタン押下 → `reserve-queue`シートに予約待ちとして登録
   2. グループに「X月X日(曜)は X月X日(曜)7:00に予約可能になります。自動予約します。」と通知
-  3. 毎朝7:05のGASトリガーが`reserve-queue`シートをチェック
+  3. GASトリガー（everyMinutes(1)）が`reserve-queue`シートをチェックし、7:00〜7:10 の窓のみ実処理する
   4. 予約可能日（利用日の7日前）が今日以前のエントリについて、即時予約処理（F-6-2）を実行する
 
 #### F-6-4. 予約結果通知
@@ -491,7 +489,7 @@
 - [ ] **AC-26**: 7日以内のスロットで「予約する」ボタンを押すと即時予約される
   - **Given**: 確定スロットの利用日が今日から7日以内。ScriptPropertiesに予約者情報（氏名・電話・メール）・AWS_RESERVE_URLが設定済み
   - **When**: グループメンバーが「予約する」ボタンを押す
-  - **Then**: AWS Lambdaがバド卓ねっとの予約フォームに自動送信し、グループに「✅ 予約が完了しました！」通知が届く。`RESERVED_SLOT_{slotKey}`フラグが`true`に設定される
+  - **Then**: AWS Lambdaがバドミントンコートをスキャンしてバドミントンの予約フォームに自動送信し、グループに「✅ 予約が完了しました！」通知が届く。`RESERVED_SLOT_{slotKey}`フラグが`true`に設定される
 
 - [ ] **AC-27**: 二重予約が防止される
   - **Given**: あるスロットがすでに予約済み（`RESERVED_SLOT_{slotKey}` = `true`）
@@ -505,7 +503,7 @@
 
 - [ ] **AC-29**: 予約待ちキューが予約可能日になると自動予約される
   - **Given**: `reserve-queue`シートに`pending`ステータスのエントリがある。今日が利用日の7日前以降
-  - **When**: 毎朝7:05のトリガーが実行される
+  - **When**: GASトリガー（everyMinutes(1)）が実行される（7:00〜7:10 の窓のみ実処理）
   - **Then**: Lambdaが予約フォームを自動送信し、グループに「✅ 予約が完了しました！」通知が届く。エントリのstatusが`reserved`に更新される
 
 ---
@@ -616,13 +614,13 @@
 | 観点 | 結果 |
 |:--|:--|
 | ログイン要否 | ログイン不要。毎回「氏名・電話番号・メールアドレス」を入力する方式 |
-| 予約フォームURL形式 | `/schedule/reserve/{reserveId}` 形式（reserveIdはコート・時間帯ごとに付与される動的ID） |
+| 予約フォームURL形式 | `/schedule/reserve/{courseTimeId}` 形式（courseTimeIdはコート・時間帯ごとに付与される動的ID） |
 | GASからのアクセス | **NG**（XSERVER WAF が Google IP をブロック。D-016参照） |
 | AWS Lambdaからのアクセス | **OK**（Googleのサーバー以外のIPからはアクセス可能と判断） |
-| コースID取得方法 | 施設スケジュールページ（`/facility/{facilityId}/schedule`）から日付に対応するコースへのリンクを取得 |
-| 予約IDの取得方法 | コース詳細ページ（`/schedule/course/{courseId}/1`）の時間帯選択ページから取得 |
+| コースID取得方法 | `/schedule/course/{courseGroupId}/{page}` の時間帯選択ページから取得 |
+| 予約IDの取得方法 | コース詳細ページの時間帯リンクから `courseTimeId` を取得 |
 | 予約可能期間 | 利用日の1週間前の7:00から（これ以前は予約ページに遷移できない） |
-| CSRFトークン | フォーム詳細は実装時に確認要（TBD-18） |
+| CSRFトークン | ✅ **TBD-18 解消済み（2026-05-16 実機確認）**。フォームの `_token` hidden フィールドとして存在する。Lambda が GET で取得して POST に含める3ステップフローで対応済み |
 
 ---
 
@@ -665,11 +663,11 @@
 
 ### 9-6. F-6 予約自動化まわり
 
-- **TBD-18**: バド卓ねっとの予約フォームのCSRFトークン・隠しフィールドの有無（Lambda実装時に実機確認が必要）
+- ~~**TBD-18**: バド卓ねっとの予約フォームのCSRFトークン・隠しフィールドの有無~~ → ✅ **解消済み（2026-05-16 実機確認）**。フォームに `_token` hidden フィールドが存在することを確認。Lambda が Step1（GET）で取得して Step2（POST confirm）・Step3（POST send）に含める3ステップフローを実装済み。
   - 用語補足: **CSRFトークン**(シーサーフトークン)= フォームの不正送信を防ぐためにサーバーが発行する使い捨ての番号。フォームのHTMLの中に隠しフィールドとして埋め込まれていることが多い
-- **TBD-19**: 予約失敗時のリトライ方針（Lambda側でリトライするか、GASが翌朝再試行するか）
-- **TBD-20**: 予約待ちキュー（`reserve-queue`シート）のデータ保持期間（完了・失敗後のエントリをいつ削除するか）
-- **TBD-21**: バド卓ねっとのCSRFトークン取得が必要な場合のLambda実装方針（GETでページ取得→トークン抽出→POST）
+- ~~**TBD-21**: バド卓ねっとのCSRFトークン取得が必要な場合のLambda実装方針~~ → ✅ **解消済み（TBD-18 と同時解消）**。「GETでページ取得 → `_token` を cheerio で抽出 → POST に含める」の3ステップフローをLambdaに実装済み。
+- **TBD-19**: 予約失敗時のリトライ方針（GASが翌朝再試行するか） → **一部解消**。Lambda側は `_withRetry()` で最大3回の指数バックオフリトライを実装済み。GAS側での翌朝再試行の仕組みは未実装（失敗時はグループにエラー通知して手動対応を促す方針）。
+- **TBD-20**: 予約待ちキュー（`reserve-queue`シート）のデータ保持期間（完了・失敗後のエントリをいつ削除するか） → **継続保留**
 
 ---
 
@@ -922,7 +920,7 @@ LIFF で回答が送信されるたびに、すべてのスロットの `can`(�
 2. _checkAndNotifyViableSlots() が発火
 3. 「予約する」ボタン付きFlexメッセージをグループに送信
 4. グループメンバーの誰かが「予約する」をタップ
-5a. 利用日が7日以内 → AWS Lambda経由で即座に予約
+5a. 利用日が7日以内 → scan で空きコートを確認 → コート選択 or 自動予約 → AWS Lambda経由で即座に予約
 5b. 利用日が8日以上先 → reserve-queueシートに保存して予約待ち
 6. 予約完了 or 失敗をグループに通知
 ```
@@ -937,7 +935,7 @@ LIFF で回答が送信されるたびに、すべてのスロットの `can`(�
 action=reserve&slotKey=YYYY-MM-DD|HH:mm&facilityId=420
 ```
 
-- `action`: 処理の種類。`reserve` = 予約処理
+- `action`: 処理の種類。`reserve` = 予約処理の開始、`selectFacility` = 施設・コースグループ選択、`reserveCourt` = 特定コートを予約
 - `slotKey`: 予約対象の日時（`YYYY-MM-DD|HH:mm` 形式）。例: `2026-05-25|13:00`
 - `facilityId`: 施設のID。バド卓ねっと上の数字。例: `420`（鳥屋野総合体育館）
 
@@ -945,14 +943,36 @@ action=reserve&slotKey=YYYY-MM-DD|HH:mm&facilityId=420
 
 ### F-6-3. Lambda へのリクエスト仕様
 
-GAS から AWS Lambda（API Gateway）に送るリクエスト（JSON形式）:
+#### scan リクエスト（空きコート一覧取得）
+
+GAS から Lambda（API Gateway）に送る JSON:
 
 ```json
 {
-  "slotKey": "2026-05-25|13:00",
-  "facilityId": 420,
+  "action": "scan",
+  "date": "2026-05-25",
+  "startTime": "13:00",
+  "courseGroupIds": [14881, 14882]
+}
+```
+
+Lambda からの応答:
+
+```json
+{ "success": true, "courts": [{ "courtName": "バドミントン 1", "courseTimeId": 407563, "courseGroupId": 14881 }] }
+```
+
+> `courseGroupIds`（コースグループID）は ScriptProperties の `TOYA_COURSE_GROUP_IDS` または `HIGASHI_COURSE_GROUP_IDS` から取得する。ハードコードしない。
+
+#### reserve リクエスト（予約実行）
+
+GAS から Lambda（API Gateway）に送る JSON:
+
+```json
+{
+  "courseTimeId": 407752,
   "name": "（ScriptPropertiesのRESERVE_NAME）",
-  "phone": "（ScriptPropertiesのRESERVE_PHONE）",
+  "tel":  "（ScriptPropertiesのRESERVE_TEL）",
   "email": "（ScriptPropertiesのRESERVE_EMAIL）"
 }
 ```
@@ -963,6 +983,8 @@ Lambda からの応答:
 { "success": true, "message": "予約が完了しました" }
 { "success": false, "message": "エラー内容" }
 ```
+
+> バド卓ねっとはログイン不要のため、ログインIDやパスワードは不要。氏名（name）・電話番号（tel）・メールアドレス（email）のみで予約できる。
 
 ---
 
@@ -986,9 +1008,14 @@ Lambda からの応答:
 | キー | 用途 |
 |:--|:--|
 | RESERVE_NAME | 予約フォームに入力する代表者の氏名 |
-| RESERVE_PHONE | 予約フォームに入力する代表者の電話番号 |
+| RESERVE_TEL | 予約フォームに入力する代表者の電話番号（RESERVE_PHONE でも可） |
 | RESERVE_EMAIL | 予約フォームに入力する代表者のメールアドレス |
 | AWS_RESERVE_URL | AWS LambdaのAPI Gateway URL |
+| RESERVE_API_TOKEN | GAS-Lambda 間の認証トークン（X-Api-Token ヘッダーに付与） |
+| RESERVE_ENABLED | 自動予約機能の有効化フラグ（`'true'` で有効・それ以外で無効） |
+| TOYA_COURSE_GROUP_IDS | 鳥屋野総合体育館のコースグループID（カンマ区切り。例: `14881,14882`） |
+| HIGASHI_COURSE_GROUP_IDS | 東総合スポーツセンターのコースグループID（カンマ区切り） |
+| DEFAULT_FACILITY_ID | Flex メッセージで使う施設ID（省略時 `'420'`） |
 | RESERVED_SLOT_{slotKey} | スロット予約済みフラグ（true = 予約済み） |
 
 ---
@@ -1002,14 +1029,14 @@ Lambda からの応答:
 
 ---
 
-### F-6-7. 実装ファイル構成（予定）
+### F-6-7. 実装ファイル構成（実装済み）
 
 | ファイル | 変更内容 |
 |:--|:--|
-| `src/handlers.js` | postbackハンドラーを追加（`handlePostback`）。AWS Lambdaを呼び出す処理（`_callReserveLambda`）を追加 |
-| `src/Code.js` | `_routeEvent` に `postback` イベントの振り分けを追加。毎朝7:05のトリガー関数を追加 |
+| `src/handlers.js` | postbackハンドラーを追加（`handlePostback`）。scan/reserve の Lambda 呼び出し処理（`_callScanLambda` / `_callReserveLambda`）を追加 |
+| `src/Code.js` | `_routeEvent` に `postback` イベントの振り分けを追加。`processReserveQueue`（everyMinutes(1) + 7:00〜7:10 窓チェック付き）を追加 |
 | `src/sheets.js` | `getReserveQueueSheet()` / `addReserveQueue()` / `getReserveQueueEntries()` / `updateReserveQueueStatus()` を追加 |
-| `lambda/` | AWS Lambda関数（Node.js）を新規作成。axios + cheerio でバド卓ねっとを操作 |
+| `lambda/` | AWS Lambda関数（Node.js）を新規作成。axios + cheerio でバド卓ねっとを操作。ログイン処理なし（ログイン不要サイトのため） |
 
 ---
 
@@ -1021,8 +1048,57 @@ Lambda からの応答:
 
 ---
 
+### F-6-9. 予約速度最適化仕様（2026-05-16 追加・2026-05-16 改訂）
+
+#### 背景
+体育館の予約開始時刻（利用日の7日前 7:00）は争奪戦になる。
+GASのatHour(7)トリガーは7:00〜8:00のどこかで起動するため精度が足りない。
+Lambda はコールドスタート（初回起動）時に数秒かかる場合がある。
+
+#### F-6-9-1. GASトリガーの精密化
+- `setupQueueTrigger()` のトリガーを `atHour(7)` から `everyMinutes(1)` に変更する
+- `processReserveQueue()` の冒頭で「現在時刻が7:00〜7:10の間か」を確認し、範囲外なら即 return する
+- これにより最悪でも7:01:xx には起動できる（従来は最悪8:00近くまで遅れる可能性あり）
+
+#### F-6-9-2. Lambda コンテナのウォームアップ
+バド卓ねっとはログイン不要のため、セッションキャッシュは不要。
+`event.action === 'warmup'` のとき、スケジュールページに軽く HEAD リクエストを送り、Lambda コンテナを起動させて return する。
+
+- AWSのEventBridgeルールで毎朝6:59（JST）にwarmupアクションを呼ぶことで、7:00の予約処理でコールドスタートの遅延をなくす
+- warmup 中の HEAD リクエストが失敗しても致命的ではない（コンテナはすでに起動済みのため）
+
+```javascript
+// EventBridgeのペイロード（warmup用）
+{ "action": "warmup" }
+
+// EventBridgeのcron式（6:59 JST = 21:59 UTC）
+cron(59 21 * * ? *)
+```
+
+#### F-6-9-3. HTTP keepAlive
+- axiosのHTTPAgentに `keepAlive: true` を設定し、接続を使い回す
+
+#### F-6-9-4. 冪等性チェック（Idempotency）— 楽観的ロック方式
+バド卓ねっとはログイン不要のため「マイページの予約一覧」で確認することができない。
+代わりに GAS 側の `RESERVED_SLOT_{slotKey}` フラグを使って二重予約を防ぐ。
+
+- `_callReserveLambda()` の**呼び出し前**に `RESERVED_SLOT_{slotKey}` を `'true'` にセットする（楽観的ロック）
+- Lambda が成功 → フラグはそのまま `'true'` を維持する（呼び出し元でフラグを立て直す必要はない）
+- Lambda が失敗（例外 / success=false / HTTP エラー）→ `_callReserveLambda()` 内でフラグを `'false'` に戻す（再試行を可能にする）
+- GAS プロセスがクラッシュした場合は `'true'` のままになる可能性がある（過剰ロック）。その場合は手動で `'false'` に戻すこと
+
+#### F-6-9-5. ScriptProperties追加（GAS側）
+| キー | 用途 |
+|:--|:--|
+| なし | 今回追加なし（EventBridgeはAWS側で設定） |
+
+---
+
 ## 改訂履歴
 
+- **v1.1**(2026-05-16): F-6 実装確定仕様を反映（整合性チェックによる更新）。§8-5 CSRFトークン行を TBD-18 解消済みに更新。§9-6 TBD-18/TBD-21 を解消済みに、TBD-19 を「一部解消」に更新。F-6-3 Lambda リクエスト仕様を実装に合わせて scan/reserve の2段階フロー・courseTimeId 形式に刷新。F-6-5 ScriptProperties に RESERVE_TEL / RESERVE_API_TOKEN / RESERVE_ENABLED / TOYA_COURSE_GROUP_IDS / HIGASHI_COURSE_GROUP_IDS / DEFAULT_FACILITY_ID を追加。F-6-7 トリガー記述を everyMinutes(1) + 7:00〜7:10 窓チェックに更新。F-6-9-2 warmup ペイロード例から facilityId を削除（ログイン不要のため不要）。AC-29 をトリガー仕様に合わせて更新。F-6-3 の「予約待ちキュー」処理フローのトリガー記述を修正。
+- **v1.0.1**(2026-05-16): 仕様変更「バド卓ねっとはログイン不要」を反映。F-6-9-2（warmup）をログインなし・HEAD リクエスト版に改訂。F-6-9-4（冪等性チェック）をマイページ確認方式から楽観的ロック方式（`_callReserveLambda` 呼び出し前にフラグをセット・失敗時に解放）に改訂。Lambda から `axios-cookiejar-support` / `tough-cookie` / ログイン処理 / セッションキャッシュを削除。AWS_SETUP_GUIDE の環境変数から `BADTAKU_LOGIN_ID` / `BADTAKU_PASSWORD` を削除。
+- **v1.0**(2026-05-16): F-6-9「予約速度最適化仕様」を §13 末尾に追記。GASトリガー精密化（everyMinutes(1) + 7:00〜7:10窓チェック）・Lambda事前ログイン（warmupアクション + セッションキャッシュ）・HTTP keepAlive・冪等性チェック（TBD-18仮実装）の仕様を追加。EventBridge cron式・warmupペイロード例を記載。
 - **v0.9.2**(2026-05-16): バグ修正「アンケート自動配信のタイミング修正」。F-2-5 にアンケート自動配信の仕様（全施設揃い時のみ）を追記。AC-20 を更新（通知+配信の両方を記載）。D-024 追加。
 - **v0.9.1**(2026-05-16): バグ修正「翌月スケジュール未検知」対応。§8-1-a にページ内テーブル構造を追記。F-2-1 を翌月シート（`scraper-<id>-next`）対応に更新。AC-30 追加。白根カルチャーセンター削除に伴う AC-20・F-2-5・D-005 の件数表記を修正。D-023 追加。
 - **v0.9**(2026-05-16): F-6「施設予約自動化仕様」を §13 に新規追加。§3-4（Phase 4 機能要件 F-6-1〜F-6-4）追加。§4-3 個人情報ポリシー修正（F-6 予約代表者の例外を明記）。§4-4 に AWS Lambda・API Gateway の無料枠を追記。§5 に AC-25〜AC-29 追加。§6-1 に WAF ブロック問題と F-6 対応方針を追記。§7 技術スタックに AWS Lambda 行を追加。§8-5 バド卓ねっと技術検証を追加。§9-6 TBD-18〜21 追加。§10 ロードマップに F-6 追加。目次に §13 と §3-4 を追加。
@@ -1037,8 +1113,3 @@ Lambda からの応答:
   - **D-011 追加**(シート命名規則・列名命名規則・日時表現の統一):§4-3 データ保持方針に「全シート共通で D-011 の命名規則に従う」を追記。§9-4 TBD-13 / TBD-14 を解消済に更新
   - **DEFAULT_MAX_ATTEMPTS 定数化**(REVIEW R-8 対応):§4-2 の実装上の注意に追記
   - §5 受け入れ条件:AC-1 を ✅ PASS(2026-05-10)に更新
-  - §10 開発ロードマップ:Phase 0 完了 / Phase 1 を F-1-1 完了状態に更新
-- **v0.2**(2026-05-10): critic-ja 評価(86/100点・プロダクトグレード下位)のフィードバックを反映。
-  - 🔴 最優先 2 件:F-1-1 の Webhook `follow` イベントトリガーを明示 / AC-8 を Given-When-Then 形式で粒度向上
-  - 🟡 推奨 4 件:目次(TOC)追加 / §1-3「類似ツールとの差別化」追加(既存 1-3 を 1-4 にリナンバー)/ §2-1 末尾に「典型的な利用シーンの 1 日」追記 / §4-2 のリトライ仕様を「最大 3 回・指数バックオフ」で具体化
-- **v0.1**(2026-05-10): 初版起草。ユーザーとの壁打ち結果(全 10 項目)+ 技術検証結果(GREEN)を反映。実装はまだ開始していない段階の要件整理ドキュメント。

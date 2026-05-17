@@ -764,6 +764,87 @@
 
 ---
 
+## D-025: Lambda 経由での自動予約方式採用（F-6）
+
+- **決定日**: 2026-05-16
+- **対応機能**: F-6（自動予約）
+- **決定**: GAS から直接バド卓ねっとを操作するのではなく、**AWS Lambda を中継する方式**を採用する。
+- **背景・課題**:
+  - GAS から `niigata-kaikou.jp` に直接 `UrlFetchApp.fetch()` でアクセスすると、サイトの WAF（不正アクセスを弾く仕組み）に引っかかって 501 エラーになることが実機確認で判明した
+  - Lambda（AWS のサーバーレス実行基盤）経由では通過できることを scan 機能で確認済み
+- **採用理由**:
+  - Lambda 側で axios + cheerio を使えばフォームの解析・送信が柔軟に行える
+  - GAS は Lambda に JSON を投げるだけでよいため、GAS 側のコードがシンプルになる
+- **影響範囲**:
+  - `lambda/reserve.js`（Lambda 本体）
+  - `src/handlers.js`（`_callReserveLambda` / `_callScanLambda`）
+  - AWS API Gateway + Lambda の設定が必要
+
+---
+
+## D-026: courseGroupId を ScriptProperties で管理・IMPORTXML で自動取得（F-6）
+
+- **決定日**: 2026-05-16
+- **対応機能**: F-6（自動予約）
+- **決定**:
+  1. 施設の各開放パターンに割り当てられた ID（courseGroupId）は **ScriptProperties に保存**し、管理者が手動更新できる設計にする
+  2. `scraper.js` に IMPORTXML 方式でバド卓ねっとのトップページから courseGroupId を自動取得する機能を追加する
+- **背景・課題**:
+  - courseGroupId は施設・開放パターンごとに異なり、変更される可能性がある
+  - ハードコードすると変更時にコード修正が必要になる
+- **採用理由**:
+  - ScriptProperties なら GAS のコードを変更せずに管理者が値を更新できる
+  - IMPORTXML は GAS のスプレッドシート関数であり、GAS からのアクセスでも WAF を回避できる
+- **影響範囲**:
+  - ScriptProperties キー: `TOYA_COURSE_GROUP_IDS`（鳥屋野）、`HIGASHI_COURSE_GROUP_IDS`（東総合）
+  - `src/scraper.js`（courseGroupId 自動取得ロジック）
+
+---
+
+## D-027: バド卓ねっとはログイン不要・予約フォームは3ステップ（F-6）
+
+- **決定日**: 2026-05-16
+- **対応機能**: F-6（自動予約）
+- **決定**: バド卓ねっとは**会員制ではなく、氏名・電話番号・メールアドレスを入力するだけで予約できる**ことを実機確認で確認した。Lambda のログイン処理は不要。
+- **予約フォームの実際の構造**（ページのソース確認済み）:
+  1. GET `/schedule/reserve/{courseTimeId}` → 入力フォーム（`_token` など hidden フィールドを取得）
+  2. POST `/schedule/post` with `name / tel / email / mode=confirm` → 確認ページ（`cancel_key` を取得）
+  3. POST `/schedule/post` with `mode=send` → 予約完了
+- **成功判定**: 完了ページの `.p-contact-form-step .is-current` が「3」または「送信完了」を含むかで判定
+- **影響範囲**:
+  - `lambda/reserve.js`（3ステップの予約処理・ログイン処理なし）
+
+---
+
+## D-028: 予約確認フロー設計（施設選択→コート選択→確認→予約実行）（F-6）
+
+- **決定日**: 2026-05-16
+- **対応機能**: F-6（自動予約）
+- **決定**: 「予約する」ボタンを押してから予約完了まで、以下の4ステップを踏むフローを採用する。
+  ```
+  [予約する] → scan実行
+    → 施設が複数 → [施設を選ぶ]（パターン情報も表示）
+    → [コートを選ぶ]
+    → [予約します] ← ここで初めて予約実行
+  ```
+- **施設の定義**:
+  - 鳥屋野総合体育館（facilityId=420）: 大体育室（Aパターン）・中体育室（Bパターン）
+  - 東総合スポーツセンター（facilityId=413）: Aパターン・Bパターン・Cパターン
+  - 将来: 西総合スポーツセンターが復活した場合も同様に追加予定
+- **施設選択画面の表示内容**: 施設名 + そのとき開放されているパターン名（例:「鳥屋野 / 大体育室(A)・中体育室(B)」）
+- **検討した代替案**:
+  1. コートを選んだら即予約（修正前の設計）: 誤タップで即予約される危険がある
+  2. **採用案（確認ボタンを挟む）**: 誤操作を防ぎ、ユーザーが最終確認してから予約できる
+- **postback アクションの流れ**:
+  - `action=reserve` → scan → 施設選択 or コート選択
+  - `action=selectFacility&courseGroupId=...` → コート選択 Flex を表示
+  - `action=selectCourt&courseTimeId=...` → 予約確認 Flex を表示
+  - `action=confirmReserve&courseTimeId=...` → 予約実行
+- **影響範囲**:
+  - `src/handlers.js`: `_doImmediateReserve` / `handlePostback` / `_buildCourtSelectionFlex` の変更、`_buildFacilitySelectionFlex` / `_buildReserveConfirmFlex` の新規追加
+
+---
+
 ## 改訂履歴
 
 - **v1.1**(2026-05-15): D-022 追加。F-5 グループトーク移行の設計判断を記録。D-001 との関係(1on1 Push → グループ 1 通への置き換え)を明記。
