@@ -51,7 +51,20 @@ function doPost(e) {
     var requestBody = (e && e.postData && e.postData.contents) ? e.postData.contents : '';
     var signatureFromQuery = (e && e.parameter && e.parameter.signature) ? e.parameter.signature : '';
 
-    // (1) シークレット URL トークン検証(必須・第一防衛線)
+    // JSON を先にパース（LIFF POST と LINE Webhook を識別するため）
+    var payload = null;
+    if (requestBody) {
+      try { payload = JSON.parse(requestBody); } catch (_) {}
+    }
+
+    // (1-a) LIFF POST API: WEBHOOK_URL_TOKEN チェックより前に分岐
+    //        LIFF リクエストは ID Token で認証するため URL トークン不要
+    if (payload && payload.liff) {
+      var liffPostResponse = _handleLiffPostApi(payload);
+      if (liffPostResponse) return liffPostResponse;
+    }
+
+    // (1) シークレット URL トークン検証(LINE Webhook 専用・第一防衛線)
     var expectedToken = getProperty('WEBHOOK_URL_TOKEN');
     var providedToken = (e && e.parameter && e.parameter.token) ? e.parameter.token : '';
     if (expectedToken && !timingSafeEqual(expectedToken, providedToken)) {
@@ -75,20 +88,13 @@ function doPost(e) {
       }
     }
 
-    // (3) JSON パース
-    if (!requestBody) {
-      return _ok();
-    }
-    var payload;
-    try {
-      payload = JSON.parse(requestBody);
-    } catch (parseError) {
-      logError(parseError, { phase: 'doPost.jsonParse', body: requestBody.substring(0, 500) });
+    // (3) JSON パース済み。空ボディまたはパース失敗なら終了
+    if (!requestBody || !payload) {
       return _ok();
     }
 
-    // (4) events 配列を取り出して 1 件ずつ振り分け
-    var events = (payload && payload.events) ? payload.events : [];
+    // (4) events 配列を取り出して 1 件ずつ振り分け(LINE Webhook)
+    var events = payload.events || [];
     for (var i = 0; i < events.length; i++) {
       _routeEvent(events[i]);
     }
@@ -132,6 +138,10 @@ function doGet(e) {
     return _serveLiffResultsPage();
   }
 
+  if (page === 'reserve') {
+    return _serveLiffReservePage();
+  }
+
   // それ以外 → ヘルスチェックテキスト(後方互換)
   return ContentService.createTextOutput(
     'gas-badminton-scheduler is running. (POST events from LINE will be processed here.)'
@@ -170,6 +180,24 @@ function _serveLiffResultsPage() {
   return template.evaluate()
     .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
     .setTitle('回答状況確認');
+}
+
+/**
+ * LIFF 予約ページを配信する(内部用・F-6 LIFF方式)
+ *
+ * liff/reserve.html を HtmlService のテンプレートとして読み込み、
+ * スクリプトプロパティ LIFF_RESERVE_ID と GAS_WEB_APP_URL を埋め込んで返す。
+ *
+ * @returns {GoogleAppsScript.HTML.HtmlOutput}
+ * @private
+ */
+function _serveLiffReservePage() {
+  var template = HtmlService.createTemplateFromFile('liff/reserve');
+  template.liffId    = getProperty('LIFF_RESERVE_ID')  || '';
+  template.gasApiUrl = getProperty('GAS_WEB_APP_URL')  || '';
+  return template.evaluate()
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
+    .setTitle('コート予約');
 }
 
 // ─────────────────────────────────────────────
@@ -337,7 +365,8 @@ function resetResponsesSheetForF4() {
 /**
  * 1 イベントを正しい担当関数へ振り分ける(内部用)
  *
- * F-6 変更点: `postback` イベントを handlePostback() に振り分けを追加。
+ * F-6 変更点: postback は LIFF方式移行により handlePostback がスタブ化されている。
+ *   実際の予約フローは LIFF ページ経由の handleLiffReserve* 関数群で完結する。
  *
  * @param {Object} event - LINE Webhook イベントオブジェクト 1 件
  * @private
@@ -394,14 +423,18 @@ function _ok() {
 // ─────────────────────────────────────────────
 
 /**
- * GitHub Pages からの LIFF API リクエストを処理する(内部用)
+ * LIFF API リクエストを処理する(内部用)
  *
  * GET パラメータ:
- *   liff=getSchedules   → スケジュール一覧 + このユーザーの前回答を返す(F-4 グリッド形式)
- *   liff=getAllResponses → 全員の回答状況を返す(F-4 形式)
- *   liff=submit         → answers パラメータの回答を保存する
- *   idToken             → LIFF の ID Token(全アクションで必須)
- *   answers             → JSON 文字列 { 'YYYY-MM-DD|HH:mm': 'can'|'undecided' }(submit のみ)
+ *   liff=getSchedules      → スケジュール一覧 + このユーザーの前回答を返す(F-4 グリッド形式)
+ *   liff=getAllResponses    → 全員の回答状況を返す(F-4 形式)
+ *   liff=submit            → answers パラメータの回答を保存する
+ *   liff=reserveGetData    → 予約LIFF用: 初期データ取得(slotKey 必須・F-6 LIFF方式)
+ *   liff=reserveScanCourts → 予約LIFF用: コートスキャン(slotKey + courseGroupId 必須・F-6 LIFF方式)
+ *   idToken                → LIFF の ID Token(全アクションで必須)
+ *   slotKey                → 'YYYY-MM-DD|HH:mm' 形式(reserveGetData / reserveScanCourts で必須)
+ *   courseGroupId          → スキャン対象(reserveScanCourts のみ)
+ *   answers                → JSON 文字列 { 'YYYY-MM-DD|HH:mm': 'can'|'undecided' }(submit のみ)
  *
  * @param {Object} e - doGet のイベントオブジェクト
  * @param {string} action - liff パラメータの値
@@ -444,9 +477,77 @@ function _handleLiffApi(e, action) {
       return _jsonResponse({ ok: true, data: result });
     }
 
+    // ── F-6 LIFF方式: 予約用 GET API ──
+
+    if (action === 'reserveGetData') {
+      // slotKey は URL パラメータで渡す(LIFF ページが開いた時点で呼ぶ)
+      // userId は検証済み identity から取得する(§14-11 IDOR対策)
+      var rdSlotKey = (e && e.parameter && e.parameter.slotKey) ? e.parameter.slotKey : '';
+      var rdResult = handleLiffReserveGetData(rdSlotKey, identity.userId);
+      return _jsonResponse({ ok: rdResult.success !== false, data: rdResult });
+    }
+
+    if (action === 'reserveScanCourts') {
+      var scSlotKey      = (e && e.parameter && e.parameter.slotKey)      ? e.parameter.slotKey      : '';
+      var scCourseGroupId = (e && e.parameter && e.parameter.courseGroupId) ? e.parameter.courseGroupId : '';
+      var scResult = handleLiffReserveScanCourts(scSlotKey, scCourseGroupId);
+      return _jsonResponse({ ok: scResult.success !== false, data: scResult });
+    }
+
     return _jsonResponse({ ok: false, error: 'unknown action: ' + action });
   } catch (err) {
     logError(err, { phase: '_handleLiffApi', action: action });
+    return _jsonResponse({ ok: false, error: 'server error' });
+  }
+}
+
+/**
+ * LIFF 予約ページからの POST リクエストを処理する(内部用・F-6 LIFF方式)
+ *
+ * LIFF ページが GAS Web App に対して doPost で送るリクエストを処理する。
+ * JSON body に liff フィールドが含まれている場合に呼ばれる。
+ *
+ * liff=reserveSubmit      → 即時予約実行
+ * liff=reserveQueueSubmit → キュー予約登録
+ *
+ * @param {Object} payload - JSON.parse 済みの doPost body
+ * @returns {GoogleAppsScript.Content.TextOutput | null} JSON レスポンス or null(処理しない場合)
+ */
+function _handleLiffPostApi(payload) {
+  var action = (payload && payload.liff) ? payload.liff : '';
+  if (!action) return null;
+
+  // ── ID Token 検証（CWE-306 対策）──
+  // doGet 側の _handleLiffApi と同様に verifyLineIdToken で必ず認証する。
+  // curl 等から任意の slotKey + reserverIndex を POST されても弾けるようにする。
+  var idToken = (payload && payload.idToken) ? payload.idToken : '';
+  if (!idToken) {
+    console.warn('[WARN] _handleLiffPostApi: idToken が指定されていません。action=' + action);
+    return _jsonResponse({ ok: false, error: 'idToken is required' });
+  }
+  var identity = verifyLineIdToken(idToken);
+  if (!identity) {
+    console.warn('[WARN] _handleLiffPostApi: ID Token verification failed. action=' + action);
+    return _jsonResponse({ ok: false, error: 'auth_failed' });
+  }
+  // ── ここまで ID Token 検証 ──
+
+  try {
+    if (action === 'reserveSubmit') {
+      // identity.userId を渡して handlers.js 側で lineUserId 照合する(§14-11 IDOR対策)
+      var submitResult = handleLiffReserveSubmit(payload, identity.userId);
+      return _jsonResponse({ ok: submitResult.success !== false, data: submitResult });
+    }
+
+    if (action === 'reserveQueueSubmit') {
+      // identity.userId を渡して handlers.js 側で lineUserId 照合する(§14-11 IDOR対策)
+      var queueResult = handleLiffReserveQueueSubmit(payload, identity.userId);
+      return _jsonResponse({ ok: queueResult.success !== false, data: queueResult });
+    }
+
+    return _jsonResponse({ ok: false, error: 'unknown liff POST action: ' + action });
+  } catch (err) {
+    logError(err, { phase: '_handleLiffPostApi', action: action });
     return _jsonResponse({ ok: false, error: 'server error' });
   }
 }
@@ -566,30 +667,37 @@ function processReserveQueue() {
     var dateLabel = m + '月' + day + '日(' + w + ')';
 
     try {
-      // ── Step 1: 施設 ID に対応するコースグループ ID を取得 ──
-      // REQUIREMENTS.md F-6-6 で定義済み: facilityId '420' = 鳥屋野、'413' = 東総合
-      // 未知の facilityId は警告ログを出してスキップする（将来の施設追加時の誤作動防止）
+      // ── Step 1: courseGroupId を決定 ──
+      // LIFF方式では entry.courseGroupId が直接指定されている場合はそれを使う。
+      // 未指定の場合は facilityId から ScriptProperties を参照してフォールバックする。
       var facilityIdStr = String(entry.facilityId);
-      var idPropKey;
-      if (facilityIdStr === '420') {
-        idPropKey = 'TOYA_COURSE_GROUP_IDS';
-      } else if (facilityIdStr === '413') {
-        idPropKey = 'HIGASHI_COURSE_GROUP_IDS';
-      } else {
-        console.warn('[WARN] processReserveQueue: 未知の facilityId=' + facilityIdStr +
-                     ' のためスキップ。id=' + entry.reservationQueueId);
-        skipped++;
-        processed--;
-        continue;
-      }
 
-      // courseGroupIds は ScriptProperties から取得（コース番号は週ごとに変わる場合がある）
-      // 例: TOYA_COURSE_GROUP_IDS = "14879,14881,14882" / HIGASHI_COURSE_GROUP_IDS = "14791"
-      var idPropVal = getProperty(idPropKey) || '';
-      var courseGroupIds = idPropVal
-        ? idPropVal.split(',').map(function (s) { return parseInt(s.trim(), 10); })
-                             .filter(function (n) { return !isNaN(n); })
-        : [];
+      var courseGroupIds = [];
+      if (entry.courseGroupId && entry.courseGroupId > 0) {
+        // LIFF方式: キュー登録時に courseGroupId が指定されている
+        courseGroupIds = [entry.courseGroupId];
+      } else {
+        // 旧方式フォールバック: facilityId から ScriptProperties を参照
+        var idPropKey;
+        if (facilityIdStr === '420') {
+          idPropKey = 'TOYA_COURSE_GROUP_IDS';
+        } else if (facilityIdStr === '413') {
+          idPropKey = 'HIGASHI_COURSE_GROUP_IDS';
+        } else if (facilityIdStr === '429') {
+          idPropKey = 'KAMEDA_COURSE_GROUP_IDS';
+        } else {
+          console.warn('[WARN] processReserveQueue: 未知の facilityId=' + facilityIdStr +
+                       ' のためスキップ。id=' + entry.reservationQueueId);
+          skipped++;
+          processed--;
+          continue;
+        }
+        var idPropVal = getProperty(idPropKey) || '';
+        courseGroupIds = idPropVal
+          ? idPropVal.split(',').map(function (s) { return parseInt(s.trim(), 10); })
+                               .filter(function (n) { return !isNaN(n); })
+          : [];
+      }
 
       if (courseGroupIds.length === 0) {
         // ScriptProperties に courseGroupIds が設定されていない → スキップして手動対応を促す
@@ -640,16 +748,72 @@ function processReserveQueue() {
         continue;
       }
 
-      // 最初に見つかった空きコートの courseTimeId を使って予約する
-      var courseTimeId = scanResult.courts[0].courseTimeId;
+      // ── Step 3: courseTimeId をコート優先順位に基づいて決定 ──
+      // LIFF方式では entry.courtPriority1〜3 に優先コート名（文字列）が指定されている。
+      // 優先順位に沿って空きコートを選ぶ。全優先コートが埋まっていれば
+      // §14-6-3 の仕様通り「全コートが埋まるまで順次試行」を実施する。
+      var courts = scanResult.courts;
+      var courseTimeId = 0;
+
+      // コート名マップ: courtName → courseTimeId の対応表を作成
+      // （courtPriority はコート名文字列で統一。修正4対応）
+      var courtNameToTimeId = {};
+      for (var cIdx = 0; cIdx < courts.length; cIdx++) {
+        courtNameToTimeId[courts[cIdx].courtName] = courts[cIdx].courseTimeId;
+      }
+
+      // 優先順位コートを順番に試す（コート名で突合）
+      var priorities = [entry.courtPriority1, entry.courtPriority2, entry.courtPriority3];
+      var triedCourseTimeIds = {};
+      for (var pi = 0; pi < priorities.length; pi++) {
+        var pName = String(priorities[pi] || '');
+        if (pName && courtNameToTimeId[pName]) {
+          courseTimeId = courtNameToTimeId[pName];
+          triedCourseTimeIds[String(courseTimeId)] = true;
+          break;
+        }
+      }
+
+      // §14-6-3: 優先コートが全滅でも空きコートが残っている場合は全コートを順次試行する
+      // （とにかくコートを確保することを優先する）
+      if (!courseTimeId && courts.length > 0) {
+        for (var fci = 0; fci < courts.length; fci++) {
+          var fcId = String(courts[fci].courseTimeId);
+          if (!triedCourseTimeIds[fcId]) {
+            courseTimeId = courts[fci].courseTimeId;
+            break;
+          }
+        }
+      }
+
       console.log('[INFO] processReserveQueue: スキャン成功。courseTimeId=' + courseTimeId +
-                  ' 空きコート数=' + scanResult.courts.length +
+                  ' 空きコート数=' + courts.length +
                   ' id=' + entry.reservationQueueId);
 
-      // ── Step 3: Lambda 経由で予約実行 ──
+      // ── Step 4: reserver-master から予約者情報を取得 ──
+      var reserverInfo = null;
+      if (entry.reserverIndex !== null && entry.reserverIndex !== undefined) {
+        try {
+          var masterEntries = getReserverMasterEntries();
+          for (var mi = 0; mi < masterEntries.length; mi++) {
+            if (masterEntries[mi].index === entry.reserverIndex) {
+              reserverInfo = {
+                name:  masterEntries[mi].name,
+                tel:   masterEntries[mi].tel,
+                email: masterEntries[mi].email
+              };
+              break;
+            }
+          }
+        } catch (masterErr) {
+          console.warn('[WARN] processReserveQueue: reserver-master 取得エラー: ' + masterErr.message);
+        }
+      }
+
+      // ── Step 5: Lambda 経由で予約実行 ──
       // _callReserveLambda は内部で楽観的ロック（RESERVED_SLOT_* フラグを呼び出し前に 'true' にセット）
       // を設定する。失敗時はフラグを 'false' に戻す。
-      var lambdaResult = _callReserveLambda(entry.slotKey, entry.facilityId, courseTimeId);
+      var lambdaResult = _callReserveLambda(entry.slotKey, entry.facilityId, courseTimeId, reserverInfo);
 
       if (lambdaResult && lambdaResult.success) {
         // 予約成功
@@ -658,11 +822,13 @@ function processReserveQueue() {
 
         if (groupId) {
           try {
-            pushText(groupId,
-              '✅ 予約が完了しました！（自動予約）\n' +
+            var successMsg = '✅ 予約が完了しました！（自動予約）\n' +
               dateLabel + ' ' + slotStart + '〜' + slotEnd + '\n' +
-              entry.facilityName
-            );
+              entry.facilityName;
+            if (reserverInfo && reserverInfo.name) {
+              successMsg += '\n予約者: ' + reserverInfo.name;
+            }
+            pushText(groupId, successMsg);
           } catch (pushErr) {
             logError(pushErr, { phase: 'processReserveQueue.push.success', slotKey: entry.slotKey });
           }

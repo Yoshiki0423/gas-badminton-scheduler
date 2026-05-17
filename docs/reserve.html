@@ -269,11 +269,6 @@
         return;
       }
 
-      // [一時表示] userId 確認用 — reserver-master 登録完了後に削除してください
-      const _profile = await liff.getProfile();
-      showError('【管理者へ】あなたのLINE ID（コピーして管理者に送ってください）:\n' + _profile.userId);
-      return;
-
       // ID Token 取得
       state.idToken = liff.getIDToken() || '';
       if (!state.idToken) {
