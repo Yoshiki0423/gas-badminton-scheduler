@@ -634,11 +634,11 @@
         url += (url.indexOf('?') >= 0 ? '&' : '?') + qs;
       }
 
-      const options = {
-        method: method,
-        headers: { 'Content-Type': 'application/json' }
-      };
-      if (body) options.body = JSON.stringify(body);
+      const options = { method: method };
+      if (body) {
+        options.headers = { 'Content-Type': 'application/json' };
+        options.body = JSON.stringify(body);
+      }
 
       const resp = await fetch(url, options);
       if (!resp.ok) throw new Error('HTTP ' + resp.status);
