@@ -338,6 +338,21 @@ function verifyLineIdToken(idToken) {
       return null;
     }
 
+    // aud チェック: このLIFFアプリ向けのトークンかを確認(§14-11 多層検証)
+    if (parsed.aud !== channelId) {
+      console.log('[WARN] verifyLineIdToken: aud mismatch. expected=' + channelId +
+                  ' got=' + parsed.aud);
+      return null;
+    }
+
+    // exp チェック: 有効期限内かを確認(秒単位のUnixタイムスタンプ)
+    var nowSec = Math.floor(Date.now() / 1000);
+    if (!parsed.exp || parsed.exp <= nowSec) {
+      console.log('[WARN] verifyLineIdToken: token expired. exp=' + parsed.exp +
+                  ' now=' + nowSec);
+      return null;
+    }
+
     return {
       userId: parsed.sub,
       displayName: parsed.name || '(名前不明)'

@@ -67,6 +67,14 @@ var FACILITIES = [
     nextSheetName: 'scraper-413-next',
     enabled: true
   },
+  {
+    facilityId: 429,
+    facilityName: '亀田総合体育館',
+    url: 'https://niigata-kaikou.jp/facility/429/schedule',
+    sheetName: 'scraper-429',
+    nextSheetName: 'scraper-429-next',
+    enabled: true
+  }
 ];
 
 /** 連続失敗カウントのしきい値(これを超えたら管理者通知) */
@@ -115,6 +123,31 @@ var PROP_TOYA_COURSE_GROUP_IDS = 'TOYA_COURSE_GROUP_IDS';
  * 値の形式: "14791,14793" のようなカンマ区切り数値文字列
  */
 var PROP_HIGASHI_COURSE_GROUP_IDS = 'HIGASHI_COURSE_GROUP_IDS';
+
+/**
+ * ScriptProperties キー: 鳥屋野総合体育館の courseGroupId ラベル一覧
+ * 値の形式: "A,A/B,B,A" のようなカンマ区切り文字列(IDS と同順)
+ * "A"=大体育室、"B"=中体育室、"A/B"=混在(時間帯によってどちらも使う日)
+ */
+var PROP_TOYA_COURSE_GROUP_LABELS = 'TOYA_COURSE_GROUP_LABELS';
+
+/**
+ * ScriptProperties キー: 東総合スポーツセンターの courseGroupId ラベル一覧
+ * 値の形式: PROP_TOYA_COURSE_GROUP_LABELS と同じ形式
+ */
+var PROP_HIGASHI_COURSE_GROUP_LABELS = 'HIGASHI_COURSE_GROUP_LABELS';
+
+/**
+ * ScriptProperties キー: 亀田総合体育館(facilityId=429)の courseGroupId 一覧
+ * 値の形式: "14791,14793" のようなカンマ区切り数値文字列
+ */
+var PROP_KAMEDA_COURSE_GROUP_IDS = 'KAMEDA_COURSE_GROUP_IDS';
+
+/**
+ * ScriptProperties キー: 亀田総合体育館の courseGroupId ラベル一覧
+ * 値の形式: PROP_TOYA_COURSE_GROUP_LABELS と同じ形式
+ */
+var PROP_KAMEDA_COURSE_GROUP_LABELS = 'KAMEDA_COURSE_GROUP_LABELS';
 
 /** 毎朝トリガーを起動する時刻(0-23) */
 var TRIGGER_HOUR = 7;
@@ -912,12 +945,15 @@ var COURSE_ID_SHEET_NAME = 'courseids';
  *   IMPORTHTML 方式(setupScraperSheets)と同じパターンで回避する。
  *
  * シート構造:
- *   A1 = 鳥屋野(facilityId=420)の IMPORTXML 式
- *   B1 = 東総合(facilityId=413)の IMPORTXML 式
- *   結果として A列・B列それぞれに "/schedule/course/数字/1 or 2" の文字列が縦並びで入る
+ *   A1 = 鳥屋野(420)の href 式 → "/schedule/course/数字/1 or 2" が縦並び
+ *   B1 = 東総合(413)の href 式
+ *   C1 = 鳥屋野(420)のリンクテキスト式 → "バドミントン個人開放(大体育室A)" 等が縦並び
+ *   D1 = 東総合(413)のリンクテキスト式
+ *   E1 = 亀田(429)の href 式
+ *   F1 = 亀田(429)のリンクテキスト式
  *
  * 冪等性:
- *   A1・B1 に既に式が設定されていれば再設定しない。
+ *   各セルに既に式が設定されていれば再設定しない。
  *   毎回 updateCourseGroupIds() から呼ばれるため、余分な書き込みを避ける。
  *
  * @returns {GoogleAppsScript.Spreadsheet.Sheet} courseids シート
@@ -929,27 +965,59 @@ function _setupCourseIdSheet() {
   }
   var ss = SpreadsheetApp.openById(spreadsheetId);
 
-  // シートを取得 or 作成(setupScraperSheets と同じパターン)
   var sheet = ss.getSheetByName(COURSE_ID_SHEET_NAME);
   if (!sheet) {
     sheet = ss.insertSheet(COURSE_ID_SHEET_NAME);
     console.log('[INFO] _setupCourseIdSheet: ' + COURSE_ID_SHEET_NAME + ' シートを新規作成しました。');
   }
 
-  // 既に式が入っていれば再設定しない(冪等)
-  var a1Val = sheet.getRange('A1').getFormula();
-  var b1Val = sheet.getRange('B1').getFormula();
+  // ─── レイアウト設計 ───────────────────────────────────────
+  // IMPORTXML("..url..","//a[...]/..")  は PARENT 要素を取得する。
+  // 親要素がリンク+テキストを含む場合、IMPORTXML が 2 列に展開する:
+  //   列 1 = リンクテキスト("○ 予約"など)
+  //   列 2 = 残りテキスト("大体育室A" / "Aパターン"など) ← ラベル判定に使う
+  //
+  // 展開先(列 2)が別の式と衝突すると #REF! になるため、
+  // 各施設の text 列の右隣を必ず空き列として確保する。
+  //
+  //   A: 鳥屋野 hrefs    B: 鳥屋野 text→ (C列にあふれる)   C: 空き
+  //   D: 東総合 hrefs    E: 東総合 text→ (F列にあふれる)   F: 空き
+  //   G: 亀田 hrefs      H: 亀田 text→  (I列にあふれる)    I: 空き
+  //
+  // 新レイアウトの判定: B1 が 鳥屋野テキスト式(facility/420 を含み @href を含まない)かどうか
+  // ─────────────────────────────────────────────────────────
 
-  var toyaFormula   = '=IMPORTXML("https://niigata-kaikou.jp/facility/420/schedule","//a[contains(@href,\'/schedule/course/\')]/@href")';
-  var higashiFormula = '=IMPORTXML("https://niigata-kaikou.jp/facility/413/schedule","//a[contains(@href,\'/schedule/course/\')]/@href")';
+  var b1Formula = sheet.getRange('B1').getFormula();
+  // 新レイアウト判定: B1 が 鳥屋野テキスト式(facility/420 かつ XPath が /.. で終わる)かどうか
+  // href 式は ]/@href 、text 式は ]/.. で終わるので後者で区別する
+  var isNewLayout = b1Formula && b1Formula.indexOf('facility/420') !== -1 && b1Formula.indexOf(']/..') !== -1;
 
-  if (!a1Val) {
-    sheet.getRange('A1').setFormula(toyaFormula);
-    console.log('[INFO] _setupCourseIdSheet: A1 に鳥屋野の IMPORTXML 式を設定しました。');
+  if (!isNewLayout) {
+    // 旧レイアウト(B1=東総合hrefs 等)または空 → クリアして新レイアウトに移行
+    sheet.clearContents();
+    console.log('[INFO] _setupCourseIdSheet: レイアウトを新形式(9列)に移行するためシートをクリアしました。');
   }
-  if (!b1Val) {
-    sheet.getRange('B1').setFormula(higashiFormula);
-    console.log('[INFO] _setupCourseIdSheet: B1 に東総合の IMPORTXML 式を設定しました。');
+
+  // 式テンプレート
+  var hrefXpath = "//a[contains(@href,'/schedule/course/')]/@href";
+  var textXpath = "//a[contains(@href,'/schedule/course/')]/..";
+
+  var defs = [
+    { hrefCell: 'A1', textCell: 'B1', name: '鳥屋野(420)', url: 'https://niigata-kaikou.jp/facility/420/schedule' },
+    { hrefCell: 'D1', textCell: 'E1', name: '東総合(413)', url: 'https://niigata-kaikou.jp/facility/413/schedule' },
+    { hrefCell: 'G1', textCell: 'H1', name: '亀田(429)',   url: 'https://niigata-kaikou.jp/facility/429/schedule' }
+  ];
+
+  for (var i = 0; i < defs.length; i++) {
+    var def = defs[i];
+    if (!sheet.getRange(def.hrefCell).getFormula()) {
+      sheet.getRange(def.hrefCell).setFormula('=IMPORTXML("' + def.url + '","' + hrefXpath + '")');
+      console.log('[INFO] _setupCourseIdSheet: ' + def.hrefCell + ' に ' + def.name + ' href 式を設定しました。');
+    }
+    if (!sheet.getRange(def.textCell).getFormula()) {
+      sheet.getRange(def.textCell).setFormula('=IMPORTXML("' + def.url + '","' + textXpath + '")');
+      console.log('[INFO] _setupCourseIdSheet: ' + def.textCell + ' に ' + def.name + ' text 式を設定しました。');
+    }
   }
 
   return sheet;
@@ -977,6 +1045,18 @@ function _setupCourseIdSheet() {
  *
  * @returns {void}
  */
+/**
+ * コース選択リンクのテキストからパターンラベル(A/B)を返す
+ * 大体育室 → "A"、中体育室 → "B"、不明 → ""(handlers.js が ID 数字にフォールバック)
+ * @private
+ */
+function _courseTextToLabel(text) {
+  var t = (text || '').replace(/\s+/g, '');
+  if (t.indexOf('大体育室') >= 0) return 'A';
+  if (t.indexOf('中体育室') >= 0) return 'B';
+  return '';
+}
+
 function updateCourseGroupIds() {
   var sheet = _setupCourseIdSheet();
 
@@ -985,36 +1065,76 @@ function updateCourseGroupIds() {
 
   var props = PropertiesService.getScriptProperties();
 
-  /** 更新対象の施設定義(列インデックスと ScriptProperties キーの対応) */
+  /**
+   * 更新対象の施設定義(新レイアウト: 9列構成)
+   *   hrefCol    : href 列(A=0, D=3, G=6)
+   *   textCol1   : IMPORTXML text 式の列(B=1, E=4, H=7) — リンクテキストが入る
+   *   textCol2   : text 式の右隣(C=2, F=5, I=8) — 部屋名テキストがあふれ込む
+   *   両列を結合してラベル判定する
+   */
   var targets = [
-    { colIndex: 0, facilityName: '鳥屋野総合体育館',      propKey: PROP_TOYA_COURSE_GROUP_IDS },
-    { colIndex: 1, facilityName: '東総合スポーツセンター', propKey: PROP_HIGASHI_COURSE_GROUP_IDS }
+    { hrefCol: 0, textCol1: 1, textCol2: 2, facilityName: '鳥屋野総合体育館',      propKey: PROP_TOYA_COURSE_GROUP_IDS,    labelsPropKey: PROP_TOYA_COURSE_GROUP_LABELS },
+    { hrefCol: 3, textCol1: 4, textCol2: 5, facilityName: '東総合スポーツセンター', propKey: PROP_HIGASHI_COURSE_GROUP_IDS, labelsPropKey: PROP_HIGASHI_COURSE_GROUP_LABELS },
+    { hrefCol: 6, textCol1: 7, textCol2: 8, facilityName: '亀田総合体育館',         propKey: PROP_KAMEDA_COURSE_GROUP_IDS,  labelsPropKey: PROP_KAMEDA_COURSE_GROUP_LABELS }
   ];
 
   // シート全体を一括取得して列ごとに処理する
   var allValues = sheet.getDataRange().getValues();
+  var numCols = allValues.length > 0 ? allValues[0].length : 0;
 
   for (var t = 0; t < targets.length; t++) {
     var target = targets[t];
     var ids = [];
     var idSeen = {};
+    // courseGroupId → { "A": true, "B": true } のようなラベルセット
+    var idToLabels = {};
 
     for (var r = 0; r < allValues.length; r++) {
-      var cellVal = allValues[r][target.colIndex];
-      // 値が文字列でなければスキップ(空セル・数値・エラー値対応)
-      if (typeof cellVal !== 'string') {
+      var hrefCell = allValues[r][target.hrefCol];
+      // href が文字列でなければスキップ(空セル・数値・エラー値対応)
+      if (typeof hrefCell !== 'string') {
         continue;
       }
       // "/schedule/course/数字/1" の形式のみバドミントン枠として抽出(末尾 /2 は卓球・除外)
-      var m = cellVal.match(/^\/schedule\/course\/(\d+)\/1$/);
+      var m = hrefCell.match(/^\/schedule\/course\/(\d+)\/1$/);
       if (!m) {
         continue;
       }
       var idNum = parseInt(m[1], 10);
+      if (isNaN(idNum)) {
+        continue;
+      }
+
       // 重複排除: 同じ ID が複数行に出現する場合がある
-      if (!isNaN(idNum) && !idSeen[idNum]) {
+      if (!idSeen[idNum]) {
         ids.push(idNum);
         idSeen[idNum] = true;
+        idToLabels[idNum] = {};
+      }
+
+      // IMPORTXML "/.." は 2 列に展開される:
+      //   textCol1 = リンクテキスト("○ 予約"など)
+      //   textCol2 = 部屋名テキスト("大体育室A" / "Aパターン"など)
+      // 両列を結合して判定する(どちらに部屋名が入るかはHTML構造による)
+      // 施設ごとのラベル表記:
+      //   鳥屋野/東総合: "大体育室A" → A / "中体育室B" → B
+      //   亀田:          "Aパターン" → A / "Bパターン" → B / "Cパターン" → C / "Dパターン" → D
+      var t1 = (target.textCol1 < numCols && typeof allValues[r][target.textCol1] === 'string') ? allValues[r][target.textCol1] : '';
+      var t2 = (target.textCol2 < numCols && typeof allValues[r][target.textCol2] === 'string') ? allValues[r][target.textCol2] : '';
+      var textStr = (t1 + t2).replace(/\s+/g, '');
+      if (textStr.indexOf('大体育室') >= 0) idToLabels[idNum]['A'] = true;
+      if (textStr.indexOf('中体育室') >= 0) idToLabels[idNum]['B'] = true;
+      if (textStr.indexOf('Aパターン') >= 0) idToLabels[idNum]['A'] = true;
+      if (textStr.indexOf('Bパターン') >= 0) idToLabels[idNum]['B'] = true;
+      if (textStr.indexOf('Cパターン') >= 0) idToLabels[idNum]['C'] = true;
+      if (textStr.indexOf('Dパターン') >= 0) idToLabels[idNum]['D'] = true;
+      // 東総合スタイル: "時A"/"予約A" 形式で直接ラベル文字が示されるパターン
+      // 例: "=予約A" / "=予約9-17時A17-21時B" / "=予約9-13時B13-15時C15-21時A"
+      // ※鳥屋野(「予約大体育室A」→"大"で止まる)・亀田(「時～Aパターン」→"～"で止まる)には不一致
+      var labelLetterRe = /(?:時|予約)([A-D])(?=\d|$)/g;
+      var labelMatch;
+      while ((labelMatch = labelLetterRe.exec(textStr)) !== null) {
+        idToLabels[idNum][labelMatch[1]] = true;
       }
     }
 
@@ -1030,9 +1150,19 @@ function updateCourseGroupIds() {
     // 昇順ソートして保存(予約システムの利用順と合わせる)
     ids.sort(function (a, b) { return a - b; });
     var newVal = ids.join(',');
-
     props.setProperty(target.propKey, newVal);
-    console.log('[INFO] updateCourseGroupIds: ' + target.facilityName + ' 更新前=' + prevCount + '件 → 更新後=' + ids.length + '件 (' + newVal + ')');
+
+    // ラベルを IDs と同順で構築して保存
+    // 複数ラベルは "/" でつなぐ (例: A/B は混在日)
+    var labelArr = ids.map(function(id) {
+      var set = idToLabels[id] || {};
+      var chars = Object.keys(set).sort();
+      return chars.join('/'); // 例: "A"/"A/B"/"" (空なら handlers.js が ID数字にフォールバック)
+    });
+    var newLabelsVal = labelArr.join(',');
+    props.setProperty(target.labelsPropKey, newLabelsVal);
+
+    console.log('[INFO] updateCourseGroupIds: ' + target.facilityName + ' 更新前=' + prevCount + '件 → 更新後=' + ids.length + '件 (' + newVal + ') labels=(' + newLabelsVal + ')');
   }
 }
 

@@ -190,9 +190,10 @@
 
   <!-- LIFF SDK -->
   <script src="https://static.line-scdn.net/liff/edge/versions/2.22.3/sdk.js"></script>
-  <script src="liff.config.js"></script>
   <script>
-    const LIFF_ID = '2010067159-5Cwenzhc';
+    // GAS テンプレート変数（_serveLiffReservePage で埋め込まれる）
+    const LIFF_ID    = '<?= liffId ?>';
+    const GAS_API_URL = '<?= gasApiUrl ?>';
 
     // §14-9 施設・パターン別の固定コート名（facilityId_pattern → コート名配列）
     const COURT_NAMES = {
@@ -368,6 +369,7 @@
         const validGroups = scanResults
           .filter(function(r) { return r.hasCourts; })
           .map(function(r) { return r.cg; });
+        // スキャンが全滅した場合はフォールバックとして全件表示
         state.courseGroups = validGroups.length > 0 ? validGroups : state.courseGroups;
         list.innerHTML = '';
       }
@@ -423,6 +425,7 @@
         const cgKey = cg.facilityId + '|' + (cg.courseGroupLabel || String(cg.courseGroupId));
         let scanData;
         if (state.scanCache[cgKey]) {
+          // 施設選択画面でスキャン済みのキャッシュを再利用
           scanData = state.scanCache[cgKey];
         } else {
           document.getElementById('scanLoading').style.display = 'block';

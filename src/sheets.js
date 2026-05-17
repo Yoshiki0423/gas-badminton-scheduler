@@ -26,11 +26,14 @@
  *   - getSlotResponsesByUserId(userId)                     : ユーザーの回答を { 'YYYY-MM-DD|HH:mm': 'can'|'undecided' } 形式で返す
  *   - resetResponsesSheet()                                : シートをリセットして新ヘッダーを設定
  *
- *   ── reserve-queue シート(F-6) ──
+ *   ── reserve-queue シート(F-6 / LIFF方式拡張) ──
  *   - getReserveQueueSheet()                      : reserve-queue シートを取得・初期化
- *   - addReserveQueue(entry)                      : エントリを追加(reservationQueueId は自動採番)
- *   - getReserveQueueEntries(status)              : status で絞り込んで取得
+ *   - addReserveQueue(entry)                      : エントリを追加(reservationQueueId は自動採番・I〜M列対応)
+ *   - getReserveQueueEntries(status)              : status で絞り込んで取得(I〜M列対応)
  *   - updateReserveQueueStatus(reservationQueueId, status) : status と updatedAt を更新
+ *
+ *   ── reserver-master シート(F-6 LIFF方式・新規) ──
+ *   - getReserverMasterEntries()                  : 予約者マスター一覧を返す({ index, name, tel, email }[])
  *
  * メンバーシート構造(D-007 で確定):
  *   A: userId       (LINE ユーザー ID・主キー・テキスト書式)
@@ -57,7 +60,7 @@
  *   F: createdAt    (初回回答日時 ISO 8601 + Asia/Tokyo)
  *   G: updatedAt    (最終更新日時 ISO 8601 + Asia/Tokyo)
  *
- * reserve-queue シート構造(F-6 / D-011 命名規則):
+ * reserve-queue シート構造(F-6 LIFF方式拡張 / D-011 命名規則):
  *   A: reservationQueueId (主キー・"RQ_" + タイムスタンプ + ランダム4桁 形式)
  *   B: slotKey            (YYYY-MM-DD|HH:mm)
  *   C: facilityId         (施設ID)
@@ -66,6 +69,18 @@
  *   F: status             ("pending" / "reserved" / "failed")
  *   G: createdAt          (ISO 8601 + Asia/Tokyo)
  *   H: updatedAt          (ISO 8601 + Asia/Tokyo)
+ *   I: courseGroupId      (LIFF で選択した courseGroupId・省略時 0)
+ *   J: courtPriority1     (第1優先 courseTimeId・省略時 0)
+ *   K: courtPriority2     (第2優先 courseTimeId・省略時 0)
+ *   L: courtPriority3     (第3優先 courseTimeId・省略時 0)
+ *   M: reserverIndex      (reserver-master の index 番号・省略時 '')
+ *
+ * reserver-master シート構造(F-6 LIFF方式・新規):
+ *   A: index       (数値・一意の番号)
+ *   B: name        (予約者名)
+ *   C: tel         (電話番号)
+ *   D: email       (メールアドレス)
+ *   E: lineUserId  (LINE ユーザー ID・IDOR対策・§14-11)
  *
  * 命名規則(D-011):
  *   - シート名は全小文字 + ハイフン区切り or 単一単語(`members`, `schedules` 等)
@@ -1066,7 +1081,13 @@ var RESERVE_QUEUE_SHEET_NAME = 'reserve-queue';
 /**
  * reserve-queue シートのヘッダー行(D-011 命名規則:lowerCamelCase)
  *
- * F-6 仕様 §F-6-4 で確定した 8 列構造。
+ * F-6 LIFF方式移行により 8 列 → 13 列に拡張。
+ *   A-H: 旧来の列(後方互換)
+ *   I: courseGroupId   (LIFF で選択した courseGroupId)
+ *   J: courtPriority1  (第1優先 courseTimeId)
+ *   K: courtPriority2  (第2優先 courseTimeId)
+ *   L: courtPriority3  (第3優先 courseTimeId)
+ *   M: reserverIndex   (reserver-master の index 番号)
  */
 var RESERVE_QUEUE_HEADER = [
   'reservationQueueId', // A: 主キー(RQ_yyyyMMddHHmmss_XXXX 形式)
@@ -1076,7 +1097,12 @@ var RESERVE_QUEUE_HEADER = [
   'reservableDate',     // E: 予約可能日(YYYY-MM-DD・利用日の 7 日前)
   'status',             // F: 状態("pending" / "reserved" / "failed")
   'createdAt',          // G: 登録日時(ISO 8601 + Asia/Tokyo)
-  'updatedAt'           // H: 最終更新日時(ISO 8601 + Asia/Tokyo)
+  'updatedAt',          // H: 最終更新日時(ISO 8601 + Asia/Tokyo)
+  'courseGroupId',      // I: LIFF で選択した courseGroupId(LIFF方式追加)
+  'courtPriority1',     // J: 第1優先 courseTimeId(LIFF方式追加)
+  'courtPriority2',     // K: 第2優先 courseTimeId(LIFF方式追加)
+  'courtPriority3',     // L: 第3優先 courseTimeId(LIFF方式追加)
+  'reserverIndex'       // M: reserver-master の index 番号(LIFF方式追加)
 ];
 
 /** reserve-queue 列インデックス(1-based・getRange 用) */
@@ -1088,6 +1114,11 @@ var RQCOL_RESERVABLE_DATE      = 5;
 var RQCOL_STATUS               = 6;
 var RQCOL_CREATED_AT           = 7;
 var RQCOL_UPDATED_AT           = 8;
+var RQCOL_COURSE_GROUP_ID      = 9;
+var RQCOL_COURT_PRIORITY_1     = 10;
+var RQCOL_COURT_PRIORITY_2     = 11;
+var RQCOL_COURT_PRIORITY_3     = 12;
+var RQCOL_RESERVER_INDEX       = 13;
 
 // ─────────────────────────────────────────────
 // F-6: reserve-queue シート 関数
@@ -1151,6 +1182,11 @@ function _initializeReserveQueueSheet(sheet) {
   sheet.setColumnWidth(RQCOL_STATUS,                 80);
   sheet.setColumnWidth(RQCOL_CREATED_AT,            200);
   sheet.setColumnWidth(RQCOL_UPDATED_AT,            200);
+  sheet.setColumnWidth(RQCOL_COURSE_GROUP_ID,       120);
+  sheet.setColumnWidth(RQCOL_COURT_PRIORITY_1,      120);
+  sheet.setColumnWidth(RQCOL_COURT_PRIORITY_2,      120);
+  sheet.setColumnWidth(RQCOL_COURT_PRIORITY_3,      120);
+  sheet.setColumnWidth(RQCOL_RESERVER_INDEX,         80);
 }
 
 /**
@@ -1164,11 +1200,16 @@ function _initializeReserveQueueSheet(sheet) {
  * (二重登録防止・ただし reserved / failed は別エントリとして扱わない)。
  *
  * @param {{
- *   slotKey:        string, - 'YYYY-MM-DD|HH:mm' 形式(必須)
- *   facilityId:     string, - 施設 ID(必須)
- *   facilityName:   string, - 施設名(必須)
- *   reservableDate: string, - 予約可能日 YYYY-MM-DD(必須)
- *   status?:        string  - 初期ステータス(省略時 'pending')
+ *   slotKey:        string,  - 'YYYY-MM-DD|HH:mm' 形式(必須)
+ *   facilityId:     string,  - 施設 ID(必須)
+ *   facilityName:   string,  - 施設名(必須)
+ *   reservableDate: string,  - 予約可能日 YYYY-MM-DD(必須)
+ *   status?:        string,  - 初期ステータス(省略時 'pending')
+ *   courseGroupId?:  number, - LIFF で選択した courseGroupId(省略時 0)
+ *   courtPriority1?: number, - 第1優先 courseTimeId(省略時 0)
+ *   courtPriority2?: number, - 第2優先 courseTimeId(省略時 0)
+ *   courtPriority3?: number, - 第3優先 courseTimeId(省略時 0)
+ *   reserverIndex?:  number|string - reserver-master の index 番号(省略時 '')
  * }} entry
  * @returns {{ reservationQueueId: string, row: number, skipped: boolean }}
  *   skipped=true の場合は既存 pending エントリがあったため追加しなかった
@@ -1210,7 +1251,12 @@ function addReserveQueue(entry) {
       entry.reservableDate,
       status,
       nowIso,
-      nowIso
+      nowIso,
+      entry.courseGroupId  || 0,
+      entry.courtPriority1 || 0,
+      entry.courtPriority2 || 0,
+      entry.courtPriority3 || 0,
+      (entry.reserverIndex !== undefined && entry.reserverIndex !== null) ? entry.reserverIndex : ''
     ]]);
     SpreadsheetApp.flush();
 
@@ -1268,6 +1314,11 @@ function getReserveQueueEntries(status) {
       status:             rowStatus,
       createdAt:          String(row[RQCOL_CREATED_AT           - 1]),
       updatedAt:          String(row[RQCOL_UPDATED_AT           - 1]),
+      courseGroupId:      parseInt(row[RQCOL_COURSE_GROUP_ID    - 1], 10) || 0,
+      courtPriority1:     parseInt(row[RQCOL_COURT_PRIORITY_1   - 1], 10) || 0,
+      courtPriority2:     parseInt(row[RQCOL_COURT_PRIORITY_2   - 1], 10) || 0,
+      courtPriority3:     parseInt(row[RQCOL_COURT_PRIORITY_3   - 1], 10) || 0,
+      reserverIndex:      row[RQCOL_RESERVER_INDEX - 1] !== '' ? parseInt(row[RQCOL_RESERVER_INDEX - 1], 10) : null,
       row:                i + 2  // 1-based の行番号(ヘッダー行 1 + データ offset)
     });
   }
@@ -1378,4 +1429,68 @@ function _generateReservationQueueId() {
   var rand = Math.floor(Math.random() * 10000);
   var randPadded = ('0000' + rand).slice(-4);
   return 'RQ_' + timestamp + '_' + randPadded;
+}
+
+// ─────────────────────────────────────────────
+// F-6: reserver-master シート 関数
+// ─────────────────────────────────────────────
+
+/**
+ * reserver-master シートから予約者マスター一覧を取得する(F-6 LIFF方式)
+ *
+ * シート構造:
+ *   A: index       (数値・一意の番号)
+ *   B: name        (予約者名)
+ *   C: tel         (電話番号)
+ *   D: email       (メールアドレス)
+ *   E: lineUserId  (LINE ユーザー ID・IDOR対策・§14-11)
+ *
+ * シートが存在しない場合は空配列を返す(エラーにしない)。
+ * index / name / tel / email のいずれかが空の行はスキップする。
+ * lineUserId は空の場合も許容(空文字列として返す)。
+ *
+ * @returns {Array<{index: number, name: string, tel: string, email: string, lineUserId: string}>}
+ * @throws {Error} MEMBERS_SPREADSHEET_ID 未設定 or スプレッドシートが開けない場合
+ */
+function getReserverMasterEntries() {
+  var spreadsheetId = getProperty('MEMBERS_SPREADSHEET_ID');
+  if (!spreadsheetId) {
+    throw new Error('getReserverMasterEntries: MEMBERS_SPREADSHEET_ID が ScriptProperties に設定されていません');
+  }
+
+  var ss;
+  try {
+    ss = SpreadsheetApp.openById(spreadsheetId);
+  } catch (openError) {
+    throw new Error('getReserverMasterEntries: スプレッドシートを開けません (id=' + spreadsheetId + '): ' + openError.message);
+  }
+
+  var sheet = ss.getSheetByName('reserver-master');
+  if (!sheet) {
+    console.log('[INFO] getReserverMasterEntries: reserver-master シートが存在しません。空配列を返します。');
+    return [];
+  }
+
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return [];  // ヘッダー行のみ or 空
+
+  // E列(lineUserId)まで5列を取得する(§14-11 IDOR対策)
+  var values = sheet.getRange(2, 1, lastRow - 1, 5).getValues();
+  var result = [];
+
+  for (var i = 0; i < values.length; i++) {
+    var row        = values[i];
+    var idx        = parseInt(row[0], 10);
+    var name       = String(row[1] || '').trim();
+    var tel        = String(row[2] || '').trim();
+    var email      = String(row[3] || '').trim();
+    var lineUserId = String(row[4] || '').trim();
+
+    // 必須フィールドが欠けている行はスキップ
+    if (isNaN(idx) || !name || !tel || !email) continue;
+
+    result.push({ index: idx, name: name, tel: tel, email: email, lineUserId: lineUserId });
+  }
+
+  return result;
 }

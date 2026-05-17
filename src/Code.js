@@ -488,9 +488,10 @@ function _handleLiffApi(e, action) {
     }
 
     if (action === 'reserveScanCourts') {
-      var scSlotKey      = (e && e.parameter && e.parameter.slotKey)      ? e.parameter.slotKey      : '';
-      var scCourseGroupId = (e && e.parameter && e.parameter.courseGroupId) ? e.parameter.courseGroupId : '';
-      var scResult = handleLiffReserveScanCourts(scSlotKey, scCourseGroupId);
+      var scSlotKey        = (e && e.parameter && e.parameter.slotKey)        ? e.parameter.slotKey        : '';
+      var scCourseGroupId  = (e && e.parameter && e.parameter.courseGroupId)  ? e.parameter.courseGroupId  : '';
+      var scCourseGroupIds = (e && e.parameter && e.parameter.courseGroupIds) ? e.parameter.courseGroupIds : '';
+      var scResult = handleLiffReserveScanCourts(scSlotKey, scCourseGroupId, scCourseGroupIds);
       return _jsonResponse({ ok: scResult.success !== false, data: scResult });
     }
 
