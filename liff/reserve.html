@@ -147,6 +147,7 @@
       <div class="step-bar" id="stepBar2"></div>
       <div class="card">
         <div class="section-title" id="courtScreenTitle">コートを選択</div>
+        <div id="courtScreenSubtitle" style="font-size:0.8rem;color:#666;margin-top:2px;margin-bottom:8px;"></div>
         <div id="error-court" class="error-msg" style="display:none"></div>
         <img id="patternImg" class="pattern-img" alt="割り振り図" />
         <div class="loading" id="scanLoading" style="display:none">
@@ -207,6 +208,16 @@
       '429_C': ['バドミントン 1', 'バドミントン 2', 'バドミントン 3', 'バドミントン 4', 'バドミントン 5', 'バドミントン 6', 'バドミントン 7'],
       '429_D': ['バドミントン 1', 'バドミントン 2', 'バドミントン 3', 'バドミントン 4', 'バドミントン 5', 'バドミントン 6', 'バドミントン 7', 'バドミントン 8', 'バドミントン 9', 'バドミントン 10', 'バドミントン 11']
     };
+
+    // patternName("中体育室 B", "大体育室 A", "Aパターン"等) → 単純ラベル("A","B","C","D")
+    function extractSimpleLabel(patternName) {
+      if (!patternName) return '';
+      var m = patternName.match(/([A-D])\s*$/);
+      if (m) return m[1];
+      var m2 = patternName.match(/^([A-D])パターン/);
+      if (m2) return m2[1];
+      return '';
+    }
 
     // ──────────────────────────────────────────
     // アプリ状態
@@ -345,7 +356,7 @@
           state.courseGroups.map(async function(cg) {
             const cgKey = cg.facilityId + '|' + (cg.courseGroupLabel || String(cg.courseGroupId));
             if (state.scanCache[cgKey]) {
-              return { cg: cg, hasCourts: state.scanCache[cgKey].courts.length > 0 };
+              return { cg: cg, scanData: state.scanCache[cgKey] };
             }
             try {
               const res = await fetchGas('GET', null, {
@@ -355,30 +366,41 @@
                 courseGroupId:  String(cg.courseGroupId),
                 idToken: state.idToken
               });
-              if (res.ok && res.data && res.data.courts) {
+              if (res.ok && res.data && res.data.courts && res.data.courts.length > 0) {
                 state.scanCache[cgKey] = res.data;
-                return { cg: cg, hasCourts: res.data.courts.length > 0 };
+                return { cg: cg, scanData: res.data };
               }
-              return { cg: cg, hasCourts: false };
+              return { cg: cg, scanData: null };
             } catch (e) {
-              return { cg: cg, hasCourts: false };
+              return { cg: cg, scanData: null };
             }
           })
         );
 
-        const validGroups = scanResults
-          .filter(function(r) { return r.hasCourts; })
-          .map(function(r) { return r.cg; });
-        // スキャンが全滅した場合はフォールバックとして全件表示
-        state.courseGroups = validGroups.length > 0 ? validGroups : state.courseGroups;
+        // 全コートをパターン別に分類し、(施設, パターン) ごとにカードを1つ作る
+        const dedupedMap = {};
+        const dedupedGroups = [];
+        scanResults.forEach(function(r) {
+          if (!r.scanData || !r.scanData.courts || r.scanData.courts.length === 0) return;
+          var courtsByLabel = {};
+          r.scanData.courts.forEach(function(court) {
+            var label = extractSimpleLabel(court.patternName);
+            if (!label) label = r.cg.courseGroupLabel;
+            if (!courtsByLabel[label]) courtsByLabel[label] = [];
+            courtsByLabel[label].push(court);
+          });
+          Object.keys(courtsByLabel).sort().forEach(function(label) {
+            var key = r.cg.facilityId + '|' + label;
+            if (!dedupedMap.hasOwnProperty(key)) {
+              dedupedMap[key] = true;
+              var newCg = Object.assign({}, r.cg, { courseGroupLabel: label });
+              dedupedGroups.push(newCg);
+              state.scanCache[key] = Object.assign({}, r.scanData, { courts: courtsByLabel[label] });
+            }
+          });
+        });
+        state.courseGroups = dedupedGroups.length > 0 ? dedupedGroups : state.courseGroups;
         list.innerHTML = '';
-      }
-
-      // 1種類だけなら自動スキップ
-      if (state.courseGroups.length === 1) {
-        state.selectedCourseGroup = state.courseGroups[0];
-        showCourtScreen();
-        return;
       }
 
       state.courseGroups.forEach(function(cg) {
@@ -420,6 +442,8 @@
       if (state.isUnlocked) {
         // 解禁済み: scan してコート一覧を表示
         document.getElementById('courtScreenTitle').textContent = 'コートを選択';
+        document.getElementById('courtScreenSubtitle').textContent =
+          cg.facilityName + '　パターン' + (cg.courseGroupLabel || '');
         document.getElementById('courtList').innerHTML = '';
 
         const cgKey = cg.facilityId + '|' + (cg.courseGroupLabel || String(cg.courseGroupId));

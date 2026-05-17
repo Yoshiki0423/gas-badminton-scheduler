@@ -376,30 +376,31 @@
           })
         );
 
-        // patternName から実際のパターン("A"/"B" 等)を取り出して (施設, パターン) で重複除去
+        // 全コートをパターン別に分類し、(施設, パターン) ごとにカードを1つ作る
+        // courts[0] だけで判断すると混在グループ(A/B 等)を誤判定するため全件をループ
         const dedupedMap = {};
         const dedupedGroups = [];
         scanResults.forEach(function(r) {
           if (!r.scanData || !r.scanData.courts || r.scanData.courts.length === 0) return;
-          const effectiveLabel = extractSimpleLabel(r.scanData.courts[0].patternName) || r.cg.courseGroupLabel;
-          const key = r.cg.facilityId + '|' + effectiveLabel;
-          if (!dedupedMap.hasOwnProperty(key)) {
-            dedupedMap[key] = true;
-            const newCg = Object.assign({}, r.cg, { courseGroupLabel: effectiveLabel });
-            dedupedGroups.push(newCg);
-            // 実効キーでもキャッシュを登録しておく（showCourtScreen で再利用）
-            state.scanCache[key] = r.scanData;
-          }
+          var courtsByLabel = {};
+          r.scanData.courts.forEach(function(court) {
+            var label = extractSimpleLabel(court.patternName);
+            if (!label) label = r.cg.courseGroupLabel;
+            if (!courtsByLabel[label]) courtsByLabel[label] = [];
+            courtsByLabel[label].push(court);
+          });
+          Object.keys(courtsByLabel).sort().forEach(function(label) {
+            var key = r.cg.facilityId + '|' + label;
+            if (!dedupedMap.hasOwnProperty(key)) {
+              dedupedMap[key] = true;
+              var newCg = Object.assign({}, r.cg, { courseGroupLabel: label });
+              dedupedGroups.push(newCg);
+              state.scanCache[key] = Object.assign({}, r.scanData, { courts: courtsByLabel[label] });
+            }
+          });
         });
         state.courseGroups = dedupedGroups.length > 0 ? dedupedGroups : state.courseGroups;
         list.innerHTML = '';
-      }
-
-      // 1種類だけなら自動スキップ
-      if (state.courseGroups.length === 1) {
-        state.selectedCourseGroup = state.courseGroups[0];
-        showCourtScreen();
-        return;
       }
 
       state.courseGroups.forEach(function(cg) {
