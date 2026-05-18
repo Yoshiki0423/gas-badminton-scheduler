@@ -1564,7 +1564,11 @@ function _callScanLambda(date, startTime, courseGroupIds) {
  */
 function _patternNameToSimpleLabel(patternName) {
   if (!patternName) return '';
-  // 末尾の英字: "中体育室 B" → "B"
+  var t = patternName.replace(/\s+/g, '');
+  // 部屋名で直接判定（末尾に英字がない場合も含む）
+  if (t.indexOf('大体育室') >= 0) return 'A';
+  if (t.indexOf('中体育室') >= 0) return 'B';
+  // 末尾の英字: "A" → "A", "パターンB" → "B"
   var m = patternName.match(/([A-D])\s*$/);
   if (m) return m[1];
   // 先頭の Xパターン: "Aパターン" → "A"
@@ -1892,14 +1896,24 @@ function handleLiffReserveScanCourts(slotKey, courseGroupId, courseGroupIds) {
   }
 
   var courts = scanResult.courts.map(function(c) {
-    var fId        = facilityNameToId[c.facilityName] || '';
-    var simpleLabel = _patternNameToSimpleLabel(c.patternName || '');
-    var imgKey     = fId && simpleLabel ? 'PATTERN_IMG_' + fId + '_' + simpleLabel : '';
-    var imageUrl   = imgKey ? (getProperty(imgKey) || '') : '';
+    var fId         = facilityNameToId[c.facilityName] || '';
+    var rawPattern  = c.patternName || '';
+    var simpleLabel = _patternNameToSimpleLabel(rawPattern);
+    // Lambda がパターンを取得できなかった場合（"バドミントン" 等）は
+    // ScriptProperties の courseGroupId→label マップで補完する
+    if (!simpleLabel && c.courseGroupId) {
+      var fallback = cgIdToLabel[c.courseGroupId] || '';
+      if (fallback) {
+        rawPattern  = fallback;
+        simpleLabel = _patternNameToSimpleLabel(fallback);
+      }
+    }
+    var imgKey   = fId && simpleLabel ? 'PATTERN_IMG_' + fId + '_' + simpleLabel : '';
+    var imageUrl = imgKey ? (getProperty(imgKey) || '') : '';
     return {
       courseTimeId: c.courseTimeId,
       courtName:    c.courtName,
-      patternName:  c.patternName  || '',
+      patternName:  rawPattern,
       facilityName: c.facilityName || '',
       imageUrl:     imageUrl
     };

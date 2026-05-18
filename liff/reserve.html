@@ -212,6 +212,9 @@
     // patternName("中体育室 B", "大体育室 A", "Aパターン"等) → 単純ラベル("A","B","C","D")
     function extractSimpleLabel(patternName) {
       if (!patternName) return '';
+      var t = patternName.replace(/\s+/g, '');
+      if (t.indexOf('大体育室') >= 0) return 'A';
+      if (t.indexOf('中体育室') >= 0) return 'B';
       var m = patternName.match(/([A-D])\s*$/);
       if (m) return m[1];
       var m2 = patternName.match(/^([A-D])パターン/);
