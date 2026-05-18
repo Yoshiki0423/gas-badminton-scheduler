@@ -1908,8 +1908,13 @@ function handleLiffReserveScanCourts(slotKey, courseGroupId, courseGroupIds) {
         simpleLabel = _patternNameToSimpleLabel(fallback);
       }
     }
-    var imgKey   = fId && simpleLabel ? 'PATTERN_IMG_' + fId + '_' + simpleLabel : '';
-    var imageUrl = imgKey ? (getProperty(imgKey) || '') : '';
+    // Lambda のスキャン結果に imageUrl があればそれを優先する（時間帯に対応した正確な画像）
+    // ない場合は ScriptProperties の PATTERN_IMG_ キャッシュにフォールバックする
+    var imageUrl = c.imageUrl || '';
+    if (!imageUrl) {
+      var imgKey = fId && simpleLabel ? 'PATTERN_IMG_' + fId + '_' + simpleLabel : '';
+      imageUrl = imgKey ? (getProperty(imgKey) || '') : '';
+    }
     return {
       courseTimeId: c.courseTimeId,
       courtName:    c.courtName,

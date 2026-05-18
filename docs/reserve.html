@@ -436,6 +436,7 @@
       // 割り振り図を表示（ScriptProperties キャッシュから）
       // ※ imageUrl は reserveScanCourts の結果で取得するため、ここでは空
       const imgEl = document.getElementById('patternImg');
+      imgEl.src = '';
       imgEl.classList.remove('loaded');
 
       document.getElementById('btnCourtBack').onclick = function() { showCourseGroupScreen(); };
