@@ -1577,7 +1577,7 @@ function _patternNameToSimpleLabel(patternName) {
   return '';
 }
 
-function _callGetImagesLambda(courseGroupId) {
+function _callGetImagesLambda(courseGroupId, simpleLabel) {
   var awsUrl   = getProperty('AWS_RESERVE_URL');
   var apiToken = getProperty('RESERVE_API_TOKEN');
   if (!awsUrl) {
@@ -1588,7 +1588,7 @@ function _callGetImagesLambda(courseGroupId) {
     method: 'post',
     contentType: 'application/json',
     headers: { 'X-Api-Token': apiToken || '' },
-    payload: JSON.stringify({ action: 'getImages', courseGroupId: courseGroupId }),
+    payload: JSON.stringify({ action: 'getImages', courseGroupId: courseGroupId, simpleLabel: simpleLabel || '' }),
     muteHttpExceptions: true
   });
 
@@ -1815,6 +1815,80 @@ function handleLiffReserveGetData(slotKey, userId) {
 }
 
 /**
+ * LIFF予約ページ用: 未解禁スロットのパターン画像を取得する
+ *
+ * 未解禁の場合は Lambda スキャンが走らないため、ScriptProperties のキャッシュまたは
+ * Lambda getImages を使ってパターン画像 URL を返す。
+ *
+ * GAS doGet リクエスト例:
+ *   ?liff=reserveGetPatternImage&facilityId=420&simpleLabel=A&idToken=...
+ *
+ * レスポンス JSON:
+ *   { ok: true, data: { success: true, imageUrl: "https://niigata-kaikou.jp/..." } }
+ *
+ * @param {string} facilityId   - 施設ID（例: "420"）
+ * @param {string} simpleLabel  - パターン記号 "A" / "B" / "C"
+ * @returns {Object}
+ */
+function handleLiffReserveGetPatternImage(facilityId, simpleLabel) {
+  if (!facilityId || !simpleLabel) {
+    return { success: false, error: 'facilityId と simpleLabel が必要です' };
+  }
+  var sl = simpleLabel.toUpperCase();
+
+  // 1. ScriptProperties キャッシュを確認（スキャン済みなら即返す）
+  var cacheKey = 'PATTERN_IMG_' + facilityId + '_' + sl;
+  var cached = getProperty(cacheKey) || '';
+  if (cached) {
+    return { success: true, imageUrl: cached };
+  }
+
+  // 2. facilityId → ScriptProperties のキーを解決
+  var facilityDefs = [
+    { facilityId: '420', idsKey: 'TOYA_COURSE_GROUP_IDS',    labelsKey: 'TOYA_COURSE_GROUP_LABELS' },
+    { facilityId: '413', idsKey: 'HIGASHI_COURSE_GROUP_IDS', labelsKey: 'HIGASHI_COURSE_GROUP_LABELS' },
+    { facilityId: '429', idsKey: 'KAMEDA_COURSE_GROUP_IDS',  labelsKey: 'KAMEDA_COURSE_GROUP_LABELS' }
+  ];
+  var targetDef = null;
+  for (var fi = 0; fi < facilityDefs.length; fi++) {
+    if (facilityDefs[fi].facilityId === facilityId) { targetDef = facilityDefs[fi]; break; }
+  }
+  if (!targetDef) {
+    return { success: false, error: '未対応の施設ID: ' + facilityId };
+  }
+
+  var idsVal = getProperty(targetDef.idsKey) || '';
+  if (!idsVal) {
+    return { success: true, imageUrl: '' };
+  }
+
+  var ids    = idsVal.split(',').map(function(s) { return parseInt(s.trim(), 10); }).filter(function(n) { return !isNaN(n); });
+  var lblVal = getProperty(targetDef.labelsKey) || '';
+  var labels = lblVal ? lblVal.split(',').map(function(s) { return s.trim(); }) : [];
+
+  // simpleLabel に一致する最初の courseGroupId を取得（なければ先頭ID）
+  var courseGroupId = ids[0];
+  for (var ii = 0; ii < ids.length; ii++) {
+    var rawLbl = labels[ii] || '';
+    var m = rawLbl.match(/[A-Za-z]/);
+    if (m && m[0].toUpperCase() === sl) { courseGroupId = ids[ii]; break; }
+  }
+
+  // 3. Lambda getImages を呼んで画像URLを取得
+  try {
+    var lambdaResult = _callGetImagesLambda(courseGroupId, sl);
+    var imageUrl = (lambdaResult && lambdaResult.success && lambdaResult.imageUrl) ? lambdaResult.imageUrl : '';
+    if (imageUrl) {
+      PropertiesService.getScriptProperties().setProperty(cacheKey, imageUrl);
+    }
+    return { success: true, imageUrl: imageUrl };
+  } catch (e) {
+    logError(e, { phase: 'handleLiffReserveGetPatternImage', facilityId: facilityId, simpleLabel: sl });
+    return { success: false, error: e.message };
+  }
+}
+
+/**
  * LIFF予約ページ用: コートスキャン
  *
  * 選択された courseGroupId の空きコートを Lambda(scan) で取得して返す。
@@ -1911,6 +1985,11 @@ function handleLiffReserveScanCourts(slotKey, courseGroupId, courseGroupIds) {
     // Lambda のスキャン結果に imageUrl があればそれを優先する（時間帯に対応した正確な画像）
     // ない場合は ScriptProperties の PATTERN_IMG_ キャッシュにフォールバックする
     var imageUrl = c.imageUrl || '';
+    if (imageUrl && fId && simpleLabel) {
+      // スキャン時に取得できた画像URLを ScriptProperties にキャッシュしておく
+      // 未解禁フローでスキャンなしに同施設・同パターンの画像を表示するときに使う
+      PropertiesService.getScriptProperties().setProperty('PATTERN_IMG_' + fId + '_' + simpleLabel, imageUrl);
+    }
     if (!imageUrl) {
       var imgKey = fId && simpleLabel ? 'PATTERN_IMG_' + fId + '_' + simpleLabel : '';
       imageUrl = imgKey ? (getProperty(imgKey) || '') : '';

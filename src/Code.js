@@ -495,6 +495,13 @@ function _handleLiffApi(e, action) {
       return _jsonResponse({ ok: scResult.success !== false, data: scResult });
     }
 
+    if (action === 'reserveGetPatternImage') {
+      var gpFacilityId  = (e && e.parameter && e.parameter.facilityId)  ? e.parameter.facilityId  : '';
+      var gpSimpleLabel = (e && e.parameter && e.parameter.simpleLabel) ? e.parameter.simpleLabel : '';
+      var gpResult = handleLiffReserveGetPatternImage(gpFacilityId, gpSimpleLabel);
+      return _jsonResponse({ ok: gpResult.success !== false, data: gpResult });
+    }
+
     return _jsonResponse({ ok: false, error: 'unknown action: ' + action });
   } catch (err) {
     logError(err, { phase: '_handleLiffApi', action: action });
@@ -669,35 +676,35 @@ function processReserveQueue() {
 
     try {
       // ── Step 1: courseGroupId を決定 ──
-      // LIFF方式では entry.courseGroupId が直接指定されている場合はそれを使う。
-      // 未指定の場合は facilityId から ScriptProperties を参照してフォールバックする。
+      // 登録時の courseGroupId は月をまたぐと古い番号になって使えなくなる。
+      // ScriptProperties には常に最新の番号リストが入っているのでそちらを優先する。
+      // ScriptProperties が空のときだけ登録時の番号をバックアップとして使う。
       var facilityIdStr = String(entry.facilityId);
 
-      var courseGroupIds = [];
-      if (entry.courseGroupId && entry.courseGroupId > 0) {
-        // LIFF方式: キュー登録時に courseGroupId が指定されている
-        courseGroupIds = [entry.courseGroupId];
+      var idPropKey;
+      if (facilityIdStr === '420') {
+        idPropKey = 'TOYA_COURSE_GROUP_IDS';
+      } else if (facilityIdStr === '413') {
+        idPropKey = 'HIGASHI_COURSE_GROUP_IDS';
+      } else if (facilityIdStr === '429') {
+        idPropKey = 'KAMEDA_COURSE_GROUP_IDS';
       } else {
-        // 旧方式フォールバック: facilityId から ScriptProperties を参照
-        var idPropKey;
-        if (facilityIdStr === '420') {
-          idPropKey = 'TOYA_COURSE_GROUP_IDS';
-        } else if (facilityIdStr === '413') {
-          idPropKey = 'HIGASHI_COURSE_GROUP_IDS';
-        } else if (facilityIdStr === '429') {
-          idPropKey = 'KAMEDA_COURSE_GROUP_IDS';
-        } else {
-          console.warn('[WARN] processReserveQueue: 未知の facilityId=' + facilityIdStr +
-                       ' のためスキップ。id=' + entry.reservationQueueId);
-          skipped++;
-          processed--;
-          continue;
-        }
-        var idPropVal = getProperty(idPropKey) || '';
-        courseGroupIds = idPropVal
-          ? idPropVal.split(',').map(function (s) { return parseInt(s.trim(), 10); })
-                               .filter(function (n) { return !isNaN(n); })
-          : [];
+        console.warn('[WARN] processReserveQueue: 未知の facilityId=' + facilityIdStr +
+                     ' のためスキップ。id=' + entry.reservationQueueId);
+        skipped++;
+        processed--;
+        continue;
+      }
+
+      var idPropVal = getProperty(idPropKey) || '';
+      var courseGroupIds = idPropVal
+        ? idPropVal.split(',').map(function (s) { return parseInt(s.trim(), 10); })
+                             .filter(function (n) { return !isNaN(n); })
+        : [];
+
+      // ScriptProperties が空の場合のみ登録時 courseGroupId をバックアップとして使う
+      if (courseGroupIds.length === 0 && entry.courseGroupId && entry.courseGroupId > 0) {
+        courseGroupIds = [entry.courseGroupId];
       }
 
       if (courseGroupIds.length === 0) {
