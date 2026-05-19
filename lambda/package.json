@@ -1,0 +1,10 @@
+{
+  "name": "badminton-reserve-lambda",
+  "version": "1.0.0",
+  "description": "バド卓ねっと(niigata-kaikou.jp)の予約フォームを自動送信する AWS Lambda 関数",
+  "main": "reserve.js",
+  "dependencies": {
+    "axios": "^1.7.0",
+    "cheerio": "^1.0.0"
+  }
+}
