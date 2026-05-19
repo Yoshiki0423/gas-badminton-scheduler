@@ -650,6 +650,11 @@
         }
 
         const list = document.getElementById('courtList');
+        // ★デバッグ: list が取得できているか確認
+        document.getElementById('courtScreenSubtitle').textContent +=
+          ' | listNull=' + (list === null);
+        if (!list) return;
+
         list.innerHTML = '';
         courtNames.forEach(function(name) {
           const btn = document.createElement('button');
@@ -667,6 +672,9 @@
           });
           list.appendChild(btn);
         });
+        // ★デバッグ: ボタン追加後の子要素数
+        document.getElementById('courtScreenSubtitle').textContent +=
+          ' | added=' + list.children.length;
 
         renderPriority();
 
