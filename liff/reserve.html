@@ -196,6 +196,14 @@
     const LIFF_ID    = '<?= liffId ?>';
     const GAS_API_URL = '<?= gasApiUrl ?>';
 
+    // 変更時は src/scraper.js の FACILITY_STATUS も同期すること
+    const FACILITY_STATUS = Object.freeze({
+      AVAILABLE:   'available',
+      UNPUBLISHED: 'unpublished',
+      CLOSED:      'closed',
+      ERROR:       'error'
+    });
+
     // §14-9 施設・パターン別の固定コート名（facilityId_pattern → コート名配列）
     const COURT_NAMES = {
       '420_A': ['バドミントン 1', 'バドミントン 2', 'バドミントン 3', 'バドミントン 4', 'バドミントン 5', 'バドミントン 6'],
@@ -350,72 +358,125 @@
         return;
       }
 
-      // 解禁済みの場合: 全グループを並列スキャンしてこの日に有効なものだけ表示
-      if (state.isUnlocked) {
-        list.innerHTML = '<div style="text-align:center;padding:16px;color:#666;">スキャン中...</div>';
-        showScreen('screen-courseGroup');
+      // 常に全施設をスキャンして利用可能コートを確認する
+      list.innerHTML = '<div style="text-align:center;padding:16px;color:#666;">スキャン中...</div>';
+      showScreen('screen-courseGroup');
 
-        const scanResults = await Promise.all(
-          state.courseGroups.map(async function(cg) {
-            const cgKey = cg.facilityId + '|' + (cg.courseGroupLabel || String(cg.courseGroupId));
-            if (state.scanCache[cgKey]) {
-              return { cg: cg, scanData: state.scanCache[cgKey] };
+      const scanResults = await Promise.all(
+        state.courseGroups.map(async function(cg) {
+          if (cg.facilityStatus && cg.facilityStatus !== 'available') {
+            return { cg: cg, scanData: null };
+          }
+          const cgKey = cg.facilityId + '|' + (cg.courseGroupLabel || String(cg.courseGroupId));
+          if (state.scanCache[cgKey]) {
+            return { cg: cg, scanData: state.scanCache[cgKey] };
+          }
+          try {
+            const res = await fetchGas('GET', null, {
+              liff: 'reserveScanCourts',
+              slotKey: state.slotKey,
+              courseGroupIds: cg.courseGroupIds ? cg.courseGroupIds.join(',') : String(cg.courseGroupId),
+              courseGroupId:  String(cg.courseGroupId),
+              idToken: state.idToken
+            });
+            if (res.ok && res.data && res.data.courts && res.data.courts.length > 0) {
+              state.scanCache[cgKey] = res.data;
+              return { cg: cg, scanData: res.data };
             }
-            try {
-              const res = await fetchGas('GET', null, {
-                liff: 'reserveScanCourts',
-                slotKey: state.slotKey,
-                courseGroupIds: cg.courseGroupIds ? cg.courseGroupIds.join(',') : String(cg.courseGroupId),
-                courseGroupId:  String(cg.courseGroupId),
-                idToken: state.idToken
-              });
-              if (res.ok && res.data && res.data.courts && res.data.courts.length > 0) {
-                state.scanCache[cgKey] = res.data;
-                return { cg: cg, scanData: res.data };
-              }
-              return { cg: cg, scanData: null };
-            } catch (e) {
-              return { cg: cg, scanData: null };
-            }
-          })
-        );
+            return { cg: cg, scanData: null };
+          } catch (e) {
+            return { cg: cg, scanData: null };
+          }
+        })
+      );
 
-        // 全コートをパターン別に分類し、(施設, パターン) ごとにカードを1つ作る
-        const dedupedMap = {};
-        const dedupedGroups = [];
-        scanResults.forEach(function(r) {
-          if (!r.scanData || !r.scanData.courts || r.scanData.courts.length === 0) return;
-          var courtsByLabel = {};
-          r.scanData.courts.forEach(function(court) {
-            var label = extractSimpleLabel(court.patternName);
-            if (!label) label = r.cg.courseGroupLabel;
-            if (!courtsByLabel[label]) courtsByLabel[label] = [];
-            courtsByLabel[label].push(court);
-          });
-          Object.keys(courtsByLabel).sort().forEach(function(label) {
-            var key = r.cg.facilityId + '|' + label;
-            if (!dedupedMap.hasOwnProperty(key)) {
-              dedupedMap[key] = true;
-              var newCg = Object.assign({}, r.cg, { courseGroupLabel: label });
-              dedupedGroups.push(newCg);
-              state.scanCache[key] = Object.assign({}, r.scanData, { courts: courtsByLabel[label] });
-            }
-          });
+      // available 施設はパターン別に分類してカードを分割する
+      const dedupedMap = {};
+      const finalGroups = [];
+      scanResults.forEach(function(r) {
+        if (r.cg.facilityStatus && r.cg.facilityStatus !== 'available') {
+          finalGroups.push(r.cg);
+          return;
+        }
+        if (!r.scanData || !r.scanData.courts || r.scanData.courts.length === 0) {
+          finalGroups.push(r.cg);
+          return;
+        }
+        var courtsByLabel = {};
+        r.scanData.courts.forEach(function(court) {
+          var label = extractSimpleLabel(court.patternName);
+          if (!label) label = r.cg.courseGroupLabel;
+          if (!courtsByLabel[label]) courtsByLabel[label] = [];
+          courtsByLabel[label].push(court);
         });
-        state.courseGroups = dedupedGroups.length > 0 ? dedupedGroups : state.courseGroups;
-        list.innerHTML = '';
-      }
+        Object.keys(courtsByLabel).sort().forEach(function(label) {
+          var key = r.cg.facilityId + '|' + label;
+          if (!dedupedMap.hasOwnProperty(key)) {
+            dedupedMap[key] = true;
+            var newCg = Object.assign({}, r.cg, { courseGroupLabel: label });
+            finalGroups.push(newCg);
+            state.scanCache[key] = Object.assign({}, r.scanData, { courts: courtsByLabel[label] });
+          }
+        });
+      });
+      state.courseGroups = finalGroups;
+      list.innerHTML = '';
 
       state.courseGroups.forEach(function(cg) {
-        const btn = document.createElement('button');
-        btn.className = 'btn-choice';
-        btn.innerHTML = '<div class="label">' + esc(cg.facilityName) + '</div>' +
-                        '<div class="sub">パターン ' + esc(cg.courseGroupLabel) + '</div>';
-        btn.addEventListener('click', function() {
-          state.selectedCourseGroup = cg;
-          showCourtScreen();
-        });
-        list.appendChild(btn);
+        var status = cg.facilityStatus || FACILITY_STATUS.AVAILABLE;
+        if (status === FACILITY_STATUS.UNPUBLISHED) {
+          const btn = document.createElement('button');
+          btn.className = 'btn-choice';
+          btn.disabled = true;
+          btn.setAttribute('aria-disabled', 'true');
+          btn.style.cssText = 'opacity:0.5;cursor:not-allowed;';
+          btn.innerHTML = '<div class="label">' + esc(cg.facilityName) + '</div>' +
+                          '<div class="sub">まだスケジュールが公開されていません</div>';
+          list.appendChild(btn);
+        } else if (status === FACILITY_STATUS.CLOSED) {
+          const btn = document.createElement('button');
+          btn.className = 'btn-choice';
+          btn.disabled = true;
+          btn.setAttribute('aria-disabled', 'true');
+          btn.style.cssText = 'opacity:0.5;cursor:not-allowed;';
+          btn.innerHTML = '<div class="label">' + esc(cg.facilityName) + '</div>' +
+                          '<div class="sub">この日は休館日です</div>';
+          list.appendChild(btn);
+        } else if (status === FACILITY_STATUS.ERROR) {
+          const btn = document.createElement('button');
+          btn.className = 'btn-choice';
+          btn.disabled = true;
+          btn.setAttribute('aria-disabled', 'true');
+          btn.style.cssText = 'opacity:0.5;cursor:not-allowed;';
+          btn.innerHTML = '<div class="label">' + esc(cg.facilityName) + '</div>' +
+                          '<div class="sub">情報を取得できませんでした</div>';
+          list.appendChild(btn);
+        } else {
+          const cgKey = cg.facilityId + '|' + (cg.courseGroupLabel || String(cg.courseGroupId));
+          const hasScanData = !!(state.scanCache[cgKey] &&
+                                 state.scanCache[cgKey].courts &&
+                                 state.scanCache[cgKey].courts.length > 0);
+          if (!hasScanData) {
+            const btn = document.createElement('button');
+            btn.className = 'btn-choice';
+            btn.disabled = true;
+            btn.setAttribute('aria-disabled', 'true');
+            btn.style.cssText = 'opacity:0.5;cursor:not-allowed;';
+            btn.innerHTML = '<div class="label">' + esc(cg.facilityName) + '</div>' +
+                            '<div class="sub">現在空きコートがありません</div>';
+            list.appendChild(btn);
+          } else {
+            const btn = document.createElement('button');
+            btn.className = 'btn-choice';
+            btn.innerHTML = '<div class="label">' + esc(cg.facilityName) + '</div>' +
+                            '<div class="sub">パターン ' + esc(cg.courseGroupLabel) + '</div>';
+            btn.addEventListener('click', function() {
+              state.selectedCourseGroup = cg;
+              showCourtScreen();
+            });
+            list.appendChild(btn);
+          }
+        }
       });
 
       showScreen('screen-courseGroup');

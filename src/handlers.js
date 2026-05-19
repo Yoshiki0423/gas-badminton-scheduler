@@ -1781,6 +1781,35 @@ function handleLiffReserveGetData(slotKey, userId) {
   }
   courseGroups = dedupedGroups;
 
+  // facilityStatus を施設ごとに1回だけ取得して各 courseGroup に付加する
+  var statusSs = null;
+  var facilityStatusCache = {};
+  try {
+    var statusSpreadsheetId = getProperty('MEMBERS_SPREADSHEET_ID');
+    if (statusSpreadsheetId) {
+      statusSs = SpreadsheetApp.openById(statusSpreadsheetId);
+    }
+  } catch (ssErr) {
+    console.warn('[WARN] handleLiffReserveGetData: スプレッドシート取得エラー: ' + ssErr.message);
+  }
+  for (var si = 0; si < courseGroups.length; si++) {
+    var cgItem = courseGroups[si];
+    var fid = cgItem.facilityId;
+    if (!facilityStatusCache.hasOwnProperty(fid)) {
+      if (statusSs) {
+        try {
+          facilityStatusCache[fid] = getFacilityStatusForDate(fid, cgItem.facilityName, useDate, statusSs);
+        } catch (statusErr) {
+          console.warn('[WARN] handleLiffReserveGetData: getFacilityStatusForDate エラー facilityId=' + fid + ': ' + statusErr.message);
+          facilityStatusCache[fid] = FACILITY_STATUS.ERROR;
+        }
+      } else {
+        facilityStatusCache[fid] = FACILITY_STATUS.ERROR;
+      }
+    }
+    cgItem.facilityStatus = facilityStatusCache[fid];
+  }
+
   // lineUserId で予約者を1名自動特定する(§14-11 IDOR対策)
   var reserverEntries;
   try {

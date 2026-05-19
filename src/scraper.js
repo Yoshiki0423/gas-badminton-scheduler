@@ -161,6 +161,42 @@ var DEFAULT_BADMINTON_COL = 2;
 /** ヘッダー行を探す最大行数(先頭 N 行以内でバドミントン列を探す) */
 var HEADER_SEARCH_LIMIT = 5;
 
+/**
+ * 施設ステータスの定数
+ * GAS はグローバルスコープ共有のため handlers.js からも参照可能
+ */
+var FACILITY_STATUS = {
+  AVAILABLE:   'available',
+  UNPUBLISHED: 'unpublished',
+  CLOSED:      'closed',
+  ERROR:       'error'
+};
+
+// ─────────────────────────────────────────────
+// 内部ユーティリティ
+// ─────────────────────────────────────────────
+
+/**
+ * シートの 2D 配列からバドミントン列インデックスを探す
+ *
+ * 先頭 HEADER_SEARCH_LIMIT 行以内で「バドミントン」を含む列を探す。
+ * 見つからなければ DEFAULT_BADMINTON_COL を返す。
+ *
+ * @param {Array<Array>} values - sheet.getDataRange().getValues() の戻り値
+ * @returns {number} バドミントン列インデックス(0-based)
+ * @private
+ */
+function _findBadmintonCol(values) {
+  for (var r = 0; r < Math.min(HEADER_SEARCH_LIMIT, values.length); r++) {
+    for (var c = 0; c < values[r].length; c++) {
+      if (String(values[r][c]).trim().indexOf('バドミントン') !== -1) {
+        return c;
+      }
+    }
+  }
+  return DEFAULT_BADMINTON_COL;
+}
+
 // ─────────────────────────────────────────────
 // セットアップ
 // ─────────────────────────────────────────────
@@ -467,28 +503,11 @@ function parseScraperSheetValues(values, facilityName, monthOffset) {
   }
 
   // ─── バドミントン列インデックスをヘッダー行から探す ───
-  // 最初の HEADER_SEARCH_LIMIT 行以内で「バドミントン」を含む列を探す
-  var badmintonCol = DEFAULT_BADMINTON_COL;
-  var headerFound = false;
-
-  for (var r = 0; r < Math.min(HEADER_SEARCH_LIMIT, values.length); r++) {
-    var row = values[r];
-    for (var c = 0; c < row.length; c++) {
-      var cellStr = String(row[c]).trim();
-      if (cellStr.indexOf('バドミントン') !== -1) {
-        badmintonCol = c;
-        headerFound = true;
-        console.log('[INFO] parseScraperSheetValues: ' + facilityName + ' バドミントン列を発見: 列' + c + ' (行' + r + ')');
-        break;
-      }
-    }
-    if (headerFound) {
-      break;
-    }
-  }
-
-  if (!headerFound) {
+  var badmintonCol = _findBadmintonCol(values);
+  if (badmintonCol === DEFAULT_BADMINTON_COL) {
     console.log('[WARN] parseScraperSheetValues: ' + facilityName + ' バドミントン列が見つかりません。デフォルト列' + DEFAULT_BADMINTON_COL + 'を使用します。');
+  } else {
+    console.log('[INFO] parseScraperSheetValues: ' + facilityName + ' バドミントン列を発見: 列' + badmintonCol);
   }
 
   // ─── データ行をループ ───
@@ -754,6 +773,97 @@ function _isExcluded(text) {
     return true;
   }
   return false;
+}
+
+/**
+ * 指定日の施設のステータスをスプレッドシートから判定する
+ *
+ * 予約日の月に応じて当月シート(scraper-{facilityId})または
+ * 翌月シート(scraper-{facilityId}-next)を参照し、以下のルールで判定する:
+ *   - シートが存在しない          → "unpublished"
+ *   - バドミントン列に「休館日」で始まる行が1件以上ある → "closed"
+ *   - parseScraperSheetValues のパース結果が 0件 → "unpublished"
+ *   - 1件以上                     → "available"
+ *
+ * @param {string} facilityId - 施設ID文字列("420" / "413" / "429")
+ * @param {string} facilityName - 施設名(ログ・parseScraperSheetValues に使用)
+ * @param {string} reservationDateStr - 予約日 "YYYY-MM-DD" 形式
+ * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss - 開済みスプレッドシート
+ * @returns {'available'|'unpublished'|'closed'} ステータス文字列。
+ *   'error' はこの関数では返さない。エラーは例外をスローし、呼び出し元が FACILITY_STATUS.ERROR に変換する。
+ */
+function getFacilityStatusForDate(facilityId, facilityName, reservationDateStr, ss) {
+  // CacheService でシートアクセスを1時間キャッシュ
+  var cacheKey = 'facilityStatus_' + facilityId + '_' + reservationDateStr;
+  var cache = CacheService.getScriptCache();
+  var cached = cache.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
+
+  var nowJst = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM-dd');
+  var currentYear = parseInt(nowJst.substring(0, 4), 10);
+  var currentMonth = parseInt(nowJst.substring(5, 7), 10);
+
+  // 予約日の年月・日を取得
+  var reservationYear  = parseInt(reservationDateStr.substring(0, 4), 10);
+  var reservationMonth = parseInt(reservationDateStr.substring(5, 7), 10);
+  var reservationDay   = parseInt(reservationDateStr.substring(8, 10), 10);
+
+  // 当月か翌月かを判定してシート名を決める
+  var isNextMonth = (reservationYear > currentYear) ||
+                    (reservationYear === currentYear && reservationMonth > currentMonth);
+  var sheetName = isNextMonth
+    ? 'scraper-' + facilityId + '-next'
+    : 'scraper-' + facilityId;
+  var monthOffset = isNextMonth ? 1 : 0;
+
+  var status;
+  var sheet = ss.getSheetByName(sheetName);
+  if (!sheet) {
+    console.log('[INFO] getFacilityStatusForDate: ' + sheetName + ' シートが存在しません。unpublished を返します。');
+    status = FACILITY_STATUS.UNPUBLISHED;
+    cache.put(cacheKey, status, 3600 + Math.floor(Math.random() * 600) - 300);
+    return status;
+  }
+
+  var values = sheet.getDataRange().getValues();
+  if (!values || values.length === 0) {
+    status = FACILITY_STATUS.UNPUBLISHED;
+    cache.put(cacheKey, status, 3600 + Math.floor(Math.random() * 600) - 300);
+    return status;
+  }
+
+  // ─── バドミントン列インデックスをヘッダー行から探す(DRY) ───
+  var badmintonCol = _findBadmintonCol(values);
+
+  // ─── 休館日チェック: 予約日の行だけを対象に「休館日」で始まるか確認 ───
+  var targetDayRe = new RegExp('^' + reservationDay + '日(?!\\d)');
+  for (var i = 0; i < values.length; i++) {
+    var col0 = String(values[i][0]).trim();
+    if (!targetDayRe.test(col0)) continue; // 予約日の行以外はスキップ
+    if (badmintonCol >= values[i].length) continue;
+    var cellVal = String(values[i][badmintonCol]).trim();
+    if (cellVal.indexOf('休館日') === 0) {
+      console.log('[INFO] getFacilityStatusForDate: ' + facilityName + ' ' + reservationDay + '日 休館日を検出。closed を返します。');
+      status = FACILITY_STATUS.CLOSED;
+      cache.put(cacheKey, status, 3600 + Math.floor(Math.random() * 600) - 300);
+      return status;
+    }
+  }
+
+  // ─── スケジュール公開確認: パース結果が 0件なら unpublished ───
+  var parsed = parseScraperSheetValues(values, facilityName, monthOffset);
+  if (parsed.length === 0) {
+    console.log('[INFO] getFacilityStatusForDate: ' + facilityName + ' パース結果0件。unpublished を返します。');
+    status = FACILITY_STATUS.UNPUBLISHED;
+    cache.put(cacheKey, status, 3600 + Math.floor(Math.random() * 600) - 300);
+    return status;
+  }
+
+  status = FACILITY_STATUS.AVAILABLE;
+  cache.put(cacheKey, status, 3600);
+  return status;
 }
 
 /**
@@ -1266,7 +1376,6 @@ function _checkAndNotifyNewMonths() {
   }
 
   // 新規の全施設揃い通知
-  console.log('[INFO] _checkAndNotifyNewMonths: 全施設で ' + allNotifiedMonth + ' が揃いました。全施設揃い通知を送ります。');
   try {
     _notifyAllFacilitiesReady(allNotifiedMonth);
   } catch (allNotifyErr) {
