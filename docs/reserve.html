@@ -616,19 +616,18 @@
           return;
         }
 
-        // 選択済みコート優先順位: コート名文字列の配列（修正4: 型統一）
-        // localStorageへの保存は廃止（修正3）。端末をまたいだ引き継ぎは
-        // GAS ScriptProperties に保存済みの値を handleLiffReserveGetData から受け取る想定。
-        // （現状 initData に savedPriority が返ってくる拡張余地を残す）
+        document.getElementById('courtScreenSubtitle').textContent += ' | s1';
         var savedPriorityFromServer = (initData.savedPriority || []);
         state.selectedCourts = savedPriorityFromServer
           .filter(function(v) { return typeof v === 'string' && v !== ''; })
           .slice(0, 3);
 
+        document.getElementById('courtScreenSubtitle').textContent += ' | s2';
         const priorityArea = document.getElementById('priorityArea');
         priorityArea.style.display = 'block';
         const priorityList = document.getElementById('priorityList');
 
+        document.getElementById('courtScreenSubtitle').textContent += ' | s3';
         const renderPriority = function() {
           priorityList.innerHTML = state.selectedCourts.map(function(name, i) {
             return '<div class="priority-item">' +
