@@ -602,6 +602,15 @@
         // §14-9 の固定コート名を facilityId + '_' + 単純ラベル で引く
         const cgKey = String(cg.facilityId) + '_' + String(simpleLabel);
         const courtNames = (COURT_NAMES[cgKey] || []).slice();
+
+        // ★デバッグ用（確認後削除）
+        document.getElementById('courtScreenSubtitle').textContent =
+          'DBG: isUnlocked=' + state.isUnlocked +
+          ' | label=' + cg.courseGroupLabel +
+          ' | simple=' + simpleLabel +
+          ' | key=' + cgKey +
+          ' | courts=' + courtNames.length;
+
         if (courtNames.length === 0) {
           showElError('error-court', '施設・パターン（' + cgKey + '）のコート情報が見つかりません。管理者にお問い合わせください。');
           return;
