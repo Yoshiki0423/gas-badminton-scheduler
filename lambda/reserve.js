@@ -369,7 +369,8 @@ function _parseAvailableCourts($, timeLabel, courseGroupId, facilityName) {
   // 例: "大体育室　A" → "大体育室 A"
   // 例: "9-13時 B / 13-15時 C / 15-21時 A" のような時間帯別パターン → timeLabel に対応する部分だけ抽出
   const patternName = _extractPatternName($, timeLabel);
-  const imageUrl    = _extractPatternImageUrl($, timeLabel);
+  const simpleLabel = _simpleLabelFromPattern(patternName);
+  const imageUrl    = _extractPatternImageUrl($, simpleLabel);
 
   const normalizedFacilityName = (facilityName || '').trim();
 
@@ -490,17 +491,29 @@ function _extractPatternName($, timeLabel) {
 }
 
 /**
- * ページHTMLから、指定した時間帯に対応する割り振り図画像URLを抽出する
+ * patternName からシンプルラベル（A/B/C）を抽出する
+ * 例: "大体育室 A" → "A", "B" → "B", "Aパターン サブアリーナ" → "A"
+ * @param {string} patternName
+ * @returns {string} "A" / "B" / "C" または ""
+ */
+function _simpleLabelFromPattern(patternName) {
+  if (!patternName) return '';
+  const m = patternName.match(/[A-Za-z]/);
+  return m ? m[0].toUpperCase() : '';
+}
+
+/**
+ * ページHTMLから、指定したパターンに対応する割り振り図画像URLを抽出する
  *
- * 備考行に複数の時間帯パターンがある場合（例: 鳥屋野 "9-13大体育室A\n13-21中体育室B"）、
- * 時間帯インデックスと画像の順番を対応させて正しい画像を返す。
- * 画像が1枚だけの場合はそのまま返す。
+ * HPでは全パターンの画像が常にアルファベット順（A=0番目, B=1番目, C=2番目）で
+ * 並んで表示される。備考欄の時間帯順とは一致しない場合があるため、
+ * simpleLabel のアルファベット順インデックスで画像を選ぶ。
  *
- * @param {Object} $         - cheerio インスタンス
- * @param {string} timeLabel - 例: '15-17時'
+ * @param {Object} $           - cheerio インスタンス
+ * @param {string} simpleLabel - "A" / "B" / "C"
  * @returns {string} 絶対URL または ''
  */
-function _extractPatternImageUrl($, timeLabel) {
+function _extractPatternImageUrl($, simpleLabel) {
   const imgs = [];
   $('img').each(function() {
     const src = $(this).attr('src') || '';
@@ -514,41 +527,10 @@ function _extractPatternImageUrl($, timeLabel) {
   if (imgs.length === 0) return '';
   if (imgs.length === 1) return imgs[0];
 
-  // 複数画像 → 備考の時間帯インデックスで対応する画像を選ぶ
-  const startHourMatch = timeLabel.match(/^(\d+)-/);
-  const startHour = startHourMatch ? parseInt(startHourMatch[1], 10) : -1;
-  if (startHour < 0) return imgs[0];
-
-  let rawPattern = '';
-  $('table.c-table02 tr').each(function() {
-    const thText = $(this).find('th').text().trim();
-    if (thText.indexOf('備考') >= 0 || thText.indexOf('コート') >= 0 || thText.indexOf('台指定') >= 0) {
-      rawPattern = $(this).find('td').text().trim();
-    }
-  });
-
-  if (!rawPattern || rawPattern.indexOf('\n') < 0) return imgs[0];
-
-  const normalized = rawPattern.replace(/　/g, ' ').trim();
-  const lines = normalized.split('\n').map(function(s) { return s.trim(); }).filter(Boolean);
-  const segs = [];
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const m2 = line.match(/^(\d+)[^\d]+(\d+)(.*)/);
-    if (m2 && parseInt(m2[2], 10) > parseInt(m2[1], 10)) {
-      segs.push({ s: parseInt(m2[1], 10), e: parseInt(m2[2], 10), idx: segs.length });
-      continue;
-    }
-    const m1 = line.match(/^(\d+)時[^A-Za-z　ぁ-鿿]*(.*)/);
-    if (m1) segs.push({ s: parseInt(m1[1], 10), e: -1, idx: segs.length });
-  }
-  for (let i = 0; i < segs.length; i++) {
-    if (segs[i].e === -1) segs[i].e = (i + 1 < segs.length) ? segs[i + 1].s : 24;
-  }
-  for (let i = 0; i < segs.length; i++) {
-    if (startHour >= segs[i].s && startHour < segs[i].e) {
-      return imgs[Math.min(segs[i].idx, imgs.length - 1)];
-    }
+  // 画像はアルファベット順: A=imgs[0], B=imgs[1], C=imgs[2]
+  if (simpleLabel) {
+    const idx = simpleLabel.toUpperCase().charCodeAt(0) - 65;
+    if (idx >= 0 && idx < imgs.length) return imgs[idx];
   }
   return imgs[0];
 }
@@ -574,6 +556,7 @@ function _extractPatternImageUrl($, timeLabel) {
  */
 async function _handleGetImages(body) {
   const courseGroupId = body.courseGroupId;
+  const simpleLabel   = (body.simpleLabel || '').toUpperCase();
   if (!courseGroupId) {
     return _res(400, { success: false, message: 'courseGroupId は必須です' });
   }
@@ -601,20 +584,9 @@ async function _handleGetImages(body) {
     }
 
     const $ = cheerio.load(res.data);
+    const imageUrl = _extractPatternImageUrl($, simpleLabel);
 
-    // 割り振り図は storage/schedule/ パスの画像として埋め込まれている
-    let imageUrl = '';
-    $('img').each(function() {
-      const src = $(this).attr('src') || '';
-      if (src.indexOf('/storage/schedule/') >= 0 &&
-          (src.endsWith('.jpg') || src.endsWith('.png') || src.endsWith('.jpeg'))) {
-        // 絶対 URL に変換
-        imageUrl = src.startsWith('http') ? src : (BASE_URL + src);
-        return false; // 最初の 1 件で打ち切り
-      }
-    });
-
-    console.log('[INFO] getImages: courseGroupId=' + courseGroupId + ' imageUrl=' + imageUrl);
+    console.log('[INFO] getImages: courseGroupId=' + courseGroupId + ' simpleLabel=' + simpleLabel + ' imageUrl=' + imageUrl);
     return _res(200, { success: true, imageUrl: imageUrl });
 
   } catch (e) {
