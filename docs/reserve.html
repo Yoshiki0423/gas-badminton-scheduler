@@ -629,7 +629,7 @@
         priorityArea.style.display = 'block';
         const priorityList = document.getElementById('priorityList');
 
-        function renderPriority() {
+        const renderPriority = function() {
           priorityList.innerHTML = state.selectedCourts.map(function(name, i) {
             return '<div class="priority-item">' +
                    '<span class="priority-badge">' + (i + 1) + '位</span>' +
