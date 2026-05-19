@@ -322,11 +322,12 @@
         return;
       }
 
-      state.dateLabel    = initData.dateLabel    || '';
-      state.slotStart    = initData.slotStart    || '';
-      state.slotEnd      = initData.slotEnd      || '';
-      state.courseGroups = initData.courseGroups || [];
-      state.reserverInfo = initData.reserverInfo || null;
+      state.dateLabel      = initData.dateLabel      || '';
+      state.slotStart      = initData.slotStart      || '';
+      state.slotEnd        = initData.slotEnd        || '';
+      state.courseGroups   = initData.courseGroups   || [];
+      state.reserverInfo   = initData.reserverInfo   || null;
+      state.savedPriority  = initData.savedPriority  || [];
 
       // 解禁チェック: GAS サーバー側（Asia/Tokyo 時刻）で計算した値をそのまま使う
       // クライアント端末の new Date() で判定すると端末の時刻を変更することで
@@ -618,7 +619,7 @@
 
         document.getElementById('courtScreenSubtitle').textContent += ' | s1';
         try {
-          var savedPriorityFromServer = (initData.savedPriority || []);
+          var savedPriorityFromServer = (state.savedPriority || []);
           state.selectedCourts = savedPriorityFromServer
             .filter(function(v) { return typeof v === 'string' && v !== ''; })
             .slice(0, 3);
