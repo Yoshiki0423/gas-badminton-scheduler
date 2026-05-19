@@ -867,6 +867,172 @@ function getFacilityStatusForDate(facilityId, facilityName, reservationDateStr, 
 }
 
 /**
+ * スクレイパーシートのセルテキストから、指定開始時刻に該当するパターン記号を抽出する(内部用)
+ *
+ * 施設ごとの表記ゆれに対応した4フォーマットを順に試みる:
+ *   Format 1 (東総合): "9-13時 B"  / "9-11時 A 11-21時 ×"  (複数セグメントは一行に並ぶ場合あり)
+ *   Format 2 (鳥屋野): "13‐21中体育室" / "9-11大体育室"  (時の字なし・施設名で判定)
+ *   Format 3 (亀田・終了時刻あり): "9時～15時Aパターン"
+ *   Format 4 (亀田・終了時刻なし): "19時～Dパターン"  (endH は次セグメントで補完)
+ *
+ * セル全体が × / 休館日 → '' を返す。
+ * 時間帯内が × のセグメント → そのセグメントに対して '' を返す。
+ * どの時間帯にも該当しない場合 → '' を返す。
+ *
+ * @param {string} cellText      - スクレイパーシートのセル値(改行 \n を含む場合あり)
+ * @param {number} slotStartHour - 予約開始時刻の時(0-23)
+ * @returns {string} パターン記号 'A'〜'D' または '' (未判定・閉館)
+ * @private
+ */
+function _extractPatternForHour(cellText, slotStartHour) {
+  var text = String(cellText || '').trim();
+  if (!text) return '';
+
+  // セル全体が × または 休館日 → 閉館
+  if (/^[×✕]/.test(text) || text.indexOf('休館日') !== -1) return '';
+
+  var segments = [];
+  var lines = text.split(/[\n\r]+/);
+
+  for (var li = 0; li < lines.length; li++) {
+    var line = lines[li].trim();
+    if (!line) continue;
+
+    // 行頭の記号・前置詞を除去
+    line = line
+      .replace(/^[○〇△]\s*/, '')
+      .replace(/^予約\s*/, '')
+      .replace(/^空き状況\s*/, '');
+    if (!line) continue;
+
+    // Format 3: "9時～15時Aパターン" (亀田・終了時刻あり)
+    var re3 = /(\d{1,2})時\s*[〜～]\s*(\d{1,2})時\s*([A-D])パターン/g;
+    var m3;
+    var found3 = false;
+    while ((m3 = re3.exec(line)) !== null) {
+      found3 = true;
+      segments.push({ startH: parseInt(m3[1], 10), endH: parseInt(m3[2], 10), pattern: m3[3] });
+    }
+    if (found3) continue;
+
+    // Format 4: "19時～Dパターン" (亀田・終了時刻なし → 次セグメントで補完)
+    var re4 = /(\d{1,2})時\s*[〜～]\s*([A-D])パターン/g;
+    var m4;
+    var found4 = false;
+    while ((m4 = re4.exec(line)) !== null) {
+      found4 = true;
+      segments.push({ startH: parseInt(m4[1], 10), endH: 24, pattern: m4[2] });
+    }
+    if (found4) continue;
+
+    // Format 1: "9-13時 B" / "11-21時 ×"  (東総合・鳥屋野の一部)
+    // ハイフン類: 半角- / 全角－ / Unicodeハイフン‐ / マイナス−
+    var re1 = /(\d{1,2})\s*[-－‐−]\s*(\d{1,2})時\s*([A-D×✕])/g;
+    var m1;
+    var found1 = false;
+    while ((m1 = re1.exec(line)) !== null) {
+      found1 = true;
+      var pat1 = m1[3];
+      segments.push({
+        startH: parseInt(m1[1], 10),
+        endH:   parseInt(m1[2], 10),
+        pattern: /[×✕]/.test(pat1) ? '' : pat1
+      });
+    }
+    if (found1) continue;
+
+    // Format 2: "13‐21中体育室" / "9-11大体育室" (鳥屋野)
+    var re2 = /(\d{1,2})\s*[-－‐−]\s*(\d{1,2})\s*(大体育室|中体育室)\s*([A-D])?/g;
+    var m2;
+    var found2 = false;
+    while ((m2 = re2.exec(line)) !== null) {
+      found2 = true;
+      var pat2 = m2[4] || _courseTextToLabel(m2[3]);
+      segments.push({ startH: parseInt(m2[1], 10), endH: parseInt(m2[2], 10), pattern: pat2 });
+    }
+    if (found2) continue;
+
+    // Fallback: "Aパターン" / "A" 単独 / 大体育室・中体育室 単独
+    var mFbPat = line.match(/([A-D])パターン/);
+    if (mFbPat) { segments.push({ startH: 0, endH: 24, pattern: mFbPat[1] }); continue; }
+    var mFbSingle = line.match(/^([A-D])$/);
+    if (mFbSingle) { segments.push({ startH: 0, endH: 24, pattern: mFbSingle[1] }); continue; }
+    var mFbCourse = _courseTextToLabel(line);
+    if (mFbCourse) { segments.push({ startH: 0, endH: 24, pattern: mFbCourse }); }
+  }
+
+  // Format 4 の endH=24 を次のセグメントの startH で補完
+  for (var si = 0; si < segments.length - 1; si++) {
+    if (segments[si].endH === 24 && segments[si + 1].startH > 0) {
+      segments[si].endH = segments[si + 1].startH;
+    }
+  }
+
+  // slotStartHour が属するセグメントを返す
+  for (var sj = 0; sj < segments.length; sj++) {
+    var seg = segments[sj];
+    if (slotStartHour >= seg.startH && slotStartHour < seg.endH) {
+      return seg.pattern;
+    }
+  }
+
+  // セグメントが1件で全日扱い(startH=0, endH=24)なら無条件に返す
+  if (segments.length === 1 && segments[0].startH === 0 && segments[0].endH === 24) {
+    return segments[0].pattern;
+  }
+
+  return '';
+}
+
+/**
+ * 指定施設・日付・開始時刻に対応するパターン記号をスクレイパーシートから取得する
+ *
+ * 予約日が当月なら scraper-{facilityId}、翌月なら scraper-{facilityId}-next シートを参照する。
+ * シートが存在しない場合や該当行が見つからない場合は '' を返す。
+ *
+ * @param {string} facilityId           - 施設ID ("420" / "413" / "429")
+ * @param {string} reservationDateStr   - 予約日 "YYYY-MM-DD"
+ * @param {number} slotStartHour        - 予約開始時刻の時(0-23)
+ * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss - 開済みスプレッドシート
+ * @returns {string} パターン記号 'A'〜'D' または '' (不明・閉館)
+ */
+function getScraperPatternForSlot(facilityId, reservationDateStr, slotStartHour, ss) {
+  var nowJst = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM-dd');
+  var currentYear  = parseInt(nowJst.substring(0, 4), 10);
+  var currentMonth = parseInt(nowJst.substring(5, 7), 10);
+
+  var reservationYear  = parseInt(reservationDateStr.substring(0, 4), 10);
+  var reservationMonth = parseInt(reservationDateStr.substring(5, 7), 10);
+  var reservationDay   = parseInt(reservationDateStr.substring(8, 10), 10);
+
+  var isNextMonth = (reservationYear > currentYear) ||
+                    (reservationYear === currentYear && reservationMonth > currentMonth);
+  var sheetName = isNextMonth
+    ? 'scraper-' + facilityId + '-next'
+    : 'scraper-' + facilityId;
+
+  var sheet = ss.getSheetByName(sheetName);
+  if (!sheet) return '';
+
+  var values = sheet.getDataRange().getValues();
+  if (!values || values.length === 0) return '';
+
+  var badmintonCol = _findBadmintonCol(values);
+
+  var targetDayRe = new RegExp('^' + reservationDay + '日(?!\\d)');
+  for (var i = 0; i < values.length; i++) {
+    var col0 = String(values[i][0]).trim();
+    if (!targetDayRe.test(col0)) continue;
+    if (badmintonCol >= values[i].length) continue;
+    var cellVal = String(values[i][badmintonCol]).trim();
+    if (!cellVal) continue;
+    return _extractPatternForHour(cellVal, slotStartHour);
+  }
+
+  return '';
+}
+
+/**
  * セル内容が「有効」(〇 / ○ / △)かを判定する(内部用)
  *
  * @param {string} text

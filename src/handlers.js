@@ -1810,6 +1810,24 @@ function handleLiffReserveGetData(slotKey, userId) {
     cgItem.facilityStatus = facilityStatusCache[fid];
   }
 
+  // 未解禁スロットはスクレイパーシートからパターンを取得して各 courseGroup に付加する
+  if (!isUnlocked && statusSs) {
+    var slotHour = parseInt(slotStart.split(':')[0], 10);
+    var scraperPatternCache = {};
+    for (var spi = 0; spi < courseGroups.length; spi++) {
+      var spFid = courseGroups[spi].facilityId;
+      if (!scraperPatternCache.hasOwnProperty(spFid)) {
+        try {
+          scraperPatternCache[spFid] = getScraperPatternForSlot(spFid, useDate, slotHour, statusSs);
+        } catch (spErr) {
+          console.warn('[WARN] getScraperPatternForSlot error facilityId=' + spFid + ': ' + spErr.message);
+          scraperPatternCache[spFid] = '';
+        }
+      }
+      courseGroups[spi].scraperPattern = scraperPatternCache[spFid];
+    }
+  }
+
   // lineUserId で予約者を1名自動特定する(§14-11 IDOR対策)
   var reserverEntries;
   try {

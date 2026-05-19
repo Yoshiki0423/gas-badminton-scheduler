@@ -367,6 +367,10 @@
           if (cg.facilityStatus && cg.facilityStatus !== FACILITY_STATUS.AVAILABLE) {
             return { cg: cg, scanData: null };
           }
+          // 未解禁 + available: Lambda スキャンをスキップしスクレイパーパターンを使う
+          if (!state.isUnlocked && cg.facilityStatus === FACILITY_STATUS.AVAILABLE) {
+            return { cg: cg, scanData: null, noScan: true };
+          }
           const cgKey = cg.facilityId + '|' + (cg.courseGroupLabel || String(cg.courseGroupId));
           if (state.scanCache[cgKey]) {
             return { cg: cg, scanData: state.scanCache[cgKey] };
@@ -402,6 +406,27 @@
             dedupedMap[metaKey] = true;
             finalGroups.push(r.cg);
           }
+          return;
+        }
+        // 未解禁 + available: スクレイパーパターンで施設ごとに1枚のカードを表示
+        if (r.noScan) {
+          var noScanKey = r.cg.facilityId + '|__noscan__';
+          if (dedupedMap.hasOwnProperty(noScanKey)) return;
+          dedupedMap[noScanKey] = true;
+          var scraperPat = r.cg.scraperPattern || '';
+          // scraperPattern と一致するラベルを持つエントリを探す
+          var matchedEntry = null;
+          for (var mci = 0; mci < state.courseGroups.length; mci++) {
+            var mcg = state.courseGroups[mci];
+            if (mcg.facilityId === r.cg.facilityId && extractSimpleLabel(mcg.courseGroupLabel) === scraperPat) {
+              matchedEntry = mcg;
+              break;
+            }
+          }
+          if (!matchedEntry) matchedEntry = r.cg;
+          finalGroups.push(Object.assign({}, matchedEntry, {
+            courseGroupLabel: scraperPat || matchedEntry.courseGroupLabel
+          }));
           return;
         }
         // available: スキャン結果なしはスキップ（旧コードと同じ動作）

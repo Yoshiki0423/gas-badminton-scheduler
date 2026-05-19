@@ -943,6 +943,38 @@
 
 ---
 
+## D-035: スキャン結果ゼロ ＋ facilityStatus='available' の場合の挙動（未解禁日・来月分での 11 枚問題）
+
+- **決定日**: 2026-05-19
+- **対応機能**: F-6 LIFF 予約フロー・施設選択画面
+- **問題**: D-034 修正後、予約解禁済み（5/26 等）は 3 枚に修正されたが、以下の 2 ケースで依然 11 枚が表示された。
+  - **5/29 など「スケジュール公開済み・予約未解禁」の当月日付**
+  - **6/1 など翌月日付（施設が既に翌月スケジュールを公開済み）**
+- **根本原因の特定**:
+  - `getFacilityStatusForDate` は「スクレイパーシートにデータがあれば 'available' を返す」という実装。これらの日付はスクレイパーシートが存在しデータがあるため、facilityStatus = `'available'` が返される。
+  - `facilityStatus = 'available'` → reserve.html が全 11 エントリのスキャンを実行。
+  - しかし予約サイト（バド卓ねっと）はまだその日付の予約を受け付けておらず、Lambda スキャン結果は空（courts = []）。
+  - `finalGroups` が 0 件になる。
+  - **D-034 修正前**: `state.courseGroups = finalGroups.length > 0 ? finalGroups : state.courseGroups` → フォールバックで旧 11 エントリが復活 → 11 枚表示。
+  - **D-034 修正後（2026-05-19 後半の修正）**: フォールバック除去 → `finalGroups` = 0 → "空きコートが見つかりませんでした" を表示。
+- **D-034 修正（2026-05-19 前半デプロイ）が直せた範囲**:
+  - facilityStatus = 'available' かつ Lambda スキャンが実際にコートを返す日付（解禁済みの 5/26 等）のみ。
+  - facilityStatus = 'available' かつ Lambda スキャン空の日付（5/29・6/1 等）は依然として問題あり。
+- **最終決定（2026-05-19 後続実装）**: `isUnlocked=false` ＋ `facilityStatus='available'` のとき、Lambda スキャンを完全にスキップし、スクレイパーシートのセルテキストからパターンを取得して施設ごとに1枚のカードを表示する。
+- **実装方針の根拠**:
+  - スクレイパーシートのセルに `○ 9-13時 B\n13-15時 C\n15-21時 A` のように時間帯×パターンが記録されているため、Lambda スキャンなしでパターンを特定できる。
+  - Lambda スキャンは「予約サイトが開いているとき」だけ意味を持つ。未解禁スロットでスキャンしても必ず空を返すため実行コストの無駄。
+- **実装内容**:
+  - `src/scraper.js`: `_extractPatternForHour(cellText, slotStartHour)` を追加。4フォーマット（東総合・鳥屋野・亀田2種）と × の特殊ケースを網羅。
+  - `src/scraper.js`: `getScraperPatternForSlot(facilityId, reservationDateStr, slotStartHour, ss)` を追加。当月/翌月シートを自動判定して上の関数を呼ぶ。
+  - `src/handlers.js`: facilityStatus ループの直後、`!isUnlocked && statusSs` のときだけ `getScraperPatternForSlot` を施設ごとに呼び `scraperPattern` を courseGroup に付加。
+  - `liff/reserve.html`: スキャンフェーズで `!state.isUnlocked && facilityStatus=AVAILABLE` のカードは `{ noScan: true }` を返してスキップ。デデュープフェーズで `noScan` エントリは施設ごとに1枚のみ生成し、`extractSimpleLabel(courseGroupLabel) === scraperPattern` が一致するエントリの courseGroupIds を使う。
+- **代替案と棄却理由**:
+  - 「ScriptProperties の全パターン（7〜9枚）をそのまま表示する」案 → ユーザーが施設を選べず「どのパターンか分からない」という UX 問題があるため棄却。
+  - 「全施設を disabled カード1枚で「スケジュール確認中」表示する」案 → 予約待ち登録ができないため棄却。
+
+---
+
 ## 改訂履歴
 
 - **v1.1**(2026-05-15): D-022 追加。F-5 グループトーク移行の設計判断を記録。D-001 との関係(1on1 Push → グループ 1 通への置き換え)を明記。
