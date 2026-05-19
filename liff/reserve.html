@@ -364,7 +364,7 @@
 
       const scanResults = await Promise.all(
         state.courseGroups.map(async function(cg) {
-          if (cg.facilityStatus && cg.facilityStatus !== 'available') {
+          if (cg.facilityStatus && cg.facilityStatus !== FACILITY_STATUS.AVAILABLE) {
             return { cg: cg, scanData: null };
           }
           const cgKey = cg.facilityId + '|' + (cg.courseGroupLabel || String(cg.courseGroupId));
@@ -394,14 +394,18 @@
       const dedupedMap = {};
       const finalGroups = [];
       scanResults.forEach(function(r) {
-        if (r.cg.facilityStatus && r.cg.facilityStatus !== 'available') {
-          finalGroups.push(r.cg);
+        var status = r.cg.facilityStatus || FACILITY_STATUS.AVAILABLE;
+        if (status !== FACILITY_STATUS.AVAILABLE) {
+          // 未公開/休館日/エラー: 施設ごとに1枚だけ表示
+          var metaKey = r.cg.facilityId + '|__meta__';
+          if (!dedupedMap.hasOwnProperty(metaKey)) {
+            dedupedMap[metaKey] = true;
+            finalGroups.push(r.cg);
+          }
           return;
         }
-        if (!r.scanData || !r.scanData.courts || r.scanData.courts.length === 0) {
-          finalGroups.push(r.cg);
-          return;
-        }
+        // available: スキャン結果なしはスキップ（旧コードと同じ動作）
+        if (!r.scanData || !r.scanData.courts || r.scanData.courts.length === 0) return;
         var courtsByLabel = {};
         r.scanData.courts.forEach(function(court) {
           var label = extractSimpleLabel(court.patternName);
@@ -420,6 +424,10 @@
         });
       });
       state.courseGroups = finalGroups;
+      if (finalGroups.length === 0) {
+        list.innerHTML = '<div class="error-msg">空きコートが見つかりませんでした。<br>別の日時をお試しください。</div>';
+        return;
+      }
       list.innerHTML = '';
 
       state.courseGroups.forEach(function(cg) {
@@ -452,30 +460,15 @@
                           '<div class="sub">情報を取得できませんでした</div>';
           list.appendChild(btn);
         } else {
-          const cgKey = cg.facilityId + '|' + (cg.courseGroupLabel || String(cg.courseGroupId));
-          const hasScanData = !!(state.scanCache[cgKey] &&
-                                 state.scanCache[cgKey].courts &&
-                                 state.scanCache[cgKey].courts.length > 0);
-          if (!hasScanData) {
-            const btn = document.createElement('button');
-            btn.className = 'btn-choice';
-            btn.disabled = true;
-            btn.setAttribute('aria-disabled', 'true');
-            btn.style.cssText = 'opacity:0.5;cursor:not-allowed;';
-            btn.innerHTML = '<div class="label">' + esc(cg.facilityName) + '</div>' +
-                            '<div class="sub">現在空きコートがありません</div>';
-            list.appendChild(btn);
-          } else {
-            const btn = document.createElement('button');
-            btn.className = 'btn-choice';
-            btn.innerHTML = '<div class="label">' + esc(cg.facilityName) + '</div>' +
-                            '<div class="sub">パターン ' + esc(cg.courseGroupLabel) + '</div>';
-            btn.addEventListener('click', function() {
-              state.selectedCourseGroup = cg;
-              showCourtScreen();
-            });
-            list.appendChild(btn);
-          }
+          const btn = document.createElement('button');
+          btn.className = 'btn-choice';
+          btn.innerHTML = '<div class="label">' + esc(cg.facilityName) + '</div>' +
+                          '<div class="sub">パターン ' + esc(cg.courseGroupLabel) + '</div>';
+          btn.addEventListener('click', function() {
+            state.selectedCourseGroup = cg;
+            showCourtScreen();
+          });
+          list.appendChild(btn);
         }
       });
 
