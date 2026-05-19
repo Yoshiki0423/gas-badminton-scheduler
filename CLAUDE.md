@@ -2,39 +2,42 @@
 
 ---
 
+## ⚠️ ファイル構成の重要ルール
+
+### LIFFが配信するHTMLは `docs/reserve.html`（GitHub Pages）
+
+| ファイル | 用途 | 更新方法 |
+|---|---|---|
+| `docs/reserve.html` | **LIFFが実際に読み込むファイル**（GitHub Pages配信） | `git push` |
+| `liff/reserve.html` | GASの雛形ファイル（`<?= ... ?>` 記法あり）。LIFFからは使われていない | `clasp push`（GAS側のみ） |
+| `src/handlers.js` `src/scraper.js` | GASサーバー側のロジック | `clasp push` |
+
+**→ HTML の見た目・動作を変えるときは必ず `docs/reserve.html` を編集し `git push` すること。**  
+`liff/reserve.html` を直してもLIFFには反映されない（過去に何度も引っかかった）。
+
+---
+
 ## ⚠️ 次のセッション開始時の案内（2026-05-19 夜 更新）
 
 このセクションは次のセッションで読み込んだ後、削除してよいか確認してください。
 
-### 今回セッション（2026-05-19）でやったこと
+### 今回セッション（2026-05-19 夜）でやったこと
 
-**完了した実装**:
-- D-034: `liff/reserve.html` カード重複バグ修正・clasp push 済み
-- D-035: 未解禁スロット（5/29・6/1 等）の施設選択画面にスクレイパーパターン表示を実装
-  - `src/scraper.js`：`_extractPatternForHour`・`getScraperPatternForSlot` 追加
-  - `src/handlers.js`：`!isUnlocked` 時に `scraperPattern` を courseGroup に付加
-  - `liff/reserve.html`：ノースキャンフロー追加（未解禁+available → Lambda スキャンスキップ）
-  - clasp push 済み・git commit **未実施**（次のセッション冒頭で実施要）
+- **① コート優先順位画面のボタンが出ない問題を修正 ✅**
+  - **根本原因**：`initData` は初期化関数のローカル変数で `showCourtScreen` から参照不可（ReferenceError）
+  - `initData.savedPriority` → `state.savedPriority` 経由に変更
+  - あわせて `const renderPriority = function()` に変更（iOS Safari の `if/else` ブロック内 `function` 宣言問題）
+  - `simpleLabel` 正規化で `COURT_NAMES` キーのヒット漏れも修正
+  - 確認画面まで正常動作確認済み ✅
+- **LIFF キャッシュ問題を発見**：LINE キャッシュクリアでは解消せず、LINE Developers で
+  エンドポイント URL に `?v=2` を追加して回避。詳細は KB ケーススタディ03 §14 参照。
 
 ### 次回セッションでやること
 
-#### ① git commit と push
+#### ① デバッグコードのクリーンアップ（優先度低）
 
-```powershell
-git add src/scraper.js src/handlers.js liff/reserve.html DECISION_NOTES.md
-git commit -m "feat: 未解禁スロットの施設選択画面をスクレイパーパターンで表示（D-035）
-
-- scraper.js: _extractPatternForHour / getScraperPatternForSlot を追加
-  施設ごとの表記ゆれ（東総合・鳥屋野・亀田）を網羅した4フォーマット解析
-- handlers.js: !isUnlocked 時に scraperPattern を courseGroup に付加
-- reserve.html: 未解禁+available は Lambda スキャンをスキップし
-  スクレイパーパターンで施設ごと1枚のカードを表示するノースキャンフロー追加"
-git push
-```
-
-#### ② 実機テスト
-- 5/29（スケジュール公開済み・予約未解禁）の9時スロットで施設カードが3枚表示されるか確認
-- 6/1（翌月）で同様に確認
+- `liff/reserve.html`：`_dbgPre` 変数・デバッグパネルHTML・`[v035]` ローディングテキストを削除
+- `src/handlers.js`：`_debugToday` 戻り値を削除
 
 ---
 
