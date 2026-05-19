@@ -584,11 +584,13 @@
         // 未解禁: 固定コート情報を使って優先順位設定
         document.getElementById('courtScreenTitle').textContent = 'コート優先順位を設定（最大3つ）';
 
+        const simpleLabel = extractSimpleLabel(cg.courseGroupLabel) || cg.courseGroupLabel;
+
         // パターン画像を非同期取得（取得中は空のまま、返ってきたら表示）
         fetchGas('GET', null, {
           liff: 'reserveGetPatternImage',
           facilityId: String(cg.facilityId),
-          simpleLabel: String(cg.courseGroupLabel),
+          simpleLabel: String(simpleLabel),
           idToken: state.idToken
         }).then(function(imgRes) {
           if (imgRes && imgRes.ok && imgRes.data && imgRes.data.imageUrl) {
@@ -597,8 +599,8 @@
           }
         }).catch(function() { /* 画像取得失敗は無視 */ });
 
-        // §14-9 の固定コート名を facilityId + '_' + courseGroupLabel で引く
-        const cgKey = String(cg.facilityId) + '_' + String(cg.courseGroupLabel);
+        // §14-9 の固定コート名を facilityId + '_' + 単純ラベル で引く
+        const cgKey = String(cg.facilityId) + '_' + String(simpleLabel);
         const courtNames = (COURT_NAMES[cgKey] || []).slice();
         if (courtNames.length === 0) {
           showElError('error-court', '施設・パターン（' + cgKey + '）のコート情報が見つかりません。管理者にお問い合わせください。');
