@@ -117,7 +117,7 @@
 </head>
 <body>
   <div class="header">
-    <h1>コート予約 v5</h1>
+    <h1>コート予約</h1>
     <div class="subtitle" id="slotLabel">読み込み中...</div>
   </div>
 
@@ -603,41 +603,19 @@
         // §14-9 の固定コート名を facilityId + '_' + 単純ラベル で引く
         const cgKey = String(cg.facilityId) + '_' + String(simpleLabel);
         const courtNames = (COURT_NAMES[cgKey] || []).slice();
-
-        // ★デバッグ用（確認後削除）
-        document.getElementById('courtScreenSubtitle').textContent =
-          'DBG: isUnlocked=' + state.isUnlocked +
-          ' | label=' + cg.courseGroupLabel +
-          ' | simple=' + simpleLabel +
-          ' | key=' + cgKey +
-          ' | courts=' + courtNames.length;
-
         if (courtNames.length === 0) {
           showElError('error-court', '施設・パターン（' + cgKey + '）のコート情報が見つかりません。管理者にお問い合わせください。');
           return;
         }
 
-        document.getElementById('courtScreenSubtitle').textContent += ' | s1';
-        try {
-          var savedPriorityFromServer = (state.savedPriority || []);
-          state.selectedCourts = savedPriorityFromServer
-            .filter(function(v) { return typeof v === 'string' && v !== ''; })
-            .slice(0, 3);
-          document.getElementById('courtScreenSubtitle').textContent += ' | s2';
-        } catch(e) {
-          document.getElementById('courtScreenSubtitle').textContent += ' | ERR1:' + e.message;
-          return;
-        }
+        var savedPriorityFromServer = (state.savedPriority || []);
+        state.selectedCourts = savedPriorityFromServer
+          .filter(function(v) { return typeof v === 'string' && v !== ''; })
+          .slice(0, 3);
 
         var priorityArea = document.getElementById('priorityArea');
         var priorityList = document.getElementById('priorityList');
-        try {
-          priorityArea.style.display = 'block';
-          document.getElementById('courtScreenSubtitle').textContent += ' | s3';
-        } catch(e) {
-          document.getElementById('courtScreenSubtitle').textContent += ' | ERR2:' + e.message;
-          return;
-        }
+        priorityArea.style.display = 'block';
 
         const renderPriority = function() {
           priorityList.innerHTML = state.selectedCourts.map(function(name, i) {
@@ -660,11 +638,6 @@
         }
 
         const list = document.getElementById('courtList');
-        // ★デバッグ: list が取得できているか確認
-        document.getElementById('courtScreenSubtitle').textContent +=
-          ' | listNull=' + (list === null);
-        if (!list) return;
-
         list.innerHTML = '';
         courtNames.forEach(function(name) {
           const btn = document.createElement('button');
@@ -682,9 +655,6 @@
           });
           list.appendChild(btn);
         });
-        // ★デバッグ: ボタン追加後の子要素数
-        document.getElementById('courtScreenSubtitle').textContent +=
-          ' | added=' + list.children.length;
 
         renderPriority();
 
