@@ -128,6 +128,17 @@ function doGet(e) {
     return _handleLiffApi(e, liffAction);
   }
 
+  // デバッグエンドポイント: ?debug=scrape_preview&token=XXX
+  var debugAction = (e && e.parameter && e.parameter.debug) ? e.parameter.debug : '';
+  if (debugAction === 'scrape_preview') {
+    var debugToken = (e && e.parameter && e.parameter.token) ? e.parameter.token : '';
+    var expectedDebugToken = getProperty('DEBUG_TOKEN');
+    if (!expectedDebugToken || !timingSafeEqual(debugToken, expectedDebugToken)) {
+      return _jsonResponse({ ok: false, error: 'Unauthorized' });
+    }
+    return _jsonResponse(debugScrapePreview());
+  }
+
   var page = (e && e.parameter && e.parameter.page) ? e.parameter.page : '';
 
   if (page === 'form') {

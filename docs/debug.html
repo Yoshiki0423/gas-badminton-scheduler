@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>スクレイピングデバッグ — バドミントンスケジューラ</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 16px;
+      color: #333;
+    }
+    h1 { font-size: 1.2rem; margin-bottom: 4px; }
+    .subtitle { font-size: 0.85rem; color: #666; margin-bottom: 16px; }
+
+    .settings {
+      background: #f5f5f5;
+      border-radius: 8px;
+      padding: 12px 16px;
+      margin-bottom: 16px;
+    }
+    .settings label { display: block; font-size: 0.85rem; margin-bottom: 2px; }
+    .settings input {
+      width: 100%;
+      padding: 6px 8px;
+      box-sizing: border-box;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      font-size: 0.9rem;
+      margin-bottom: 8px;
+    }
+
+    button {
+      background: #06c755;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      padding: 10px 24px;
+      font-size: 0.95rem;
+      cursor: pointer;
+    }
+    button:disabled { background: #aaa; cursor: not-allowed; }
+
+    #status {
+      margin-top: 12px;
+      font-size: 0.85rem;
+      color: #555;
+      min-height: 1.2em;
+    }
+    .error { color: #c00; font-weight: bold; }
+    .ok    { color: #060; }
+
+    /* サマリー */
+    .summary {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 16px;
+    }
+    .summary-card {
+      background: #e8f5e9;
+      border-radius: 6px;
+      padding: 8px 14px;
+      font-size: 0.85rem;
+    }
+    .summary-card .num { font-size: 1.3rem; font-weight: bold; }
+
+    /* テーブル */
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.82rem;
+      margin-top: 12px;
+    }
+    th {
+      background: #444;
+      color: #fff;
+      padding: 6px 8px;
+      text-align: left;
+      position: sticky;
+      top: 0;
+    }
+    td { padding: 5px 8px; border-bottom: 1px solid #eee; }
+    tr:nth-child(even) { background: #f9f9f9; }
+
+    /* 施設ごとに行に色を付ける */
+    tr[data-facility="鳥屋野"] td { border-left: 3px solid #4caf50; }
+    tr[data-facility="東総合"] td { border-left: 3px solid #2196f3; }
+    tr[data-facility="亀田"] td  { border-left: 3px solid #ff9800; }
+
+    .legend {
+      display: flex;
+      gap: 12px;
+      font-size: 0.78rem;
+      margin-top: 6px;
+    }
+    .legend-item { display: flex; align-items: center; gap: 4px; }
+    .dot { width: 12px; height: 12px; border-radius: 2px; }
+  </style>
+</head>
+<body>
+
+<h1>スクレイピングデバッグページ</h1>
+<p class="subtitle">
+  GAS の <code>debugScrapePreview()</code> を呼んでスクレイピング結果を確認します。<br>
+  シートへの書き込みは行いません。設定はブラウザに保存されます。
+</p>
+
+<div class="settings">
+  <label>GAS Web App URL</label>
+  <input type="text" id="gasUrl" placeholder="https://script.google.com/macros/s/XXXXXXXX/exec">
+
+  <label>デバッグトークン（DEBUG_TOKEN）</label>
+  <input type="password" id="debugToken" placeholder="ScriptProperties に設定したトークン">
+</div>
+
+<button id="runBtn" onclick="runScrape()">確認する</button>
+
+<div id="status"></div>
+<div id="summary" class="summary"></div>
+<div id="tableWrap"></div>
+
+<script>
+  var LS_URL   = 'debug_gas_url';
+  var LS_TOKEN = 'debug_token';
+
+  // 保存済みの設定を復元
+  var savedUrl   = localStorage.getItem(LS_URL)   || '';
+  var savedToken = localStorage.getItem(LS_TOKEN) || '';
+  if (savedUrl)   document.getElementById('gasUrl').value      = savedUrl;
+  if (savedToken) document.getElementById('debugToken').value  = savedToken;
+
+  function setStatus(msg, cls) {
+    var el = document.getElementById('status');
+    el.textContent = msg;
+    el.className = cls || '';
+  }
+
+  function runScrape() {
+    var gasUrl     = document.getElementById('gasUrl').value.trim();
+    var debugToken = document.getElementById('debugToken').value.trim();
+
+    if (!gasUrl || !debugToken) {
+      setStatus('GAS Web App URL とデバッグトークンを入力してください。', 'error');
+      return;
+    }
+
+    // 設定を保存
+    localStorage.setItem(LS_URL,   gasUrl);
+    localStorage.setItem(LS_TOKEN, debugToken);
+
+    document.getElementById('runBtn').disabled = true;
+    document.getElementById('summary').innerHTML   = '';
+    document.getElementById('tableWrap').innerHTML = '';
+    setStatus('スクレイピング中… (30〜60秒かかる場合があります)');
+
+    var url = gasUrl + '?debug=scrape_preview&token=' + encodeURIComponent(debugToken);
+
+    fetch(url)
+      .then(function(res) {
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        return res.json();
+      })
+      .then(function(data) {
+        document.getElementById('runBtn').disabled = false;
+
+        if (!data.ok) {
+          setStatus('エラー: ' + (data.error || 'unknown'), 'error');
+          return;
+        }
+
+        renderResult(data);
+        setStatus('取得完了 — ' + new Date().toLocaleTimeString(), 'ok');
+      })
+      .catch(function(err) {
+        document.getElementById('runBtn').disabled = false;
+        setStatus('通信エラー: ' + err.message, 'error');
+      });
+  }
+
+  function renderResult(data) {
+    var rows = data.rows || [];
+    var errors = data.errors || [];
+
+    // --- サマリー ---
+    var byFacility = {};
+    rows.forEach(function(r) {
+      var f = r.facility_name || '不明';
+      byFacility[f] = (byFacility[f] || 0) + 1;
+    });
+
+    var summaryHtml = '';
+    Object.keys(byFacility).forEach(function(f) {
+      summaryHtml += '<div class="summary-card"><div class="num">' +
+        byFacility[f] + '</div><div>' + f + '</div></div>';
+    });
+    summaryHtml += '<div class="summary-card"><div class="num">' +
+      rows.length + '</div><div>合計</div></div>';
+
+    if (errors.length > 0) {
+      summaryHtml += '<div class="summary-card" style="background:#ffebee"><div class="num">' +
+        errors.length + '</div><div>エラー</div></div>';
+    }
+    document.getElementById('summary').innerHTML = summaryHtml;
+
+    // --- エラー表示 ---
+    var errHtml = '';
+    if (errors.length > 0) {
+      errHtml = '<div style="margin-top:12px;color:#c00;font-size:0.85rem"><b>エラー詳細:</b><ul>' +
+        errors.map(function(e) { return '<li>' + e + '</li>'; }).join('') +
+        '</ul></div>';
+    }
+
+    // --- テーブル ---
+    if (rows.length === 0) {
+      document.getElementById('tableWrap').innerHTML =
+        errHtml + '<p style="color:#888;margin-top:12px">データが0件でした。</p>';
+      return;
+    }
+
+    // 凡例
+    var legendHtml =
+      '<div class="legend">' +
+      '<div class="legend-item"><div class="dot" style="background:#4caf50"></div>鳥屋野</div>' +
+      '<div class="legend-item"><div class="dot" style="background:#2196f3"></div>東総合</div>' +
+      '<div class="legend-item"><div class="dot" style="background:#ff9800"></div>亀田</div>' +
+      '</div>';
+
+    var tbHtml =
+      '<table><thead><tr>' +
+      '<th>日付</th><th>開始</th><th>終了</th><th>施設</th><th>パターン</th>' +
+      '</tr></thead><tbody>';
+
+    rows.forEach(function(r) {
+      tbHtml += '<tr data-facility="' + (r.facility_name || '') + '">' +
+        '<td>' + (r.date          || '') + '</td>' +
+        '<td>' + (r.start_time    || '') + '</td>' +
+        '<td>' + (r.end_time      || '') + '</td>' +
+        '<td>' + (r.facility_name || '') + '</td>' +
+        '<td>' + (r.pattern       || '') + '</td>' +
+        '</tr>';
+    });
+
+    tbHtml += '</tbody></table>';
+
+    document.getElementById('tableWrap').innerHTML = errHtml + legendHtml + tbHtml;
+  }
+</script>
+</body>
+</html>

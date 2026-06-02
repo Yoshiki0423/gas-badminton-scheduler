@@ -1,1298 +1,620 @@
 /**
- * @fileoverview F-2-1 スクレイピング自動化 / F-2-2 更新検知による自動起動
+ * F1: スクレイピング機能
  *
- * Google スプレッドシートの IMPORTHTML 関数を使って
- * 4 体育館(niigata-kaikou.jp)の個人開放スケジュールを自動取得し、
- * schedules シートへ書き込む。
+ * 施設 HP（niigata-kaikou.jp）の個人開放スケジュールを
+ * IMPORTHTML で取得・パースし schedules シートに書き込む。
  *
- * 背景(D-016):
- *   niigata-kaikou.jp は XSERVER WAF が Google の IP をブロックするため、
- *   UrlFetchApp.fetch() が HTTP 501 で失敗する。
- *   代替手段として IMPORTHTML 関数をスプレッドシートに設定し、
- *   GAS から sheet.getDataRange().getValues() で読み込む方式に変更した。
+ * セットアップ手順（初回のみ）:
+ *   1. GAS エディタで setupScraperSheets() を実行
+ *      → scraper-413 / scraper-420 / scraper-429 / -next 版シートが作成される
+ *   2. 数分待って IMPORTHTML のデータ読み込みが完了するのを確認
+ *   3. debugScrapePreview() を実行して結果をデバッグページで確認
+ *   4. scrapeAllFacilities() を実行して schedules シートに書き込み
+ *   5. setupScraperTrigger() でタイムトリガーを設定
  *
- * セットアップ手順:
- *   1. GAS エディタで setupScraperSheets() を 1 回だけ手動実行する
- *      → scraper-420 / scraper-420-next / scraper-413 / scraper-413-next シートが作成され、
- *        各シートに IMPORTHTML 式が設定される
- *   2. 各シートで IMPORTHTML の読み込みが完了するのを確認する
- *   3. scrapeAllFacilities() または checkAndScrapeIfUpdated() を実行して動作確認する
+ * 提供する関数（GAS エディタから手動実行可能）:
+ *   - setupScraperSheets()    : IMPORTHTML シートを初期作成（1 回だけ）
+ *   - resetSchedulesSheet()   : schedules シートを新スキーマでリセット（1 回だけ）
+ *   - scrapeAllFacilities()   : 全施設スクレイピング → schedules シートに書き込み
+ *   - debugScrapePreview()    : 書き込みなしのプレビュー JSON を返す（デバッグページ用）
+ *   - setupScraperTrigger()   : 毎日午前 9 時トリガーをセットアップ（1 回だけ）
  *
- * 提供する関数:
- *   - setupScraperSheets()             : IMPORTHTML シートを初期セットアップ(1 回だけ実行)
- *   - scrapeAllFacilities()            : 全体育館をスクレイピングして schedules シートへ保存
- *   - scrapeFacilitySchedule(facility, ss) : 1 体育館のシート読み込み + パース + schedules 保存
- *   - parseScraperSheetValues(values, name) : シートの 2D 配列からスケジュール配列を抽出
- *   - checkAndScrapeIfUpdated()        : シート内容のハッシュ比較 → 更新あり時に scrape + 配信
- *   - setupDailyTrigger()              : checkAndScrapeIfUpdated の毎朝 7 時トリガーを設定
- *
- * エラーポリシー(REQUIREMENTS.md §4-2):
- *   - 体育館シート取得失敗 → 前回データをそのまま使い続ける(即時リトライしない)
- *   - 連続 3 日失敗 → ScriptProperties の連続失敗カウントが FAIL_THRESHOLD に達したら管理者通知
- *   - withRetry は「スプレッドシート書き込み(addSchedule)」には使う
- *     シート読み取りには使わない(IMPORTHTML が更新中の場合は次回で再試行)
+ * 設計メモ:
+ *   - UrlFetchApp は WAF にブロックされるため IMPORTHTML/IMPORTXML を使用（D-020）
+ *   - schedules シートのスキーマは SPECIFICATION.md セクション 1-1 の新定義に従う
+ *   - 亀田の end_time は D-024 のルールで計算する
+ *   - floor_map_url の取得（D-022 / IMPORTXML）は別フェーズで追加予定
  */
 
 // ─────────────────────────────────────────────
-// 定数
+// 定数: 施設設定
 // ─────────────────────────────────────────────
 
 /**
- * スクレイピング対象の施設一覧(D-005 / F-2-1)
- *
- * enabled: false の施設はスキップする(バドミントン個人開放がない施設)
- * sheetName: IMPORTHTML を設置するシート名(null = スキップ対象)
+ * スクレイピング対象施設の設定
+ * 実際のアクティブ判定は settings シートの status 列で行う（D-021）
  */
-var FACILITIES = [
+var SCRAPER_FACILITIES = [
   {
-    facilityId: 442,
-    facilityName: '西総合スポーツセンター',
-    url: 'https://niigata-kaikou.jp/facility/442/schedule',
-    sheetName: null,
-    enabled: false  // バドミントン個人開放なし → スキップ
-  },
-  {
-    facilityId: 420,
-    facilityName: '鳥屋野総合体育館',
-    url: 'https://niigata-kaikou.jp/facility/420/schedule',
-    sheetName: 'scraper-420',
-    nextSheetName: 'scraper-420-next',
-    enabled: true
-  },
-  {
-    facilityId: 413,
+    facilityId: '413',
     facilityName: '東総合スポーツセンター',
     url: 'https://niigata-kaikou.jp/facility/413/schedule',
     sheetName: 'scraper-413',
-    nextSheetName: 'scraper-413-next',
-    enabled: true
+    nextSheetName: 'scraper-413-next'
   },
   {
-    facilityId: 429,
+    facilityId: '420',
+    facilityName: '鳥屋野総合体育館',
+    url: 'https://niigata-kaikou.jp/facility/420/schedule',
+    sheetName: 'scraper-420',
+    nextSheetName: 'scraper-420-next'
+  },
+  {
+    facilityId: '429',
     facilityName: '亀田総合体育館',
     url: 'https://niigata-kaikou.jp/facility/429/schedule',
     sheetName: 'scraper-429',
-    nextSheetName: 'scraper-429-next',
-    enabled: true
+    nextSheetName: 'scraper-429-next'
   }
 ];
 
-/** 連続失敗カウントのしきい値(これを超えたら管理者通知) */
-var FAIL_THRESHOLD = 3;
-
-/** ScriptProperties キー: 最終スクレイピング実行日(YYYY-MM-DD) */
-var PROP_LAST_RUN_DATE = 'SCRAPER_LAST_RUN_DATE';
-
-/** ScriptProperties キー: 施設ごとのハッシュ接頭辞(例: HASH_FACILITY_420) */
-var HASH_KEY_PREFIX = 'HASH_FACILITY_';
-
-/** ScriptProperties キー: 施設ごとの連続失敗カウント接頭辞(例: FAIL_COUNT_FACILITY_420) */
-var FAIL_COUNT_KEY_PREFIX = 'FAIL_COUNT_FACILITY_';
-
-/**
- * ScriptProperties キー: 施設ごとに「スクレイピングで取得した月の一覧」を一時保存する接頭辞
- * 値は JSON.stringify(["2026-05","2026-06"]) のような YYYY-MM 配列(ソート済み)
- * 例: SCRAPED_MONTHS_FACILITY_420
- * (D-018) デバッグ用に通知後も消さずに残す設計
- */
-var SCRAPED_MONTHS_KEY_PREFIX = 'SCRAPED_MONTHS_FACILITY_';
-
-/**
- * ScriptProperties キー: 施設ごとに「最後に新月通知を送った月(YYYY-MM)」を記録する接頭辞
- * 例: LAST_NOTIFIED_MONTH_FACILITY_420
- */
-var LAST_NOTIFIED_MONTH_KEY_PREFIX = 'LAST_NOTIFIED_MONTH_FACILITY_';
-
-/**
- * ScriptProperties キー: 「全施設の予定が揃った」通知を送った最後の月(YYYY-MM)
- */
-var ALL_FACILITIES_NOTIFIED_MONTH_KEY = 'ALL_FACILITIES_NOTIFIED_MONTH';
-
-/** checkAndScrapeIfUpdated を呼ぶトリガーの関数名 */
-var TRIGGER_FUNCTION_NAME = 'checkAndScrapeIfUpdated';
-
-/**
- * ScriptProperties キー: 鳥屋野総合体育館(facilityId=420)の courseGroupId 一覧
- * 値の形式: "14879,14881,14882" のようなカンマ区切り数値文字列
- * _doImmediateReserve / _callScanLambda が参照する(handlers.js)
- */
-var PROP_TOYA_COURSE_GROUP_IDS = 'TOYA_COURSE_GROUP_IDS';
-
-/**
- * ScriptProperties キー: 東総合スポーツセンター(facilityId=413)の courseGroupId 一覧
- * 値の形式: "14791,14793" のようなカンマ区切り数値文字列
- */
-var PROP_HIGASHI_COURSE_GROUP_IDS = 'HIGASHI_COURSE_GROUP_IDS';
-
-/**
- * ScriptProperties キー: 鳥屋野総合体育館の courseGroupId ラベル一覧
- * 値の形式: "A,A/B,B,A" のようなカンマ区切り文字列(IDS と同順)
- * "A"=大体育室、"B"=中体育室、"A/B"=混在(時間帯によってどちらも使う日)
- */
-var PROP_TOYA_COURSE_GROUP_LABELS = 'TOYA_COURSE_GROUP_LABELS';
-
-/**
- * ScriptProperties キー: 東総合スポーツセンターの courseGroupId ラベル一覧
- * 値の形式: PROP_TOYA_COURSE_GROUP_LABELS と同じ形式
- */
-var PROP_HIGASHI_COURSE_GROUP_LABELS = 'HIGASHI_COURSE_GROUP_LABELS';
-
-/**
- * ScriptProperties キー: 亀田総合体育館(facilityId=429)の courseGroupId 一覧
- * 値の形式: "14791,14793" のようなカンマ区切り数値文字列
- */
-var PROP_KAMEDA_COURSE_GROUP_IDS = 'KAMEDA_COURSE_GROUP_IDS';
-
-/**
- * ScriptProperties キー: 亀田総合体育館の courseGroupId ラベル一覧
- * 値の形式: PROP_TOYA_COURSE_GROUP_LABELS と同じ形式
- */
-var PROP_KAMEDA_COURSE_GROUP_LABELS = 'KAMEDA_COURSE_GROUP_LABELS';
-
-/** 毎朝トリガーを起動する時刻(0-23) */
-var TRIGGER_HOUR = 7;
-
-/**
- * バドミントン列のデフォルト列インデックス(0-based)
- * ヘッダー行で「バドミントン」が見つからなかった場合のフォールバック
- */
-var DEFAULT_BADMINTON_COL = 2;
-
-/** ヘッダー行を探す最大行数(先頭 N 行以内でバドミントン列を探す) */
-var HEADER_SEARCH_LIMIT = 5;
-
-/**
- * 施設ステータスの定数
- * GAS はグローバルスコープ共有のため handlers.js からも参照可能
- */
-var FACILITY_STATUS = {
-  AVAILABLE:   'available',
-  UNPUBLISHED: 'unpublished',
-  CLOSED:      'closed',
-  ERROR:       'error'
-};
-
 // ─────────────────────────────────────────────
-// 内部ユーティリティ
+// 定数: schedules シート（新スキーマ）
 // ─────────────────────────────────────────────
 
+/** schedules シート名 */
+var SCHED_SHEET_NAME = 'schedules';
+
 /**
- * シートの 2D 配列からバドミントン列インデックスを探す
+ * schedules シートのヘッダー列（SPECIFICATION.md セクション 1-1）
  *
- * 先頭 HEADER_SEARCH_LIMIT 行以内で「バドミントン」を含む列を探す。
- * 見つからなければ DEFAULT_BADMINTON_COL を返す。
- *
- * @param {Array<Array>} values - sheet.getDataRange().getValues() の戻り値
- * @returns {number} バドミントン列インデックス(0-based)
- * @private
+ * 主キー: (date, start_time, facility_name) の 3 列で一意性を保証する
  */
-function _findBadmintonCol(values) {
-  for (var r = 0; r < Math.min(HEADER_SEARCH_LIMIT, values.length); r++) {
-    for (var c = 0; c < values[r].length; c++) {
-      if (String(values[r][c]).trim().indexOf('バドミントン') !== -1) {
-        return c;
-      }
-    }
-  }
-  return DEFAULT_BADMINTON_COL;
-}
+var SCHED_HEADER = [
+  'date',          // A: YYYY-MM-DD
+  'start_time',    // B: HH:MM
+  'end_time',      // C: HH:MM
+  'facility_name', // D: 施設名
+  'pattern',       // E: A/B/C/D
+  'scraped_at',    // F: ISO datetime（スクレイピング実行日時）
+  'floor_map_url'  // G: URL or '' （D-022: 将来 IMPORTXML で取得予定）
+];
+
+/** バドミントン列を探す先頭最大行数 */
+var SCHED_HEADER_ROWS = 5;
+
+/** バドミントン列が見つからない場合のデフォルト列インデックス（0-based）*/
+var SCHED_BADMINTON_COL_DEFAULT = 2;
 
 // ─────────────────────────────────────────────
-// セットアップ
+// パブリック関数
 // ─────────────────────────────────────────────
 
 /**
- * IMPORTHTML 用スクレイパーシートを初期セットアップする
+ * IMPORTHTML 用スクレイパーシートを初期セットアップする（1 回だけ実行）
  *
- * 1 回だけ GAS エディタから手動実行する初期化関数。
- * enabled な施設ごとに当月シート(scraper-420 等)と翌月シート(scraper-420-next 等)を作成し、
+ * 各施設の当月シート（scraper-XXX）と翌月シート（scraper-XXX-next）を作成し、
  * A1 セルに IMPORTHTML 式を設定する。
- * 既存シートがあれば中身を上書き(セットアップ再実行に対応)。
- *
- * 実行後: IMPORTHTML のデータ読み込みが完了するまで数十秒〜数分待ってから
- *         scrapeAllFacilities() を実行すること。
- *
- * @returns {void}
+ * 実行後、数分待って IMPORTHTML データが読み込まれてから
+ * debugScrapePreview() で動作確認すること。
  */
 function setupScraperSheets() {
-  var spreadsheetId = getProperty('MEMBERS_SPREADSHEET_ID');
-  if (!spreadsheetId) {
-    throw new Error('MEMBERS_SPREADSHEET_ID が設定されていません。スクリプトプロパティを確認してください。');
-  }
-  var ss = SpreadsheetApp.openById(spreadsheetId);
+  var ss = _getSpreadsheet();
 
-  for (var i = 0; i < FACILITIES.length; i++) {
-    var facility = FACILITIES[i];
-    if (!facility.enabled || !facility.sheetName) {
-      console.log('[INFO] setupScraperSheets: ' + facility.facilityName + ' はスキップ(enabled=false)');
+  for (var i = 0; i < SCRAPER_FACILITIES.length; i++) {
+    var f = SCRAPER_FACILITIES[i];
+
+    // 当月シート: table,2 が個人開放スケジュール表
+    _setImportHtmlSheet(ss, f.sheetName, f.url, 2);
+
+    // 翌月シート: table,3 が翌月スケジュール（翌月未公開時は無害な内容が入る）
+    _setImportHtmlSheet(ss, f.nextSheetName, f.url, 3);
+  }
+
+  console.log('[INFO] setupScraperSheets: 完了。' +
+    '数分後にシートを確認し、データが入っていたら debugScrapePreview() を実行してください。');
+}
+
+/**
+ * schedules シートを新スキーマでリセットする（1 回だけ実行）
+ *
+ * ⚠️ 既存データがすべて消えます。
+ * 旧スキーマのデータが入っている場合にのみ実行してください。
+ * 実行後は scrapeAllFacilities() でデータを再取得してください。
+ */
+function resetSchedulesSheet() {
+  var ss = _getSpreadsheet();
+  var sheet = ss.getSheetByName(SCHED_SHEET_NAME);
+  if (sheet) {
+    ss.deleteSheet(sheet);
+    console.log('[INFO] resetSchedulesSheet: 旧 schedules シートを削除しました。');
+  }
+  _getOrInitSchedulesSheet(ss);
+  console.log('[INFO] resetSchedulesSheet: 新スキーマで schedules シートを再作成しました。');
+}
+
+/**
+ * 全施設をスクレイピングして schedules シートに書き込む
+ *
+ * settings シートの status = 'active' の施設のみ対象（D-021）。
+ * GAS タイムトリガー（午前 9〜10 時）から呼ぶ。
+ * エラー時はグループに MSG-ERR-01 を送信する。
+ *
+ * @returns {{ saved: number, errors: Array<string> }}
+ */
+function scrapeAllFacilities() {
+  var ss = _getSpreadsheet();
+  var activeIds = _getActiveFacilityIds(ss);
+
+  var totalSaved = 0;
+  var errors = [];
+
+  for (var i = 0; i < SCRAPER_FACILITIES.length; i++) {
+    var f = SCRAPER_FACILITIES[i];
+
+    if (activeIds.indexOf(f.facilityId) === -1) {
+      console.log('[INFO] scrapeAllFacilities: ' + f.facilityName + ' は active でないためスキップ');
       continue;
     }
 
-    var sheet = ss.getSheetByName(facility.sheetName);
-    if (sheet) {
-      // 既存シートがあれば中身をクリアして上書き
-      sheet.clearContents();
-      console.log('[INFO] setupScraperSheets: ' + facility.sheetName + ' の既存シートをクリアしました。');
-    } else {
-      sheet = ss.insertSheet(facility.sheetName);
-      console.log('[INFO] setupScraperSheets: ' + facility.sheetName + ' シートを新規作成しました。');
-    }
-
-    // 当月シート: table,2 が当月スケジュール(D-016 で確認済み)
-    var formula = '=IMPORTHTML("' + facility.url + '","table",2)';
-    sheet.getRange('A1').setFormula(formula);
-    console.log('[INFO] setupScraperSheets: ' + facility.sheetName + ' に設定: ' + formula);
-
-    // 翌月シート: table,3 が翌月公開後に翌月スケジュールになる(D-023 で確認済み)
-    // 翌月未公開時は施設案内が入るが、パーサーが日付行以外をスキップするため副作用なし
-    if (facility.nextSheetName) {
-      var nextSheet = ss.getSheetByName(facility.nextSheetName);
-      if (nextSheet) {
-        nextSheet.clearContents();
-        console.log('[INFO] setupScraperSheets: ' + facility.nextSheetName + ' の既存シートをクリアしました。');
-      } else {
-        nextSheet = ss.insertSheet(facility.nextSheetName);
-        console.log('[INFO] setupScraperSheets: ' + facility.nextSheetName + ' シートを新規作成しました。');
-      }
-      var nextFormula = '=IMPORTHTML("' + facility.url + '","table",3)';
-      nextSheet.getRange('A1').setFormula(nextFormula);
-      console.log('[INFO] setupScraperSheets: ' + facility.nextSheetName + ' に設定: ' + nextFormula);
-    }
-  }
-
-  console.log('[INFO] setupScraperSheets: 完了。IMPORTHTML の読み込みが完了してから scrapeAllFacilities() を実行してください。');
-}
-
-// ─────────────────────────────────────────────
-// F-2-1: スクレイピング本体
-// ─────────────────────────────────────────────
-
-/**
- * 全体育館をスクレイピングして schedules シートへ保存する
- *
- * 1 日 1 回制限:
- *   ScriptProperties の SCRAPER_LAST_RUN_DATE と今日の日付を比較し、
- *   同日に既に実行済みなら何もせずに返る。
- *   checkAndScrapeIfUpdated 経由で呼ばれる場合はシート内容変化が前提なので
- *   制限チェックをスキップする引数 skipDailyCheck を用意している。
- *
- * @param {boolean} [skipDailyCheck=false] - true にすると 1 日 1 回制限チェックをスキップ
- * @returns {{totalSaved: number, facilityResults: Array}} 保存件数サマリ
- */
-function scrapeAllFacilities(skipDailyCheck) {
-  var today = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM-dd');
-
-  if (!skipDailyCheck) {
-    var lastRunDate = getProperty(PROP_LAST_RUN_DATE);
-    if (lastRunDate === today) {
-      console.log('[INFO] scrapeAllFacilities: 本日は既に実行済みです(' + today + ')。スキップします。');
-      return { totalSaved: 0, facilityResults: [] };
-    }
-  }
-
-  // 実行日を記録してから処理(二重実行防止)
-  PropertiesService.getScriptProperties().setProperty(PROP_LAST_RUN_DATE, today);
-
-  var spreadsheetId = getProperty('MEMBERS_SPREADSHEET_ID');
-  if (!spreadsheetId) {
-    throw new Error('MEMBERS_SPREADSHEET_ID が設定されていません。スクリプトプロパティを確認してください。');
-  }
-  var ss = SpreadsheetApp.openById(spreadsheetId);
-
-  var totalSaved = 0;
-  var facilityResults = [];
-
-  for (var i = 0; i < FACILITIES.length; i++) {
-    var facility = FACILITIES[i];
     try {
-      var saved = scrapeFacilitySchedule(facility, ss);
-      totalSaved += saved;
-      facilityResults.push({ facilityId: facility.facilityId, saved: saved, error: null });
-      // 連続失敗カウントをリセット(成功したため)
-      _resetFailCount(facility.facilityId);
-      console.log('[INFO] scrapeAllFacilities: ' + facility.facilityName + ' → ' + saved + '件保存');
+      var rows = _scrapeFacility(f, ss);
+      _upsertScheduleRows(rows, ss);
+      totalSaved += rows.length;
+      console.log('[INFO] scrapeAllFacilities: ' + f.facilityName + ' → ' + rows.length + ' 件保存');
     } catch (err) {
-      logError(err, { phase: 'scrapeAllFacilities.loop', facilityId: facility.facilityId, facilityName: facility.facilityName });
-      facilityResults.push({ facilityId: facility.facilityId, saved: 0, error: err.message });
-      // 失敗カウントを加算し、しきい値超えなら管理者通知
-      _incrementFailCountAndNotifyIfNeeded(facility);
-      // エラーが起きても次の体育館は続行する(エラーポリシー §4-2)
+      logError(err, { phase: 'scrapeAllFacilities', facilityId: f.facilityId });
+      errors.push(f.facilityName + ': ' + err.message);
     }
   }
 
-  console.log('[INFO] scrapeAllFacilities 完了: totalSaved=' + totalSaved);
+  // スクレイピング失敗があればグループ通知（MSG-ERR-01）
+  if (errors.length > 0) {
+    var groupId = getProperty('LINE_GROUP_ID');
+    if (groupId) {
+      try {
+        pushText(
+          groupId,
+          'スケジュール取得に失敗しました。前回のデータを保持しています。\n' + errors.join('\n')
+        );
+      } catch (pushErr) {
+        logError(pushErr, { phase: 'scrapeAllFacilities.notify' });
+      }
+    }
+  }
 
-  // ─── courseGroupId を更新(F-6 対応) ───
-  // scrapeAllFacilities を直接呼び出した場合もIDを最新化する
-  // checkAndScrapeIfUpdated 経由の場合は重複実行になるが、
-  // updateCourseGroupIds 内部の「更新前件数と変化なし」ログで確認できるため許容する
-  updateCourseGroupIds();
-
-  return { totalSaved: totalSaved, facilityResults: facilityResults };
+  console.log('[INFO] scrapeAllFacilities 完了: saved=' + totalSaved + ' errors=' + errors.length);
+  return { saved: totalSaved, errors: errors };
 }
 
 /**
- * 1 体育館の IMPORTHTML シートを読み込み、schedules シートへ保存する
+ * スクレイピング結果のプレビューを返す（schedules シートには書かない）
  *
- * IMPORTHTML 方式(D-016):
- *   UrlFetchApp の代わりに、スプレッドシートの IMPORTHTML 関数が取得したデータを
- *   sheet.getDataRange().getValues() で読み込む。
- *   WAF ブロック問題を回避し、Google サービス間の通信として安定動作する。
+ * デバッグページ（docs/debug.html）から doGet 経由で呼ばれる。
+ * GAS エディタから手動実行しても動作確認できる（Logger で確認）。
  *
- * @param {{ facilityId: number, facilityName: string, url: string, sheetName: string|null, enabled: boolean }} facility
- * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} [ss] - 開済みスプレッドシート。省略時は内部で openById する
- * @returns {number} 保存できたスケジュール件数
- * @throws {Error} シートが存在しない場合 or パース結果を書き込めない場合
+ * @returns {{ ok: boolean, generatedAt: string, facilities: Array, errors: Array }}
  */
-function scrapeFacilitySchedule(facility, ss) {
-  // enabled=false の施設はスキップ(西総合スポーツセンターなど)
-  if (!facility.enabled) {
-    console.log('[INFO] scrapeFacilitySchedule: ' + facility.facilityName + ' は enabled=false のためスキップ');
-    return 0;
-  }
+function debugScrapePreview() {
+  var ss = _getSpreadsheet();
+  var result = {
+    ok: true,
+    generatedAt: Utilities.formatDate(new Date(), 'Asia/Tokyo', "yyyy-MM-dd'T'HH:mm:ssXXX"),
+    facilities: [],
+    errors: []
+  };
 
-  if (!ss) {
-    var spreadsheetId = getProperty('MEMBERS_SPREADSHEET_ID');
-    if (!spreadsheetId) {
-      throw new Error('MEMBERS_SPREADSHEET_ID が設定されていません。');
-    }
-    ss = SpreadsheetApp.openById(spreadsheetId);
-  }
-
-  // シートの存在確認
-  var sheet = ss.getSheetByName(facility.sheetName);
-  if (!sheet) {
-    throw new Error(
-      facility.facilityName + ' のシート(' + facility.sheetName + ')が見つかりません。' +
-      'setupScraperSheets() を先に実行してください。'
-    );
-  }
-
-  // IMPORTHTML が読み込んだデータを 2D 配列で取得
-  var values = sheet.getDataRange().getValues();
-
-  if (!values || values.length === 0) {
-    console.log('[WARN] scrapeFacilitySchedule: ' + facility.facilityName + ' のシートが空です。IMPORTHTML の読み込みを確認してください。');
-    return 0;
-  }
-
-  // パース(当月シート)
-  var schedules = parseScraperSheetValues(values, facility.facilityName);
-
-  // 翌月シートも読み込んでマージ(D-023: 翌月スケジュール検知対応)
-  if (facility.nextSheetName) {
-    var nextSheet = ss.getSheetByName(facility.nextSheetName);
-    if (nextSheet) {
-      try {
-        var nextValues = nextSheet.getDataRange().getValues();
-        if (nextValues && nextValues.length > 0) {
-          var nextSchedules = parseScraperSheetValues(nextValues, facility.facilityName, 1);
-          if (nextSchedules.length > 0) {
-            console.log('[INFO] scrapeFacilitySchedule: ' + facility.facilityName + ' 翌月シートから ' + nextSchedules.length + ' 件取得。');
-            schedules = schedules.concat(nextSchedules);
-          }
-        }
-      } catch (nextErr) {
-        logError(nextErr, { phase: 'scrapeFacilitySchedule.nextSheet', facilityId: facility.facilityId });
-      }
+  for (var i = 0; i < SCRAPER_FACILITIES.length; i++) {
+    var f = SCRAPER_FACILITIES[i];
+    try {
+      var rows = _scrapeFacility(f, ss);
+      result.facilities.push({
+        facilityId: f.facilityId,
+        facilityName: f.facilityName,
+        rowCount: rows.length,
+        rows: rows
+      });
+    } catch (err) {
+      result.errors.push({
+        facilityId: f.facilityId,
+        facilityName: f.facilityName,
+        error: err.message
+      });
+      result.ok = false;
     }
   }
 
-  if (schedules.length === 0) {
-    // パース結果が 0 件はシート構造変化の可能性があるため警告ログのみ(エラーにしない)
-    console.log('[WARN] scrapeFacilitySchedule: ' + facility.facilityName + ' のパース結果が 0 件です。シート構造を確認してください。');
-    return 0;
-  }
-
-  // スプレッドシートへ保存(addSchedule を withRetry でラップ)
-  // IIFE で schedule をキャプチャ: var はブロックスコープを持たないため
-  // コールバック内で直接ループ変数を参照すると最後の値に固定されるバグを防ぐ
-  // 個別 try/catch で 1 件失敗しても次の件を続行する(エラーポリシー §4-2)
-  var savedCount = 0;
-  for (var i = 0; i < schedules.length; i++) {
-    (function (schedule) {
-      try {
-        withRetry(function () {
-          addSchedule(schedule);
-        }, { maxAttempts: DEFAULT_MAX_ATTEMPTS, baseDelayMs: 1000, label: 'addSchedule.' + facility.facilityName });
-        savedCount++;
-      } catch (saveErr) {
-        logError(saveErr, {
-          phase: 'scrapeFacilitySchedule.save',
-          facilityName: facility.facilityName,
-          date: schedule.date
-        });
-        // 1 件失敗しても次の件は続行する
-      }
-    })(schedules[i]);
-  }
-
-  // ─── 月一覧を ScriptProperties に一時保存(D-018: 新月検知用) ───
-  // パース済みの schedules から "YYYY-MM" を重複なく抽出してソートして保存する
-  // キー: SCRAPED_MONTHS_FACILITY_<facilityId>
-  // 通知後も残す(デバッグ用・D-018)
-  _saveScrapedMonths(facility.facilityId, schedules);
-
-  return savedCount;
+  return result;
 }
 
 /**
- * パース済みスケジュール配列から月一覧を抽出して ScriptProperties に保存する(内部用)
+ * 毎日スクレイパーを実行するトリガーをセットアップする（1 回だけ実行）
  *
- * スケジュールの date("YYYY-MM-DD")から "YYYY-MM" 部分を抽出し、
- * 重複を除いてソートした配列を JSON.stringify して ScriptProperties に保存する。
- * 通知後も消さず残す(デバッグ用・D-018)。
+ * 午前 9〜10 時のタイムトリガーを設定する（D-007）。
+ * 既存の scrapeAllFacilities トリガーがある場合は削除してから再作成する。
+ */
+function setupScraperTrigger() {
+  var FUNC = 'scrapeAllFacilities';
+  var triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === FUNC) {
+      ScriptApp.deleteTrigger(triggers[i]);
+    }
+  }
+  ScriptApp.newTrigger(FUNC).timeBased().atHour(9).everyDays(1).create();
+  console.log('[INFO] setupScraperTrigger: scrapeAllFacilities の毎日午前 9 時トリガーをセットしました。');
+}
+
+// ─────────────────────────────────────────────
+// 内部関数: スクレイピング本体
+// ─────────────────────────────────────────────
+
+/**
+ * 1 施設のスクレイピング処理（当月 + 翌月）
  *
- * @param {number} facilityId - 施設 ID
- * @param {Array<{date: string}>} schedules - parseScraperSheetValues の戻り値
+ * @param {{ facilityId, facilityName, sheetName, nextSheetName }} facilityConfig
+ * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss
+ * @returns {Array<Object>}
  * @private
  */
-function _saveScrapedMonths(facilityId, schedules) {
-  // "YYYY-MM" の重複なし一覧を作る
-  var monthMap = {};
-  for (var i = 0; i < schedules.length; i++) {
-    var date = schedules[i].date; // "YYYY-MM-DD"
-    if (date && date.length >= 7) {
-      var ym = date.substring(0, 7); // "YYYY-MM"
-      monthMap[ym] = true;
+function _scrapeFacility(facilityConfig, ss) {
+  var scrapedAt = Utilities.formatDate(new Date(), 'Asia/Tokyo', "yyyy-MM-dd'T'HH:mm:ssXXX");
+  var rows = [];
+
+  // 当月シート
+  var sheet = ss.getSheetByName(facilityConfig.sheetName);
+  if (!sheet) {
+    throw new Error(
+      facilityConfig.sheetName + ' シートが見つかりません。' +
+      'setupScraperSheets() を実行してください。'
+    );
+  }
+  var values = sheet.getDataRange().getValues();
+  if (values && values.length > 0) {
+    rows = rows.concat(
+      _parseTableToRows(values, facilityConfig.facilityId, facilityConfig.facilityName, 0, scrapedAt)
+    );
+  } else {
+    console.log('[WARN] _scrapeFacility: ' + facilityConfig.sheetName +
+      ' が空です。IMPORTHTML の読み込みを確認してください。');
+  }
+
+  // 翌月シート（なければ無視）
+  var nextSheet = ss.getSheetByName(facilityConfig.nextSheetName);
+  if (nextSheet) {
+    try {
+      var nextValues = nextSheet.getDataRange().getValues();
+      if (nextValues && nextValues.length > 0) {
+        var nextRows = _parseTableToRows(
+          nextValues, facilityConfig.facilityId, facilityConfig.facilityName, 1, scrapedAt
+        );
+        if (nextRows.length > 0) {
+          rows = rows.concat(nextRows);
+          console.log('[INFO] _scrapeFacility: ' + facilityConfig.facilityName +
+            ' 翌月シートから ' + nextRows.length + ' 件取得');
+        }
+      }
+    } catch (nextErr) {
+      // 翌月シートのエラーは無視して当月分だけ返す
+      console.log('[WARN] _scrapeFacility: 翌月シート読み込みエラー（当月分は取得済み）: ' + nextErr.message);
     }
   }
 
-  // キーを配列にしてソート
-  var months = [];
-  for (var ym in monthMap) {
-    if (monthMap.hasOwnProperty(ym)) {
-      months.push(ym);
-    }
-  }
-  months.sort();
-
-  var key = SCRAPED_MONTHS_KEY_PREFIX + facilityId;
-  PropertiesService.getScriptProperties().setProperty(key, JSON.stringify(months));
-  console.log('[INFO] _saveScrapedMonths: facilityId=' + facilityId + ' → ' + JSON.stringify(months));
+  return rows;
 }
 
 /**
- * IMPORTHTML シートの 2D 配列からバドミントン開放スケジュールを抽出する
+ * IMPORTHTML テーブル（2D 配列）からスケジュール行を抽出する
  *
- * IMPORTHTML はテーブルのデータ行のみをインポートするため、
- * 年・月は new Date() から取得する(ページの「2026年5月」形式テキストは取得不可)。
+ * テーブル構造（旧コードで確認済み）:
+ *   列 0: 日（例: "2日", "23日"）
+ *   列 1: 曜日（例: "木", "土"）
+ *   列 2: 個人開放バドミントン（セル表記は D-020 参照）
+ *   列 3: 個人開放卓球
+ *   列 4+: その他
  *
- * テーブル構造(確認済み・D-016):
- *   列0: 日(例: "2日", "23日")
- *   列1: 曜日(例: "木", "土")
- *   列2: 個人開放バドミントン
- *   列3: 個人開放卓球
- *   列4: 個人利用ランニングコース
- *   列5: 備考
- *
- * @param {Array<Array>} values - sheet.getDataRange().getValues() の戻り値(2D 配列)
- * @param {string} facilityName - 施設名(返却オブジェクトの facilityName に使用)
- * @param {number} [monthOffset=0] - 開始月を何ヶ月ずらすか。翌月シートを読む場合は 1 を渡す(D-023)
- * @returns {Array<{date: string, startTime: string, endTime: string, facilityName: string, note: string}>}
+ * @param {Array<Array>} values
+ * @param {string} facilityId
+ * @param {string} facilityName
+ * @param {number} monthOffset - 0: 当月 / 1: 翌月
+ * @param {string} scrapedAt - ISO datetime
+ * @returns {Array<Object>}
+ * @private
  */
-function parseScraperSheetValues(values, facilityName, monthOffset) {
+function _parseTableToRows(values, facilityId, facilityName, monthOffset, scrapedAt) {
   var results = [];
+
   var now = new Date();
   var year = now.getFullYear();
-  var month = now.getMonth() + 1 + (monthOffset || 0); // getMonth() は 0-based なので +1
-  // 月が 12 を超えた場合は翌年 1 月に繰り上げる
-  if (month > 12) {
-    month -= 12;
-    year += 1;
-  }
+  var month = now.getMonth() + 1 + (monthOffset || 0);
+  if (month > 12) { month -= 12; year++; }
 
-  // ─── バドミントン列インデックスをヘッダー行から探す ───
   var badmintonCol = _findBadmintonCol(values);
-  if (badmintonCol === DEFAULT_BADMINTON_COL) {
-    console.log('[WARN] parseScraperSheetValues: ' + facilityName + ' バドミントン列が見つかりません。デフォルト列' + DEFAULT_BADMINTON_COL + 'を使用します。');
-  } else {
-    console.log('[INFO] parseScraperSheetValues: ' + facilityName + ' バドミントン列を発見: 列' + badmintonCol);
-  }
-
-  // ─── データ行をループ ───
-  // prevDay: 直前のデータ行の「日」の値。月またぎ検知に使う(D-018 修正)
-  // 月またぎ判定: 今の日(dayNum)が直前の日(prevDay)より大きく減った場合 → 月が変わった
-  // 例: 31日 → 1日 のように dayNum < prevDay のときに month を 1 増やす
   var prevDay = null;
 
   for (var i = 0; i < values.length; i++) {
-    var dataRow = values[i];
+    var row = values[i];
+    var col0 = String(row[0] || '').trim();
 
-    // 列0のテキストを取り出す
-    var col0Text = String(dataRow[0]).trim();
+    // "X日" 形式の行だけ処理する（ヘッダー行・空行をスキップ）
+    var dayMatch = col0.match(/^(\d{1,2})日/);
+    if (!dayMatch) continue;
 
-    // /^(\d{1,2})日/ にマッチしない行はスキップ(ヘッダー行・空行など)
-    var dateMatch = col0Text.match(/^(\d{1,2})日/);
-    if (!dateMatch) {
-      continue;
-    }
+    var dayNum = parseInt(dayMatch[1], 10);
 
-    var dayNum = parseInt(dateMatch[1], 10);
-
-    // 月またぎ検知(D-018): 直前の日より15日以上減った場合のみ翌月と判定する
-    // しきい値15: 同月内で15日以上後退する暦上のケースはないため誤検知を防ぐ
+    // 月またぎ検知: 前日より 15 日以上小さくなったら翌月に繰り上げる
     if (prevDay !== null && (prevDay - dayNum) > 15) {
       month++;
-      if (month > 12) {
-        month = 1;
-        year++;
-      }
-      console.log('[INFO] parseScraperSheetValues: ' + facilityName + ' 月またぎを検知(' + prevDay + '日 → ' + dayNum + '日)。' + year + '-' + ('0' + month).slice(-2) + ' に移行。');
+      if (month > 12) { month = 1; year++; }
+      console.log('[INFO] _parseTableToRows: ' + facilityName +
+        ' 月またぎ検知（' + prevDay + '日→' + dayNum + '日）。' +
+        year + '-' + ('0' + month).slice(-2) + ' へ移行。');
     }
     prevDay = dayNum;
 
-    var fullDate = _buildDate(year, month, dayNum);
+    var fullDate = _buildDateStr(year, month, dayNum);
+    var cellText = (badmintonCol < row.length) ? String(row[badmintonCol] || '').trim() : '';
 
-    // バドミントン列の値を取得
-    if (badmintonCol >= dataRow.length) {
-      continue; // 行の列数が足りない場合はスキップ
-    }
-    var cellText = String(dataRow[badmintonCol]).trim();
+    if (_isUnavailable(cellText)) continue;
 
-    // × 始まり / 休館日 / 空 / ー /  などは除外
-    if (_isExcluded(cellText)) {
+    var slots = _parseSlotsFromCell(cellText, facilityId);
+
+    if (slots.length === 0) {
+      console.log('[WARN] _parseTableToRows: スロット抽出できず（スキップ）' +
+        ' date=' + fullDate + ' text="' + cellText + '"');
       continue;
     }
 
-    // 〇 / ○ / △ 始まりでなければスキップ
-    if (!_isValid(cellText)) {
-      continue;
+    // 亀田のみ: end_time をルールで計算（D-024）
+    if (facilityId === '429') {
+      slots = _calcKamedaEndTimes(slots, fullDate);
     }
 
-    // 時刻を抽出
-    var times = _extractTimesFromCell(cellText);
-
-    // note を生成
-    var note = _buildNoteFromCell(cellText);
-
-    results.push({
-      date: fullDate,
-      startTime: times.startTime,
-      endTime: times.endTime,
-      facilityName: facilityName,
-      note: note
-    });
+    for (var s = 0; s < slots.length; s++) {
+      results.push({
+        date: fullDate,
+        start_time: slots[s].start_time,
+        end_time: slots[s].end_time || '',
+        facility_name: facilityName,
+        pattern: slots[s].pattern,
+        scraped_at: scrapedAt,
+        floor_map_url: ''
+      });
+    }
   }
 
   return results;
 }
 
 // ─────────────────────────────────────────────
-// F-2-2: 更新検知による自動起動
+// 内部関数: セルテキストパーサー
 // ─────────────────────────────────────────────
 
 /**
- * 更新検知 → スクレイピング → 質問配信 のメインフロー
+ * 施設ごとのパーサーにルーティングする
  *
- * GAS の time-based trigger から毎朝 7 時に呼ばれる。
- * 処理の流れ:
- *   1. enabled な施設それぞれの IMPORTHTML シートを読み込む
- *   2. 前回取得時の SHA-256 ハッシュ(ScriptProperties に保存)と比較する
- *   3. 1 つでも変化があれば scrapeAllFacilities() → handleDistributeSurvey() を実行
- *   4. 変化がなければ何もしない
- *   5. 新しいハッシュを ScriptProperties に保存する
+ * 先頭の ○/〇/△ プレフィックスを除去してからパーサーに渡す。
  *
- * ハッシュキー名(D-013 で確定):
- *   'HASH_FACILITY_<facilityId>' — 例: 'HASH_FACILITY_420'
- *
- * シートが存在しない施設はスキップ(setupScraperSheets 未実行でも他施設は続行)。
- *
- * @returns {{updated: boolean, changedFacilities: Array<number>}}
- */
-function checkAndScrapeIfUpdated() {
-  var changedFacilities = [];
-  var newHashes = {};
-
-  var spreadsheetId = getProperty('MEMBERS_SPREADSHEET_ID');
-  if (!spreadsheetId) {
-    logError(new Error('MEMBERS_SPREADSHEET_ID が設定されていません。'), { phase: 'checkAndScrapeIfUpdated' });
-    return { updated: false, changedFacilities: [] };
-  }
-  var ss = SpreadsheetApp.openById(spreadsheetId);
-
-  // ─── 各施設のシート内容を取得してハッシュを計算 ───
-  for (var i = 0; i < FACILITIES.length; i++) {
-    var facility = FACILITIES[i];
-
-    if (!facility.enabled || !facility.sheetName) {
-      continue; // 無効施設はスキップ
-    }
-
-    var sheet = ss.getSheetByName(facility.sheetName);
-    if (!sheet) {
-      // setupScraperSheets 未実行の場合はログを出してスキップ(エラーにしない)
-      console.log('[WARN] checkAndScrapeIfUpdated: ' + facility.sheetName + ' シートが存在しません。setupScraperSheets() を実行してください。');
-      continue;
-    }
-
-    try {
-      var values = sheet.getDataRange().getValues();
-      // JSON.stringify でシート内容全体をテキスト化してハッシュ計算
-      var sheetText = JSON.stringify(values);
-      var newHash = _computeSha256Hex(sheetText);
-      newHashes[facility.facilityId] = newHash;
-
-      // 前回ハッシュと比較
-      var hashKey = HASH_KEY_PREFIX + facility.facilityId;
-      var prevHash = getProperty(hashKey);
-
-      if (prevHash !== newHash) {
-        changedFacilities.push(facility.facilityId);
-        console.log('[INFO] checkAndScrapeIfUpdated: ' + facility.facilityName + ' の更新を検知しました。');
-      }
-
-      // 翌月シートのハッシュも監視(D-023: 翌月スケジュール検知対応)
-      if (facility.nextSheetName) {
-        var nextSheet = ss.getSheetByName(facility.nextSheetName);
-        if (nextSheet) {
-          var nextValues = nextSheet.getDataRange().getValues();
-          var nextHash = _computeSha256Hex(JSON.stringify(nextValues));
-          var nextFacilityKey = facility.facilityId + '_NEXT';
-          newHashes[nextFacilityKey] = nextHash;
-
-          var prevNextHash = getProperty(HASH_KEY_PREFIX + nextFacilityKey);
-          if (prevNextHash !== nextHash) {
-            if (changedFacilities.indexOf(facility.facilityId) === -1) {
-              changedFacilities.push(facility.facilityId);
-            }
-            console.log('[INFO] checkAndScrapeIfUpdated: ' + facility.facilityName + ' の翌月シートの更新を検知しました。');
-          }
-        }
-      }
-    } catch (err) {
-      logError(err, { phase: 'checkAndScrapeIfUpdated.hash', facilityId: facility.facilityId });
-      // 取得失敗の施設は変化なしとして扱う(前回データを維持)
-    }
-  }
-
-  // ─── 更新があれば scrape + 配信 ───
-  if (changedFacilities.length > 0) {
-    console.log('[INFO] checkAndScrapeIfUpdated: ' + changedFacilities.length + ' 施設で更新を検知。スクレイピングを実行します。');
-
-    try {
-      // skipDailyCheck=true: シート変化が確認済みなので 1 日 1 回制限をスキップ
-      scrapeAllFacilities(true);
-    } catch (scrapeErr) {
-      logError(scrapeErr, { phase: 'checkAndScrapeIfUpdated.scrape' });
-    }
-
-    // 新月検知・通知(D-018 F-2-5)
-    // scrapeAllFacilities 実行後に SCRAPED_MONTHS_FACILITY_* が更新済みであることを前提とする
-    try {
-      _checkAndNotifyNewMonths();
-    } catch (notifyErr) {
-      logError(notifyErr, { phase: 'checkAndScrapeIfUpdated.notify' });
-    }
-
-    // アンケート自動配信は全施設揃い時のみ実行するため _checkAndNotifyNewMonths 内で行う(D-024)
-  } else {
-    console.log('[INFO] checkAndScrapeIfUpdated: 更新なし。何もしません。');
-  }
-
-  // ─── 新しいハッシュを保存(取得できた施設のみ) ───
-  var props = PropertiesService.getScriptProperties();
-  for (var facilityId in newHashes) {
-    if (newHashes.hasOwnProperty(facilityId)) {
-      props.setProperty(HASH_KEY_PREFIX + facilityId, newHashes[facilityId]);
-    }
-  }
-
-  // ─── courseGroupId を更新(F-6 対応) ───
-  // updateCourseGroupIds は内部でエラーをキャッチするため、ここでは try/catch 不要
-  updateCourseGroupIds();
-
-  return { updated: changedFacilities.length > 0, changedFacilities: changedFacilities };
-}
-
-/**
- * checkAndScrapeIfUpdated を毎朝 7 時に実行するトリガーを設定する
- *
- * 既存トリガーがある場合は重複作成しない。
- * GAS のスクリプトエディタから 1 回だけ手動実行して設定する。
- *
- * 使い方:
- *   GAS エディタの「関数を選択」で setupDailyTrigger を選び「実行」ボタンを押す。
- *
- * @returns {void}
- */
-function setupDailyTrigger() {
-  var triggers = ScriptApp.getProjectTriggers();
-
-  // 既存トリガーを確認して重複作成を防ぐ
-  for (var i = 0; i < triggers.length; i++) {
-    if (triggers[i].getHandlerFunction() === TRIGGER_FUNCTION_NAME) {
-      console.log('[INFO] setupDailyTrigger: トリガーは既に設定済みです。スキップします。');
-      return;
-    }
-  }
-
-  // 毎朝 TRIGGER_HOUR 時(7:00-8:00 の間)に実行するトリガーを作成
-  ScriptApp.newTrigger(TRIGGER_FUNCTION_NAME)
-    .timeBased()
-    .everyDays(1)
-    .atHour(TRIGGER_HOUR)
-    .create();
-
-  console.log('[INFO] setupDailyTrigger: ' + TRIGGER_FUNCTION_NAME + ' のトリガーを毎朝 ' + TRIGGER_HOUR + ' 時に設定しました。');
-}
-
-// ─────────────────────────────────────────────
-// 内部ユーティリティ
-// ─────────────────────────────────────────────
-
-/**
- * セル内容が「除外対象」かを判定する(内部用)
- *
- * 除外条件: × 始まり / ー / - / 空文字 / 「休館日」を含む / ー のみ
- *
- * 注意: 呼び出し元で String(cell).trim() した後の値を渡すこと。
- *       関数内でも trim を実施するため、trim を忘れた場合でも安全に動作する。
- *
- * @param {string} text - セルのテキスト
- * @returns {boolean} true なら除外
+ * @param {string} cellText
+ * @param {string} facilityId
+ * @returns {Array<{start_time, end_time?, pattern}>}
  * @private
  */
-function _isExcluded(text) {
-  // 関数内でも trim して、呼び出し元の trim 漏れに対して堅牢にする
-  text = String(text || '').trim();
+function _parseSlotsFromCell(cellText, facilityId) {
+  // ○/〇/△ プレフィックスを除去
+  var text = cellText.replace(/^[○〇△◯]+\s*/, '').trim();
 
-  if (!text) {
-    return true;
-  }
-  // × またはその全角変種(半角 x は含めない — IMPORTHTML では文字化けせず正確に × が取れる)
-  if (/^[×✕]/.test(text)) {
-    return true;
-  }
-  // ー(長音符)または半角ハイフンのみ
-  if (/^[ー\-]$/.test(text)) {
-    return true;
-  }
-  // 「休館日」を含む場合はスキップ
-  if (text.indexOf('休館日') !== -1) {
-    return true;
-  }
-  return false;
+  if (facilityId === '420') return _parseSlotsForToya(text);
+  if (facilityId === '413') return _parseSlotsForHigashi(text);
+  if (facilityId === '429') return _parseSlotsForKameda(text);
+  return [];
 }
 
 /**
- * 指定日の施設のステータスをスプレッドシートから判定する
+ * 鳥屋野（420）セルパーサー
  *
- * 予約日の月に応じて当月シート(scraper-{facilityId})または
- * 翌月シート(scraper-{facilityId}-next)を参照し、以下のルールで判定する:
- *   - シートが存在しない          → "unpublished"
- *   - バドミントン列に「休館日」で始まる行が1件以上ある → "closed"
- *   - parseScraperSheetValues のパース結果が 0件 → "unpublished"
- *   - 1件以上                     → "available"
+ * セル例: "9-13大体育室 A / 13‐21中体育室 B"
+ * ハイフン 2 種対応: U+002D（半角）/ U+2010（Unicode）（D-020 警告）
  *
- * @param {string} facilityId - 施設ID文字列("420" / "413" / "429")
- * @param {string} facilityName - 施設名(ログ・parseScraperSheetValues に使用)
- * @param {string} reservationDateStr - 予約日 "YYYY-MM-DD" 形式
- * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss - 開済みスプレッドシート
- * @returns {'available'|'unpublished'|'closed'} ステータス文字列。
- *   'error' はこの関数では返さない。エラーは例外をスローし、呼び出し元が FACILITY_STATUS.ERROR に変換する。
- */
-function getFacilityStatusForDate(facilityId, facilityName, reservationDateStr, ss) {
-  // CacheService でシートアクセスを1時間キャッシュ
-  var cacheKey = 'facilityStatus_' + facilityId + '_' + reservationDateStr;
-  var cache = CacheService.getScriptCache();
-  var cached = cache.get(cacheKey);
-  if (cached) {
-    return cached;
-  }
-
-  var nowJst = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM-dd');
-  var currentYear = parseInt(nowJst.substring(0, 4), 10);
-  var currentMonth = parseInt(nowJst.substring(5, 7), 10);
-
-  // 予約日の年月・日を取得
-  var reservationYear  = parseInt(reservationDateStr.substring(0, 4), 10);
-  var reservationMonth = parseInt(reservationDateStr.substring(5, 7), 10);
-  var reservationDay   = parseInt(reservationDateStr.substring(8, 10), 10);
-
-  // 当月か翌月かを判定してシート名を決める
-  var isNextMonth = (reservationYear > currentYear) ||
-                    (reservationYear === currentYear && reservationMonth > currentMonth);
-  var sheetName = isNextMonth
-    ? 'scraper-' + facilityId + '-next'
-    : 'scraper-' + facilityId;
-  var monthOffset = isNextMonth ? 1 : 0;
-
-  var status;
-  var sheet = ss.getSheetByName(sheetName);
-  if (!sheet) {
-    console.log('[INFO] getFacilityStatusForDate: ' + sheetName + ' シートが存在しません。unpublished を返します。');
-    status = FACILITY_STATUS.UNPUBLISHED;
-    cache.put(cacheKey, status, 3600 + Math.floor(Math.random() * 600) - 300);
-    return status;
-  }
-
-  var values = sheet.getDataRange().getValues();
-  if (!values || values.length === 0) {
-    status = FACILITY_STATUS.UNPUBLISHED;
-    cache.put(cacheKey, status, 3600 + Math.floor(Math.random() * 600) - 300);
-    return status;
-  }
-
-  // ─── バドミントン列インデックスをヘッダー行から探す(DRY) ───
-  var badmintonCol = _findBadmintonCol(values);
-
-  // ─── 休館日チェック: 予約日の行だけを対象に「休館日」で始まるか確認 ───
-  var targetDayRe = new RegExp('^' + reservationDay + '日(?!\\d)');
-  for (var i = 0; i < values.length; i++) {
-    var col0 = String(values[i][0]).trim();
-    if (!targetDayRe.test(col0)) continue; // 予約日の行以外はスキップ
-    if (badmintonCol >= values[i].length) continue;
-    var cellVal = String(values[i][badmintonCol]).trim();
-    if (cellVal.indexOf('休館日') === 0) {
-      console.log('[INFO] getFacilityStatusForDate: ' + facilityName + ' ' + reservationDay + '日 休館日を検出。closed を返します。');
-      status = FACILITY_STATUS.CLOSED;
-      cache.put(cacheKey, status, 3600 + Math.floor(Math.random() * 600) - 300);
-      return status;
-    }
-  }
-
-  // ─── スケジュール公開確認: パース結果が 0件なら unpublished ───
-  var parsed = parseScraperSheetValues(values, facilityName, monthOffset);
-  if (parsed.length === 0) {
-    console.log('[INFO] getFacilityStatusForDate: ' + facilityName + ' パース結果0件。unpublished を返します。');
-    status = FACILITY_STATUS.UNPUBLISHED;
-    cache.put(cacheKey, status, 3600 + Math.floor(Math.random() * 600) - 300);
-    return status;
-  }
-
-  status = FACILITY_STATUS.AVAILABLE;
-  cache.put(cacheKey, status, 3600);
-  return status;
-}
-
-/**
- * スクレイパーシートのセルテキストから、指定開始時刻に該当するパターン記号を抽出する(内部用)
- *
- * 施設ごとの表記ゆれに対応した4フォーマットを順に試みる:
- *   Format 1 (東総合): "9-13時 B"  / "9-11時 A 11-21時 ×"  (複数セグメントは一行に並ぶ場合あり)
- *   Format 2 (鳥屋野): "13‐21中体育室" / "9-11大体育室"  (時の字なし・施設名で判定)
- *   Format 3 (亀田・終了時刻あり): "9時～15時Aパターン"
- *   Format 4 (亀田・終了時刻なし): "19時～Dパターン"  (endH は次セグメントで補完)
- *
- * セル全体が × / 休館日 → '' を返す。
- * 時間帯内が × のセグメント → そのセグメントに対して '' を返す。
- * どの時間帯にも該当しない場合 → '' を返す。
- *
- * @param {string} cellText      - スクレイパーシートのセル値(改行 \n を含む場合あり)
- * @param {number} slotStartHour - 予約開始時刻の時(0-23)
- * @returns {string} パターン記号 'A'〜'D' または '' (未判定・閉館)
+ * @param {string} text
+ * @returns {Array<{start_time, end_time, pattern}>}
  * @private
  */
-function _extractPatternForHour(cellText, slotStartHour) {
-  var text = String(cellText || '').trim();
-  if (!text) return '';
-
-  // セル全体が × または 休館日 → 閉館
-  if (/^[×✕]/.test(text) || text.indexOf('休館日') !== -1) return '';
-
-  var segments = [];
-  var lines = text.split(/[\n\r]+/);
-
-  for (var li = 0; li < lines.length; li++) {
-    var line = lines[li].trim();
-    if (!line) continue;
-
-    // 行頭の記号・前置詞を除去
-    line = line
-      .replace(/^[○〇△]\s*/, '')
-      .replace(/^予約\s*/, '')
-      .replace(/^空き状況\s*/, '');
-    if (!line) continue;
-
-    // Format 3: "9時～15時Aパターン" (亀田・終了時刻あり)
-    var re3 = /(\d{1,2})時\s*[〜～]\s*(\d{1,2})時\s*([A-D])パターン/g;
-    var m3;
-    var found3 = false;
-    while ((m3 = re3.exec(line)) !== null) {
-      found3 = true;
-      segments.push({ startH: parseInt(m3[1], 10), endH: parseInt(m3[2], 10), pattern: m3[3] });
-    }
-    if (found3) continue;
-
-    // Format 4: "19時～Dパターン" (亀田・終了時刻なし → 次セグメントで補完)
-    var re4 = /(\d{1,2})時\s*[〜～]\s*([A-D])パターン/g;
-    var m4;
-    var found4 = false;
-    while ((m4 = re4.exec(line)) !== null) {
-      found4 = true;
-      segments.push({ startH: parseInt(m4[1], 10), endH: 24, pattern: m4[2] });
-    }
-    if (found4) continue;
-
-    // Format 1: "9-13時 B" / "11-21時 ×"  (東総合・鳥屋野の一部)
-    // ハイフン類: 半角- / 全角－ / Unicodeハイフン‐ / マイナス−
-    var re1 = /(\d{1,2})\s*[-－‐−]\s*(\d{1,2})時\s*([A-D×✕])/g;
-    var m1;
-    var found1 = false;
-    while ((m1 = re1.exec(line)) !== null) {
-      found1 = true;
-      var pat1 = m1[3];
-      segments.push({
-        startH: parseInt(m1[1], 10),
-        endH:   parseInt(m1[2], 10),
-        pattern: /[×✕]/.test(pat1) ? '' : pat1
+function _parseSlotsForToya(text) {
+  var slots = [];
+  var parts = text.split('/');
+  for (var i = 0; i < parts.length; i++) {
+    var part = parts[i].trim();
+    // 例: "9-13大体育室 A" / "13‐21中体育室 B"
+    var m = part.match(/(\d{1,2})[\-‐](\d{1,2})[^\s]*\s+([A-D])/);
+    if (m) {
+      slots.push({
+        start_time: _padHour(parseInt(m[1], 10)),
+        end_time: _padHour(parseInt(m[2], 10)),
+        pattern: m[3]
       });
     }
-    if (found1) continue;
-
-    // Format 2: "13‐21中体育室" / "9-11大体育室" (鳥屋野)
-    var re2 = /(\d{1,2})\s*[-－‐−]\s*(\d{1,2})\s*(大体育室|中体育室)\s*([A-D])?/g;
-    var m2;
-    var found2 = false;
-    while ((m2 = re2.exec(line)) !== null) {
-      found2 = true;
-      var pat2 = m2[4] || _courseTextToLabel(m2[3]);
-      segments.push({ startH: parseInt(m2[1], 10), endH: parseInt(m2[2], 10), pattern: pat2 });
-    }
-    if (found2) continue;
-
-    // Fallback: "Aパターン" / "A" 単独 / 大体育室・中体育室 単独
-    var mFbPat = line.match(/([A-D])パターン/);
-    if (mFbPat) { segments.push({ startH: 0, endH: 24, pattern: mFbPat[1] }); continue; }
-    var mFbSingle = line.match(/^([A-D])$/);
-    if (mFbSingle) { segments.push({ startH: 0, endH: 24, pattern: mFbSingle[1] }); continue; }
-    var mFbCourse = _courseTextToLabel(line);
-    if (mFbCourse) { segments.push({ startH: 0, endH: 24, pattern: mFbCourse }); }
   }
-
-  // Format 4 の endH=24 を次のセグメントの startH で補完
-  for (var si = 0; si < segments.length - 1; si++) {
-    if (segments[si].endH === 24 && segments[si + 1].startH > 0) {
-      segments[si].endH = segments[si + 1].startH;
-    }
-  }
-
-  // slotStartHour が属するセグメントを返す
-  for (var sj = 0; sj < segments.length; sj++) {
-    var seg = segments[sj];
-    if (slotStartHour >= seg.startH && slotStartHour < seg.endH) {
-      return seg.pattern;
-    }
-  }
-
-  // セグメントが1件で全日扱い(startH=0, endH=24)なら無条件に返す
-  if (segments.length === 1 && segments[0].startH === 0 && segments[0].endH === 24) {
-    return segments[0].pattern;
-  }
-
-  return '';
+  return slots;
 }
 
 /**
- * 指定施設・日付・開始時刻に対応するパターン記号をスクレイパーシートから取得する
+ * 東総合（413）セルパーサー
  *
- * 予約日が当月なら scraper-{facilityId}、翌月なら scraper-{facilityId}-next シートを参照する。
- * シートが存在しない場合や該当行が見つからない場合は '' を返す。
- *
- * @param {string} facilityId           - 施設ID ("420" / "413" / "429")
- * @param {string} reservationDateStr   - 予約日 "YYYY-MM-DD"
- * @param {number} slotStartHour        - 予約開始時刻の時(0-23)
- * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss - 開済みスプレッドシート
- * @returns {string} パターン記号 'A'〜'D' または '' (不明・閉館)
- */
-function getScraperPatternForSlot(facilityId, reservationDateStr, slotStartHour, ss) {
-  var nowJst = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM-dd');
-  var currentYear  = parseInt(nowJst.substring(0, 4), 10);
-  var currentMonth = parseInt(nowJst.substring(5, 7), 10);
-
-  var reservationYear  = parseInt(reservationDateStr.substring(0, 4), 10);
-  var reservationMonth = parseInt(reservationDateStr.substring(5, 7), 10);
-  var reservationDay   = parseInt(reservationDateStr.substring(8, 10), 10);
-
-  var isNextMonth = (reservationYear > currentYear) ||
-                    (reservationYear === currentYear && reservationMonth > currentMonth);
-  var sheetName = isNextMonth
-    ? 'scraper-' + facilityId + '-next'
-    : 'scraper-' + facilityId;
-
-  var sheet = ss.getSheetByName(sheetName);
-  if (!sheet) return '';
-
-  var values = sheet.getDataRange().getValues();
-  if (!values || values.length === 0) return '';
-
-  var badmintonCol = _findBadmintonCol(values);
-
-  var targetDayRe = new RegExp('^' + reservationDay + '日(?!\\d)');
-  for (var i = 0; i < values.length; i++) {
-    var col0 = String(values[i][0]).trim();
-    if (!targetDayRe.test(col0)) continue;
-    if (badmintonCol >= values[i].length) continue;
-    var cellVal = String(values[i][badmintonCol]).trim();
-    if (!cellVal) continue;
-    return _extractPatternForHour(cellVal, slotStartHour);
-  }
-
-  return '';
-}
-
-/**
- * セル内容が「有効」(〇 / ○ / △)かを判定する(内部用)
+ * セル例: "9-17時 A / 17-21時 B"
  *
  * @param {string} text
- * @returns {boolean} true なら有効
+ * @returns {Array<{start_time, end_time, pattern}>}
  * @private
  */
-function _isValid(text) {
-  // 〇・○・△ のいずれかで始まる
-  return /^[〇○△]/.test(text);
-}
-
-/**
- * セルテキストから開始・終了時刻を抽出する(内部用)
- *
- * 対応パターン:
- *   パターン1: "9-11" / "9〜11" / "9～11" / "13‐21" 形式(コロンなしの時刻範囲)
- *     対象区切り文字: 半角ハイフン(-) / 全角ハイフン(－) / 波ダッシュ(〜～) / Unicodeハイフン(‐ U+2010)
- *     「9日」などとの誤マッチを防ぐため後方否定先読みで「日」を除外
- *     時刻が 0〜24 の範囲なら有効(それ以外は 終日 にフォールバック)
- *   パターン2: "18:00〜20:00" 形式(コロンあり HH:mm 形式)
- *   上記なし: startTime / endTime ともに "終日"
- *
- * @param {string} text
- * @returns {{ startTime: string, endTime: string }}
- * @private
- */
-function _extractTimesFromCell(text) {
-  // パターン2: "HH:mm〜HH:mm" 形式(先にチェック・より具体的なパターン)
-  var colonRange = text.match(/(\d{1,2}:\d{2})[〜\-～](\d{1,2}:\d{2})/);
-  if (colonRange) {
-    return { startTime: colonRange[1], endTime: colonRange[2] };
-  }
-
-  // パターン1: "9-11" / "9〜11" / "13‐21" 形式(コロンなし)
-  // [－\-〜～‐] = 全角ハイフン / 半角ハイフン / 波ダッシュ2種 / Unicode U+2010 ハイフン
-  // 後方否定先読み (?![\d日]) で "9日" や "11-12日" との誤マッチを防ぐ
-  var hourRange = text.match(/(\d{1,2})[－\-〜～‐](\d{1,2})(?![\d日])/);
-  if (hourRange) {
-    var startH = parseInt(hourRange[1], 10);
-    var endH = parseInt(hourRange[2], 10);
-    // 時刻が 0〜24 の範囲であることを確認
-    if (startH >= 0 && startH <= 24 && endH >= 0 && endH <= 24) {
-      var startStr = (startH < 10 ? '0' : '') + startH + ':00';
-      var endStr = (endH < 10 ? '0' : '') + endH + ':00';
-      return { startTime: startStr, endTime: endStr };
+function _parseSlotsForHigashi(text) {
+  var slots = [];
+  var parts = text.split('/');
+  for (var i = 0; i < parts.length; i++) {
+    var part = parts[i].trim();
+    // 例: "9-17時 A"
+    var m = part.match(/(\d{1,2})[\-‐](\d{1,2})時\s*([A-D])/);
+    if (m) {
+      slots.push({
+        start_time: _padHour(parseInt(m[1], 10)),
+        end_time: _padHour(parseInt(m[2], 10)),
+        pattern: m[3]
+      });
     }
   }
-
-  // どちらにもマッチしない場合は「終日」
-  return { startTime: '終日', endTime: '終日' };
+  return slots;
 }
 
 /**
- * セルテキストから note(備考)を生成する(内部用)
+ * 亀田（429）セルパーサー
  *
- * 処理の流れ:
- *   1. "△" のみ → "要確認" を返す
- *   2. "△ + テキスト" → △ 以降のテキスト部分を返す(空なら "要確認")
- *   3. "〇/○" 始まり → 記号・時刻部分を除去した残りを返す
+ * セル例: "9時～Aパターン 19時～Cパターン"
+ * end_time はこの関数では返さない（_calcKamedaEndTimes で後から計算する）。
+ * 波ダッシュ 3 種対応: U+301C / U+FF5E / U+007E（D-020）
  *
  * @param {string} text
- * @returns {string}
+ * @returns {Array<{start_time, pattern}>}  ← end_time は含まない
  * @private
  */
-function _buildNoteFromCell(text) {
-  // △ 始まりの処理
-  if (/^△/.test(text)) {
-    var afterDelta = text.match(/^△\s*(.*)/);
-    if (afterDelta) {
-      // △ 以降のテキストから時刻部分を除去する(○ の処理と同じルール)
-      // 例: "13‐21中体育室" → "中体育室" / "18時頃開放予定" → そのまま保持
-      var deltaRemainder = afterDelta[1]
-        .replace(/\d{1,2}:\d{2}[〜\-～]\d{1,2}:\d{2}/g, ' ')   // "HH:mm〜HH:mm" 形式を除去
-        .replace(/\d{1,2}:\d{2}/g, ' ')                          // 単体時刻を除去
-        .replace(/\d{1,2}[－\-〜～‐]\d{1,2}(?![\d日])/g, ' ')  // "9-11" / "13‐21" 形式を除去
-        .replace(/\s+/g, ' ')
-        .trim();
-      return deltaRemainder || '要確認';
-    }
-    return '要確認';
+function _parseSlotsForKameda(text) {
+  var slots = [];
+  // ～ (U+FF5E), 〜 (U+301C), ~ (U+007E) いずれにも対応
+  var re = /(\d{1,2})時[〜～~]([A-D])パターン/g;
+  var m;
+  while ((m = re.exec(text)) !== null) {
+    slots.push({
+      start_time: _padHour(parseInt(m[1], 10)),
+      pattern: m[2]
+    });
   }
-
-  // 〇 / ○ 始まりの処理
-  // 時刻パターンはスペースに置き換えてから正規化する(除去すると前後の単語が詰まるため)
-  var cleaned = text
-    .replace(/^[〇○]/, '')                                    // 先頭の記号を除去
-    .replace(/\d{1,2}:\d{2}[〜\-～]\d{1,2}:\d{2}/g, ' ')    // "HH:mm〜HH:mm" 形式をスペースに置換
-    .replace(/\d{1,2}:\d{2}/g, ' ')                          // 単体時刻をスペースに置換
-    .replace(/\d{1,2}[－\-〜～‐]\d{1,2}(?![\d日])/g, ' ')   // "9-11" / "13‐21" 形式をスペースに置換
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  return cleaned;
+  return slots;
 }
 
 /**
- * 年・月・日から YYYY-MM-DD 形式の日付文字列を返す(内部用)
+ * 亀田の end_time を計算する（D-024）
  *
- * @param {number} year
- * @param {number} month
- * @param {number} day
- * @returns {string} 例: '2026-05-15'
+ * ルール:
+ *   - 同日に複数スロットがある場合: 次のスロットの start_time が end_time
+ *   - 最終スロット: 平日（月〜土）→ '21:00' / 日曜・祝日 → '17:00'
+ *
+ * @param {Array<{start_time, pattern}>} slots
+ * @param {string} date - 'YYYY-MM-DD'
+ * @returns {Array<{start_time, end_time, pattern}>}
  * @private
  */
-function _buildDate(year, month, day) {
-  var mm = ('0' + month).slice(-2);
-  var dd = ('0' + day).slice(-2);
-  return year + '-' + mm + '-' + dd;
-}
+function _calcKamedaEndTimes(slots, date) {
+  if (!slots || slots.length === 0) return [];
 
-/**
- * 文字列の SHA-256 ハッシュを 16 進文字列で返す(内部用)
- *
- * Utilities.computeDigest は byte 配列を返すため、16 進文字列に変換する。
- * byte は -128〜127 の符号付き整数なので、負の場合は 256 を足して 0〜255 に変換する。
- *
- * @param {string} text
- * @returns {string} SHA-256 の 16 進文字列(64 文字)
- * @private
- */
-function _computeSha256Hex(text) {
-  var bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, text, Utilities.Charset.UTF_8);
-  return bytes.map(function (b) {
-    var hex = (b < 0 ? b + 256 : b).toString(16);
-    return hex.length === 1 ? '0' + hex : hex;
-  }).join('');
-}
-
-/**
- * 施設の連続失敗カウントをリセットする(内部用)
- *
- * @param {number} facilityId
- * @private
- */
-function _resetFailCount(facilityId) {
-  PropertiesService.getScriptProperties()
-    .setProperty(FAIL_COUNT_KEY_PREFIX + facilityId, '0');
-}
-
-/**
- * 施設の連続失敗カウントを加算し、しきい値超えなら管理者通知を送る(内部用)
- *
- * 連続失敗カウントのキー: 'FAIL_COUNT_FACILITY_<facilityId>'
- * FAIL_THRESHOLD(3) に達したら pushText で管理者に通知する。
- * 管理者の userId は ScriptProperties 'ADMIN_USER_ID' から取得する。
- *
- * @param {{ facilityId: number, facilityName: string }} facility
- * @private
- */
-function _incrementFailCountAndNotifyIfNeeded(facility) {
-  var key = FAIL_COUNT_KEY_PREFIX + facility.facilityId;
-  var currentCount = parseInt(getProperty(key) || '0', 10);
-  var newCount = currentCount + 1;
-  PropertiesService.getScriptProperties().setProperty(key, String(newCount));
-
-  if (newCount >= FAIL_THRESHOLD) {
-    console.log('[WARN] ' + facility.facilityName + ' が ' + newCount + ' 日連続でスクレイピングに失敗しています。管理者に通知します。');
-    var adminUserId = getProperty('ADMIN_USER_ID');
-    if (adminUserId) {
-      try {
-        pushText(
-          adminUserId,
-          '[Bot 警告] ' + facility.facilityName + ' のスケジュール取得が ' + newCount + ' 日連続で失敗しています。シートの IMPORTHTML を確認してください。'
-        );
-      } catch (notifyErr) {
-        logError(notifyErr, { phase: '_incrementFailCountAndNotifyIfNeeded.push', facilityId: facility.facilityId });
-      }
+  var result = [];
+  for (var i = 0; i < slots.length; i++) {
+    var endTime;
+    if (i < slots.length - 1) {
+      endTime = slots[i + 1].start_time;
+    } else {
+      endTime = _isHolidayOrSunday(date) ? '17:00' : '21:00';
     }
+    result.push({
+      start_time: slots[i].start_time,
+      end_time: endTime,
+      pattern: slots[i].pattern
+    });
   }
+  return result;
 }
 
 // ─────────────────────────────────────────────
-// F-6: courseGroupId 自動更新
+// 内部関数: schedules シート読み書き
 // ─────────────────────────────────────────────
 
-/** courseGroupId 取得用シートの名前(固定) */
-var COURSE_ID_SHEET_NAME = 'courseids';
+/**
+ * schedules シートに行を upsert する
+ *
+ * 主キー（date + start_time + facility_name）で既存行を上書き、
+ * なければ末尾に追加する。バッチ処理で効率化。
+ *
+ * @param {Array<Object>} rows
+ * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss
+ * @private
+ */
+function _upsertScheduleRows(rows, ss) {
+  if (!rows || rows.length === 0) return;
+
+  var sheet = _getOrInitSchedulesSheet(ss);
+  var lastRow = sheet.getLastRow();
+
+  // 既存データを一括読み取り
+  var existingData = [];
+  var keyToIndex = {};
+  if (lastRow >= 2) {
+    existingData = sheet.getRange(2, 1, lastRow - 1, SCHED_HEADER.length).getValues();
+    for (var e = 0; e < existingData.length; e++) {
+      // 主キー: date(0) + start_time(1) + facility_name(3)
+      var key = existingData[e][0] + '|' + existingData[e][1] + '|' + existingData[e][3];
+      keyToIndex[key] = e;
+    }
+  }
+
+  var newRows = [];
+  for (var i = 0; i < rows.length; i++) {
+    var r = rows[i];
+    var rowData = [
+      r.date, r.start_time, r.end_time, r.facility_name,
+      r.pattern, r.scraped_at, r.floor_map_url || ''
+    ];
+    var rowKey = r.date + '|' + r.start_time + '|' + r.facility_name;
+
+    if (keyToIndex.hasOwnProperty(rowKey)) {
+      existingData[keyToIndex[rowKey]] = rowData;
+    } else {
+      newRows.push(rowData);
+    }
+  }
+
+  // 既存行を一括書き戻し
+  if (existingData.length > 0) {
+    sheet.getRange(2, 1, existingData.length, SCHED_HEADER.length).setValues(existingData);
+  }
+
+  // 新規行を一括追加
+  if (newRows.length > 0) {
+    var startRow = (lastRow < 2 ? 2 : lastRow + 1);
+    // 既存行を書き直した後のシートの最終行を再取得
+    startRow = sheet.getLastRow() + 1;
+    sheet.getRange(startRow, 1, newRows.length, SCHED_HEADER.length).setValues(newRows);
+  }
+
+  SpreadsheetApp.flush();
+}
 
 /**
- * courseGroupId 取得用の IMPORTXML シートをセットアップする
+ * schedules シートを取得する。存在しない場合は新スキーマで作成する。
  *
- * 背景(D-016 拡張):
- *   niigata-kaikou.jp は XSERVER WAF が GAS の IP をブロックするため
- *   UrlFetchApp.fetch() が HTTP 501 で失敗する。
- *   IMPORTXML はこの制限を受けないことが確認されたため、
- *   IMPORTHTML 方式(setupScraperSheets)と同じパターンで回避する。
+ * スキーマが古い場合はログで警告する（resetSchedulesSheet() の実行を促す）。
  *
- * シート構造:
- *   A1 = 鳥屋野(420)の href 式 → "/schedule/course/数字/1 or 2" が縦並び
- *   B1 = 東総合(413)の href 式
- *   C1 = 鳥屋野(420)のリンクテキスト式 → "バドミントン個人開放(大体育室A)" 等が縦並び
- *   D1 = 東総合(413)のリンクテキスト式
- *   E1 = 亀田(429)の href 式
- *   F1 = 亀田(429)のリンクテキスト式
- *
- * 冪等性:
- *   各セルに既に式が設定されていれば再設定しない。
- *   毎回 updateCourseGroupIds() から呼ばれるため、余分な書き込みを避ける。
- *
- * @returns {GoogleAppsScript.Spreadsheet.Sheet} courseids シート
+ * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss
+ * @returns {GoogleAppsScript.Spreadsheet.Sheet}
+ * @private
  */
-function _setupCourseIdSheet() {
-  var spreadsheetId = getProperty('MEMBERS_SPREADSHEET_ID');
-  if (!spreadsheetId) {
-    throw new Error('MEMBERS_SPREADSHEET_ID が設定されていません。スクリプトプロパティを確認してください。');
-  }
-  var ss = SpreadsheetApp.openById(spreadsheetId);
-
-  var sheet = ss.getSheetByName(COURSE_ID_SHEET_NAME);
+function _getOrInitSchedulesSheet(ss) {
+  var sheet = ss.getSheetByName(SCHED_SHEET_NAME);
   if (!sheet) {
-    sheet = ss.insertSheet(COURSE_ID_SHEET_NAME);
-    console.log('[INFO] _setupCourseIdSheet: ' + COURSE_ID_SHEET_NAME + ' シートを新規作成しました。');
+    sheet = ss.insertSheet(SCHED_SHEET_NAME);
+    sheet.getRange(1, 1, 1, SCHED_HEADER.length).setValues([SCHED_HEADER]);
+    sheet.getRange(1, 1, 1, SCHED_HEADER.length).setFontWeight('bold');
+    sheet.setFrozenRows(1);
+    // 全列をテキスト書式に固定（日付・時刻の自動変換防止）
+    sheet.getRange(1, 1, sheet.getMaxRows(), SCHED_HEADER.length).setNumberFormat('@');
+    _setSchedulesColumnWidths(sheet);
+    console.log('[INFO] _getOrInitSchedulesSheet: schedules シートを新規作成しました（新スキーマ）。');
+    return sheet;
   }
 
-  // ─── レイアウト設計 ───────────────────────────────────────
-  // IMPORTXML("..url..","//a[...]/..")  は PARENT 要素を取得する。
-  // 親要素がリンク+テキストを含む場合、IMPORTXML が 2 列に展開する:
-  //   列 1 = リンクテキスト("○ 予約"など)
-  //   列 2 = 残りテキスト("大体育室A" / "Aパターン"など) ← ラベル判定に使う
-  //
-  // 展開先(列 2)が別の式と衝突すると #REF! になるため、
-  // 各施設の text 列の右隣を必ず空き列として確保する。
-  //
-  //   A: 鳥屋野 hrefs    B: 鳥屋野 text→ (C列にあふれる)   C: 空き
-  //   D: 東総合 hrefs    E: 東総合 text→ (F列にあふれる)   F: 空き
-  //   G: 亀田 hrefs      H: 亀田 text→  (I列にあふれる)    I: 空き
-  //
-  // 新レイアウトの判定: B1 が 鳥屋野テキスト式(facility/420 を含み @href を含まない)かどうか
-  // ─────────────────────────────────────────────────────────
-
-  var b1Formula = sheet.getRange('B1').getFormula();
-  // 新レイアウト判定: B1 が 鳥屋野テキスト式(facility/420 かつ XPath が /.. で終わる)かどうか
-  // href 式は ]/@href 、text 式は ]/.. で終わるので後者で区別する
-  var isNewLayout = b1Formula && b1Formula.indexOf('facility/420') !== -1 && b1Formula.indexOf(']/..') !== -1;
-
-  if (!isNewLayout) {
-    // 旧レイアウト(B1=東総合hrefs 等)または空 → クリアして新レイアウトに移行
-    sheet.clearContents();
-    console.log('[INFO] _setupCourseIdSheet: レイアウトを新形式(9列)に移行するためシートをクリアしました。');
-  }
-
-  // 式テンプレート
-  var hrefXpath = "//a[contains(@href,'/schedule/course/')]/@href";
-  var textXpath = "//a[contains(@href,'/schedule/course/')]/..";
-
-  var defs = [
-    { hrefCell: 'A1', textCell: 'B1', name: '鳥屋野(420)', url: 'https://niigata-kaikou.jp/facility/420/schedule' },
-    { hrefCell: 'D1', textCell: 'E1', name: '東総合(413)', url: 'https://niigata-kaikou.jp/facility/413/schedule' },
-    { hrefCell: 'G1', textCell: 'H1', name: '亀田(429)',   url: 'https://niigata-kaikou.jp/facility/429/schedule' }
-  ];
-
-  for (var i = 0; i < defs.length; i++) {
-    var def = defs[i];
-    if (!sheet.getRange(def.hrefCell).getFormula()) {
-      sheet.getRange(def.hrefCell).setFormula('=IMPORTXML("' + def.url + '","' + hrefXpath + '")');
-      console.log('[INFO] _setupCourseIdSheet: ' + def.hrefCell + ' に ' + def.name + ' href 式を設定しました。');
-    }
-    if (!sheet.getRange(def.textCell).getFormula()) {
-      sheet.getRange(def.textCell).setFormula('=IMPORTXML("' + def.url + '","' + textXpath + '")');
-      console.log('[INFO] _setupCourseIdSheet: ' + def.textCell + ' に ' + def.name + ' text 式を設定しました。');
+  // 既存シートのスキーマを確認
+  if (sheet.getLastRow() >= 1) {
+    var existingHeader = sheet.getRange(1, 1, 1, SCHED_HEADER.length).getValues()[0];
+    if (String(existingHeader[0]) !== 'date') {
+      console.log('[WARN] _getOrInitSchedulesSheet: schedules シートが旧スキーマです。' +
+        'resetSchedulesSheet() を実行して新スキーマに移行してください。');
     }
   }
 
@@ -1300,396 +622,184 @@ function _setupCourseIdSheet() {
 }
 
 /**
- * バド卓ねっとの施設スケジュールページから courseGroupId 一覧を取得し
- * ScriptProperties に上書き保存する
- *
- * 背景(F-6):
- *   _doImmediateReserve / _callScanLambda(handlers.js)は予約時に
- *   TOYA_COURSE_GROUP_IDS / HIGASHI_COURSE_GROUP_IDS を参照する。
- *   これらの ID は施設・日付ごとに異なる連番で、従来は手動登録していた。
- *   本関数でスクレイピング時に自動更新することで手動作業を排除する。
- *
- * 取得方法(IMPORTXML 方式・旧 UrlFetchApp から変更):
- *   niigata-kaikou.jp は XSERVER WAF が GAS の IP をブロックするため
- *   UrlFetchApp.fetch() が HTTP 501 で失敗することが判明(D-016)。
- *   _setupCourseIdSheet() で courseids シートに設定した IMPORTXML 式が
- *   "/schedule/course/数字/1 or 2" の href 値を列として展開する。
- *   GAS から sheet.getRange().getValues() で読み込み、末尾が "/1" の行のみ抽出する。
- *
- * エラーポリシー:
- *   courseGroupId が 0 件の場合は ScriptProperties を更新しない(フェイルセーフ)。
- *
- * @returns {void}
- */
-/**
- * コース選択リンクのテキストからパターンラベル(A/B)を返す
- * 大体育室 → "A"、中体育室 → "B"、不明 → ""(handlers.js が ID 数字にフォールバック)
+ * schedules シートの列幅を見やすく設定する（内部用）
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet
  * @private
  */
-function _courseTextToLabel(text) {
-  var t = (text || '').replace(/\s+/g, '');
-  if (t.indexOf('大体育室') >= 0) return 'A';
-  if (t.indexOf('中体育室') >= 0) return 'B';
-  return '';
-}
-
-function updateCourseGroupIds() {
-  var sheet = _setupCourseIdSheet();
-
-  // IMPORTXML の評価が完了するまで待つ(数秒かかる場合がある)
-  SpreadsheetApp.flush();
-
-  var props = PropertiesService.getScriptProperties();
-
-  /**
-   * 更新対象の施設定義(新レイアウト: 9列構成)
-   *   hrefCol    : href 列(A=0, D=3, G=6)
-   *   textCol1   : IMPORTXML text 式の列(B=1, E=4, H=7) — リンクテキストが入る
-   *   textCol2   : text 式の右隣(C=2, F=5, I=8) — 部屋名テキストがあふれ込む
-   *   両列を結合してラベル判定する
-   */
-  var targets = [
-    { hrefCol: 0, textCol1: 1, textCol2: 2, facilityName: '鳥屋野総合体育館',      propKey: PROP_TOYA_COURSE_GROUP_IDS,    labelsPropKey: PROP_TOYA_COURSE_GROUP_LABELS },
-    { hrefCol: 3, textCol1: 4, textCol2: 5, facilityName: '東総合スポーツセンター', propKey: PROP_HIGASHI_COURSE_GROUP_IDS, labelsPropKey: PROP_HIGASHI_COURSE_GROUP_LABELS },
-    { hrefCol: 6, textCol1: 7, textCol2: 8, facilityName: '亀田総合体育館',         propKey: PROP_KAMEDA_COURSE_GROUP_IDS,  labelsPropKey: PROP_KAMEDA_COURSE_GROUP_LABELS }
-  ];
-
-  // シート全体を一括取得して列ごとに処理する
-  var allValues = sheet.getDataRange().getValues();
-  var numCols = allValues.length > 0 ? allValues[0].length : 0;
-
-  for (var t = 0; t < targets.length; t++) {
-    var target = targets[t];
-    var ids = [];
-    var idSeen = {};
-    // courseGroupId → { "A": true, "B": true } のようなラベルセット
-    var idToLabels = {};
-
-    for (var r = 0; r < allValues.length; r++) {
-      var hrefCell = allValues[r][target.hrefCol];
-      // href が文字列でなければスキップ(空セル・数値・エラー値対応)
-      if (typeof hrefCell !== 'string') {
-        continue;
-      }
-      // "/schedule/course/数字/1" の形式のみバドミントン枠として抽出(末尾 /2 は卓球・除外)
-      var m = hrefCell.match(/^\/schedule\/course\/(\d+)\/1$/);
-      if (!m) {
-        continue;
-      }
-      var idNum = parseInt(m[1], 10);
-      if (isNaN(idNum)) {
-        continue;
-      }
-
-      // 重複排除: 同じ ID が複数行に出現する場合がある
-      if (!idSeen[idNum]) {
-        ids.push(idNum);
-        idSeen[idNum] = true;
-        idToLabels[idNum] = {};
-      }
-
-      // IMPORTXML "/.." は 2 列に展開される:
-      //   textCol1 = リンクテキスト("○ 予約"など)
-      //   textCol2 = 部屋名テキスト("大体育室A" / "Aパターン"など)
-      // 両列を結合して判定する(どちらに部屋名が入るかはHTML構造による)
-      // 施設ごとのラベル表記:
-      //   鳥屋野/東総合: "大体育室A" → A / "中体育室B" → B
-      //   亀田:          "Aパターン" → A / "Bパターン" → B / "Cパターン" → C / "Dパターン" → D
-      var t1 = (target.textCol1 < numCols && typeof allValues[r][target.textCol1] === 'string') ? allValues[r][target.textCol1] : '';
-      var t2 = (target.textCol2 < numCols && typeof allValues[r][target.textCol2] === 'string') ? allValues[r][target.textCol2] : '';
-      var textStr = (t1 + t2).replace(/\s+/g, '');
-      if (textStr.indexOf('大体育室') >= 0) idToLabels[idNum]['A'] = true;
-      if (textStr.indexOf('中体育室') >= 0) idToLabels[idNum]['B'] = true;
-      if (textStr.indexOf('Aパターン') >= 0) idToLabels[idNum]['A'] = true;
-      if (textStr.indexOf('Bパターン') >= 0) idToLabels[idNum]['B'] = true;
-      if (textStr.indexOf('Cパターン') >= 0) idToLabels[idNum]['C'] = true;
-      if (textStr.indexOf('Dパターン') >= 0) idToLabels[idNum]['D'] = true;
-      // 東総合スタイル: "時A"/"予約A" 形式で直接ラベル文字が示されるパターン
-      // 例: "=予約A" / "=予約9-17時A17-21時B" / "=予約9-13時B13-15時C15-21時A"
-      // ※鳥屋野(「予約大体育室A」→"大"で止まる)・亀田(「時～Aパターン」→"～"で止まる)には不一致
-      var labelLetterRe = /(?:時|予約)([A-D])(?=\d|$)/g;
-      var labelMatch;
-      while ((labelMatch = labelLetterRe.exec(textStr)) !== null) {
-        idToLabels[idNum][labelMatch[1]] = true;
-      }
-    }
-
-    // 更新前の件数をログに残す
-    var prevVal = props.getProperty(target.propKey) || '';
-    var prevCount = prevVal ? prevVal.split(',').length : 0;
-
-    if (ids.length === 0) {
-      console.log('[WARN] updateCourseGroupIds: ' + target.facilityName + ' の courseGroupId が 0 件でした。IMPORTXML の読み込みを確認してください。ScriptProperties は更新しません。');
-      continue;
-    }
-
-    // 昇順ソートして保存(予約システムの利用順と合わせる)
-    ids.sort(function (a, b) { return a - b; });
-    var newVal = ids.join(',');
-    props.setProperty(target.propKey, newVal);
-
-    // ラベルを IDs と同順で構築して保存
-    // 複数ラベルは "/" でつなぐ (例: A/B は混在日)
-    var labelArr = ids.map(function(id) {
-      var set = idToLabels[id] || {};
-      var chars = Object.keys(set).sort();
-      return chars.join('/'); // 例: "A"/"A/B"/"" (空なら handlers.js が ID数字にフォールバック)
-    });
-    var newLabelsVal = labelArr.join(',');
-    props.setProperty(target.labelsPropKey, newLabelsVal);
-
-    console.log('[INFO] updateCourseGroupIds: ' + target.facilityName + ' 更新前=' + prevCount + '件 → 更新後=' + ids.length + '件 (' + newVal + ') labels=(' + newLabelsVal + ')');
-  }
+function _setSchedulesColumnWidths(sheet) {
+  sheet.setColumnWidth(1, 120); // date
+  sheet.setColumnWidth(2, 80);  // start_time
+  sheet.setColumnWidth(3, 80);  // end_time
+  sheet.setColumnWidth(4, 200); // facility_name
+  sheet.setColumnWidth(5, 60);  // pattern
+  sheet.setColumnWidth(6, 200); // scraped_at
+  sheet.setColumnWidth(7, 320); // floor_map_url
 }
 
 // ─────────────────────────────────────────────
-// F-2-5: 新月検知・通知ロジック
+// 内部関数: settings シート読み取り
 // ─────────────────────────────────────────────
 
 /**
- * 全施設を対象に新月の公開を検知し、メンバーへ通知する(内部用・D-018)
+ * settings シートから status='active' の facilityId 一覧を返す（D-021）
  *
- * 処理の流れ:
- *   1. FACILITIES の enabled: true な施設をループ
- *   2. SCRAPED_MONTHS_FACILITY_<id> を読む(なければスキップ)
- *   3. LAST_NOTIFIED_MONTH_FACILITY_<id> を読む(なければ空文字)
- *   4. スクレイピングで得た月のうち lastNotified より大きいものがあれば新月ありと判定
- *   5. 新月が見つかった施設に対して _notifyNewFacilityMonth() を呼ぶ
- *   6. LAST_NOTIFIED_MONTH_FACILITY_<id> を新月に更新
- *   7. 全 enabled 施設の LAST_NOTIFIED_MONTH_FACILITY_<id> が同じ値になったら
- *      ALL_FACILITIES_NOTIFIED_MONTH と比較して新規なら _notifyAllFacilitiesReady() を呼ぶ
- *   8. ALL_FACILITIES_NOTIFIED_MONTH を更新
+ * settings シートが存在しない場合は全 SCRAPER_FACILITIES を対象とする
+ * （後方互換・初期セットアップ前でも動作するよう）。
  *
- * エラーポリシー(D-018): 各施設の通知失敗は logError で記録して次の施設へ続行する
+ * settings シートの列構造（SPECIFICATION.md 1-5）:
+ *   A: facility_id / B: facility_name / C: status / D: last_checked_at / E: notes
  *
+ * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss
+ * @returns {Array<string>} facilityId の文字列配列
  * @private
  */
-function _checkAndNotifyNewMonths() {
-  var props = PropertiesService.getScriptProperties();
-
-  for (var i = 0; i < FACILITIES.length; i++) {
-    var facility = FACILITIES[i];
-    if (!facility.enabled) {
-      continue;
-    }
-
-    // ScriptProperties から SCRAPED_MONTHS_FACILITY_<id> を読む
-    var scrapedKey = SCRAPED_MONTHS_KEY_PREFIX + facility.facilityId;
-    var scrapedRaw = props.getProperty(scrapedKey);
-    if (!scrapedRaw) {
-      // スクレイピング結果が保存されていない場合はスキップ
-      console.log('[INFO] _checkAndNotifyNewMonths: ' + facility.facilityName + ' の SCRAPED_MONTHS が未設定。スキップします。');
-      continue;
-    }
-
-    var scrapedMonths;
-    try {
-      scrapedMonths = JSON.parse(scrapedRaw);
-    } catch (parseErr) {
-      logError(parseErr, { phase: '_checkAndNotifyNewMonths.parse', facilityId: facility.facilityId });
-      continue;
-    }
-
-    if (!scrapedMonths || scrapedMonths.length === 0) {
-      continue;
-    }
-
-    // LAST_NOTIFIED_MONTH_FACILITY_<id> を読む(なければ空文字)
-    var lastNotifiedKey = LAST_NOTIFIED_MONTH_KEY_PREFIX + facility.facilityId;
-    var lastNotified = props.getProperty(lastNotifiedKey) || '';
-
-    // scrapedMonths のうち lastNotified より大きい最小の月(次の未通知月)を探す
-    // scrapedMonths はソート済みなので最初にヒットした値が最も古い未通知月
-    // 複数月まとめてスクレイピングされた場合も順番通りに1件ずつ処理する
-    var newMonth = null;
-    for (var j = 0; j < scrapedMonths.length; j++) {
-      if (scrapedMonths[j] > lastNotified) {
-        newMonth = scrapedMonths[j];
-        break;
-      }
-    }
-
-    if (!newMonth) {
-      console.log('[INFO] _checkAndNotifyNewMonths: ' + facility.facilityName + ' に新月なし(lastNotified=' + lastNotified + ')');
-      continue;
-    }
-
-    // 新月あり → 施設ごと通知 + lastNotified を更新
-    console.log('[INFO] _checkAndNotifyNewMonths: ' + facility.facilityName + ' に新月を検知。' + newMonth + ' の通知を送ります。');
-    try {
-      _notifyNewFacilityMonth(facility, newMonth);
-    } catch (notifyErr) {
-      logError(notifyErr, { phase: '_checkAndNotifyNewMonths.notifyFacility', facilityId: facility.facilityId });
-      // 通知失敗でも lastNotified は更新しない(次回再試行できるように)
-      continue;
-    }
-    props.setProperty(lastNotifiedKey, newMonth);
+function _getActiveFacilityIds(ss) {
+  var sheet = ss.getSheetByName('settings');
+  if (!sheet || sheet.getLastRow() < 2) {
+    console.log('[INFO] _getActiveFacilityIds: settings シートがないため全施設を対象とします。');
+    return SCRAPER_FACILITIES.map(function (f) { return f.facilityId; });
   }
 
-  // ─── 全施設揃い通知の判定 ───
-  // 全 enabled 施設の LAST_NOTIFIED_MONTH_FACILITY_<id> が同じ値かチェック
-  var allNotifiedMonth = _getCommonLastNotifiedMonth(props);
-  if (!allNotifiedMonth) {
-    // 全施設が揃っていない(施設ごとに異なる月または未設定)
-    return;
-  }
-
-  var allFacilitiesNotified = props.getProperty(ALL_FACILITIES_NOTIFIED_MONTH_KEY) || '';
-  if (allFacilitiesNotified === allNotifiedMonth) {
-    // 全施設揃い通知は既に送済み
-    console.log('[INFO] _checkAndNotifyNewMonths: 全施設揃い通知は送済み(' + allNotifiedMonth + ')。スキップします。');
-    return;
-  }
-
-  // 新規の全施設揃い通知
-  try {
-    _notifyAllFacilitiesReady(allNotifiedMonth);
-  } catch (allNotifyErr) {
-    logError(allNotifyErr, { phase: '_checkAndNotifyNewMonths.notifyAll' });
-    // 通知失敗時は ALL_FACILITIES_NOTIFIED_MONTH を更新しない(次回再試行)
-    return;
-  }
-  props.setProperty(ALL_FACILITIES_NOTIFIED_MONTH_KEY, allNotifiedMonth);
-
-  // アンケート自動配信(D-024): 全施設揃い通知の直後に実行する
-  // ガード: SURVEY_AUTO_DISTRIBUTED_MONTH が今回の新月と一致していれば送信済みのためスキップ
-  var surveyDistributedMonth = getProperty('SURVEY_AUTO_DISTRIBUTED_MONTH') || '';
-  if (surveyDistributedMonth !== allNotifiedMonth) {
-    try {
-      handleDistributeSurvey();
-      props.setProperty('SURVEY_AUTO_DISTRIBUTED_MONTH', allNotifiedMonth);
-      console.log('[INFO] _checkAndNotifyNewMonths: アンケートを自動配信しました(' + allNotifiedMonth + ')。');
-    } catch (distributeErr) {
-      logError(distributeErr, { phase: '_checkAndNotifyNewMonths.distribute' });
+  var values = sheet.getRange(2, 1, sheet.getLastRow() - 1, 3).getValues();
+  var activeIds = [];
+  for (var i = 0; i < values.length; i++) {
+    if (String(values[i][2]).trim() === 'active') {
+      activeIds.push(String(values[i][0]).trim());
     }
+  }
+  return activeIds;
+}
+
+// ─────────────────────────────────────────────
+// 内部関数: IMPORTHTML シート管理
+// ─────────────────────────────────────────────
+
+/**
+ * スプレッドシートを取得する（内部用）
+ * @returns {GoogleAppsScript.Spreadsheet.Spreadsheet}
+ * @private
+ */
+function _getSpreadsheet() {
+  var id = getProperty('MEMBERS_SPREADSHEET_ID');
+  if (!id) {
+    throw new Error('MEMBERS_SPREADSHEET_ID が ScriptProperties に設定されていません。');
+  }
+  return SpreadsheetApp.openById(id);
+}
+
+/**
+ * IMPORTHTML 式を持つシートを作成・更新する（内部用）
+ *
+ * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss
+ * @param {string} sheetName
+ * @param {string} url
+ * @param {number} tableIndex
+ * @private
+ */
+function _setImportHtmlSheet(ss, sheetName, url, tableIndex) {
+  var sheet = ss.getSheetByName(sheetName);
+  if (sheet) {
+    sheet.clearContents();
   } else {
-    console.log('[INFO] _checkAndNotifyNewMonths: アンケートは ' + allNotifiedMonth + ' 分が配信済み。スキップします。');
+    sheet = ss.insertSheet(sheetName);
   }
+  var formula = '=IMPORTHTML("' + url + '","table",' + tableIndex + ')';
+  sheet.getRange('A1').setFormula(formula);
+  console.log('[INFO] _setImportHtmlSheet: ' + sheetName + ' ← ' + formula);
 }
 
 /**
- * 全 enabled 施設の LAST_NOTIFIED_MONTH_FACILITY_<id> が同じ値かチェックする(内部用)
+ * 2D 配列の先頭数行から「バドミントン」を含む列のインデックスを返す（内部用）
  *
- * 全施設が同じ YYYY-MM を持っていればその値を、揃っていなければ null を返す。
- * enabled 施設が 1 件もない場合も null を返す。
- *
- * @param {GoogleAppsScript.Properties.Properties} props - PropertiesService.getScriptProperties()
- * @returns {string|null} 全施設共通の YYYY-MM、揃っていなければ null
+ * @param {Array<Array>} values
+ * @returns {number} 0-based 列インデックス
  * @private
  */
-function _getCommonLastNotifiedMonth(props) {
-  var commonMonth = null;
-  var enabledCount = 0;
-
-  for (var i = 0; i < FACILITIES.length; i++) {
-    var facility = FACILITIES[i];
-    if (!facility.enabled) {
-      continue;
-    }
-    enabledCount++;
-
-    var key = LAST_NOTIFIED_MONTH_KEY_PREFIX + facility.facilityId;
-    var month = props.getProperty(key) || '';
-
-    if (!month) {
-      // 未設定施設がある場合は揃っていない
-      return null;
-    }
-
-    if (commonMonth === null) {
-      commonMonth = month;
-    } else if (commonMonth !== month) {
-      // 施設間で値が異なる
-      return null;
+function _findBadmintonCol(values) {
+  for (var r = 0; r < Math.min(SCHED_HEADER_ROWS, values.length); r++) {
+    for (var c = 0; c < values[r].length; c++) {
+      if (String(values[r][c]).indexOf('バドミントン') !== -1) {
+        return c;
+      }
     }
   }
+  console.log('[WARN] _findBadmintonCol: バドミントン列が見つかりません。' +
+    'デフォルト列 ' + SCHED_BADMINTON_COL_DEFAULT + ' を使用します。');
+  return SCHED_BADMINTON_COL_DEFAULT;
+}
 
-  // enabled 施設が 0 件 または 全施設が同じ値
-  return enabledCount > 0 ? commonMonth : null;
+// ─────────────────────────────────────────────
+// 内部関数: 汎用ユーティリティ
+// ─────────────────────────────────────────────
+
+/**
+ * セルテキストが「利用不可」かどうかを判定する（内部用）
+ *
+ * @param {string} text
+ * @returns {boolean}
+ * @private
+ */
+function _isUnavailable(text) {
+  if (!text || !text.trim()) return true;
+  var t = text.trim();
+  if (t === '-' || t === 'ー') return true;
+  // × (利用不可) / 休 (休館) / 閉 (閉館) を含む場合は利用不可
+  if (/[×]/.test(t)) return true;
+  if (/休/.test(t)) return true;
+  if (/閉/.test(t)) return true;
+  return false;
 }
 
 /**
- * 施設の新月公開をグループトークに通知する(内部用・D-018 / F-5 グループ送信対応)
+ * 年・月・日から 'YYYY-MM-DD' 形式の文字列を組み立てる（内部用）
  *
- * F-5 変更点:
- *   全 active メンバーへの個別 Push から「グループに 1 通」に変更。
- *   グループ ID が未設定の場合はログのみ・処理をスキップ(エラーにしない)。
- *
- * メッセージ形式: "<施設名>の<月>月分が公開されました！"
- *
- * @param {{ facilityId: number, facilityName: string }} facility - 施設情報
- * @param {string} yearMonth - "YYYY-MM" 形式(例: "2026-06")
+ * @param {number} year
+ * @param {number} month
+ * @param {number} day
+ * @returns {string}
  * @private
  */
-function _notifyNewFacilityMonth(facility, yearMonth) {
-  // "YYYY-MM" から月の数字を取り出す(先頭ゼロ除去のため parseInt を使う)
-  var monthLabel = parseInt(yearMonth.split('-')[1], 10);
-  var message = facility.facilityName + 'の' + monthLabel + '月分が公開されました！';
+function _buildDateStr(year, month, day) {
+  return year + '-' + ('0' + month).slice(-2) + '-' + ('0' + day).slice(-2);
+}
 
-  // F-5: グループに 1 通送信する
-  var groupId = getProperty('LINE_GROUP_ID');
-  if (!groupId) {
-    console.log('[WARN] _notifyNewFacilityMonth: LINE_GROUP_ID が未設定です。通知をスキップします。' +
-                 ' facility=' + facility.facilityName + ' yearMonth=' + yearMonth);
-    return;
-  }
+/**
+ * 時（0〜23 の整数）を 'HH:00' 形式に変換する（内部用）
+ *
+ * @param {number} hour
+ * @returns {string}
+ * @private
+ */
+function _padHour(hour) {
+  return ('0' + hour).slice(-2) + ':00';
+}
 
-  console.log('[INFO] _notifyNewFacilityMonth: ' + facility.facilityName + ' ' + yearMonth + ' → グループ(' + groupId + ')に通知');
+/**
+ * 指定日が日曜日または祝日かどうかを判定する（内部用）
+ *
+ * D-024 の亀田 end_time 計算ルールで使用する。
+ * CalendarApp が使えない場合は日曜判定のみで代替する。
+ *
+ * @param {string} date - 'YYYY-MM-DD'
+ * @returns {boolean}
+ * @private
+ */
+function _isHolidayOrSunday(date) {
+  var d = new Date(date + 'T00:00:00+09:00');
+
+  if (d.getDay() === 0) return true; // 日曜日
+
+  // 日本祝日カレンダーで確認（D-024 推奨方法）
   try {
-    pushText(groupId, message);
-  } catch (pushErr) {
-    logError(pushErr, {
-      phase: '_notifyNewFacilityMonth.push',
-      facilityId: facility.facilityId,
-      yearMonth: yearMonth,
-      groupId: groupId
-    });
-    // Push 失敗は例外として re-throw する(呼び出し元の _checkAndNotifyNewMonths が lastNotified 更新をスキップするため)
-    throw pushErr;
-  }
-}
-
-/**
- * 全施設の予定が揃ったことをグループトークに通知する(内部用・D-018 / F-5 グループ送信対応)
- *
- * F-5 変更点:
- *   全 active メンバーへの個別 Push から「グループに 1 通」に変更。
- *   グループ ID が未設定の場合はログのみ・処理をスキップ(エラーにしない)。
- *
- * メッセージ形式:
- *   "[<月>月の全施設の予定が揃いました！\n日程入力はこちら👇\nhttps://liff.line.me/<LIFF_FORM_ID>]"
- *   LIFF_FORM_ID が取得できない場合はリンク部分を省略してメッセージは送る
- *
- * @param {string} yearMonth - "YYYY-MM" 形式(例: "2026-06")
- * @private
- */
-function _notifyAllFacilitiesReady(yearMonth) {
-  var monthLabel = parseInt(yearMonth.split('-')[1], 10);
-  var liffFormId = getProperty('LIFF_FORM_ID');
-
-  var message = monthLabel + '月の全施設の予定が揃いました！';
-  if (liffFormId) {
-    message += '\n日程入力はこちら👇\nhttps://liff.line.me/' + liffFormId;
+    var cal = CalendarApp.getCalendarById('ja.japanese#holiday@group.v.calendar.google.com');
+    if (cal) {
+      var dayStart = new Date(date + 'T00:00:00+09:00');
+      var dayEnd   = new Date(date + 'T23:59:59+09:00');
+      return cal.getEvents(dayStart, dayEnd).length > 0;
+    }
+  } catch (calErr) {
+    console.log('[WARN] _isHolidayOrSunday: カレンダー API エラー（日曜判定のみで代替）: ' + calErr.message);
   }
 
-  // F-5: グループに 1 通送信する
-  var groupId = getProperty('LINE_GROUP_ID');
-  if (!groupId) {
-    console.log('[WARN] _notifyAllFacilitiesReady: LINE_GROUP_ID が未設定です。通知をスキップします。' +
-                 ' yearMonth=' + yearMonth);
-    return;
-  }
-
-  console.log('[INFO] _notifyAllFacilitiesReady: ' + yearMonth + ' 全施設揃い通知 → グループ(' + groupId + ')に送信');
-  try {
-    pushText(groupId, message);
-  } catch (pushErr) {
-    logError(pushErr, {
-      phase: '_notifyAllFacilitiesReady.push',
-      yearMonth: yearMonth,
-      groupId: groupId
-    });
-    // Push 失敗は例外として re-throw する(呼び出し元の _checkAndNotifyNewMonths が ALL_FACILITIES_NOTIFIED_MONTH 更新をスキップするため)
-    throw pushErr;
-  }
+  return false;
 }
