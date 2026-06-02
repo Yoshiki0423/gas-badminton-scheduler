@@ -433,18 +433,16 @@ function _parseSlotsFromCell(cellText, facilityId, date) {
  */
 function _parseSlotsForToya(text, date) {
   var slots = [];
-  var parts = text.split('/');
-  for (var i = 0; i < parts.length; i++) {
-    var part = parts[i].trim();
-    // 例: "9-13大体育室 A" / "13‐21中体育室 B"
-    var m = part.match(/(\d{1,2})[\-‐](\d{1,2})[^\s]*\s+([A-D])/);
-    if (m) {
-      slots.push({
-        start_time: _padHour(parseInt(m[1], 10)),
-        end_time: _padHour(parseInt(m[2], 10)),
-        pattern: m[3]
-      });
-    }
+  // グローバル検索: / や改行など区切り文字の種類に関係なく全マッチを取得
+  // 例: "9-13大体育室 A\n13‐21中体育室 B" / "9-13大体育室 A / 13‐21中体育室 B"
+  var re = /(\d{1,2})[\-‐](\d{1,2})[^\s]*\s+([A-D])/g;
+  var m;
+  while ((m = re.exec(text)) !== null) {
+    slots.push({
+      start_time: _padHour(parseInt(m[1], 10)),
+      end_time: _padHour(parseInt(m[2], 10)),
+      pattern: m[3]
+    });
   }
   // フォールバック: 時間指定なしのパターン文字のみ（例: "A", "B", "終日A"）
   if (slots.length === 0) {
@@ -470,18 +468,16 @@ function _parseSlotsForToya(text, date) {
  */
 function _parseSlotsForHigashi(text, date) {
   var slots = [];
-  var parts = text.split('/');
-  for (var i = 0; i < parts.length; i++) {
-    var part = parts[i].trim();
-    // 例: "9-17時 A"
-    var m = part.match(/(\d{1,2})[\-‐](\d{1,2})時\s*([A-D])/);
-    if (m) {
-      slots.push({
-        start_time: _padHour(parseInt(m[1], 10)),
-        end_time: _padHour(parseInt(m[2], 10)),
-        pattern: m[3]
-      });
-    }
+  // グローバル検索: / や改行など区切り文字の種類に関係なく全マッチを取得
+  // 例: "9-17時 A\n17-21時 B" / "9-17時 A / 17-21時 B"
+  var re = /(\d{1,2})[\-‐](\d{1,2})時\s*([A-D])/g;
+  var m;
+  while ((m = re.exec(text)) !== null) {
+    slots.push({
+      start_time: _padHour(parseInt(m[1], 10)),
+      end_time: _padHour(parseInt(m[2], 10)),
+      pattern: m[3]
+    });
   }
   // フォールバック: 時間指定なしのパターン文字のみ（例: "B", "終日B"）
   if (slots.length === 0) {
