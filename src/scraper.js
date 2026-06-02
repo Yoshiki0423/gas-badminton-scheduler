@@ -357,7 +357,7 @@ function _parseTableToRows(values, facilityId, facilityName, monthOffset, scrape
 
     if (_isUnavailable(cellText)) continue;
 
-    var slots = _parseSlotsFromCell(cellText, facilityId);
+    var slots = _parseSlotsFromCell(cellText, facilityId, fullDate);
 
     if (slots.length === 0) {
       console.log('[WARN] _parseTableToRows: スロット抽出できず（スキップ）' +
@@ -397,15 +397,16 @@ function _parseTableToRows(values, facilityId, facilityName, monthOffset, scrape
  *
  * @param {string} cellText
  * @param {string} facilityId
+ * @param {string} date - 'YYYY-MM-DD'（終日スロットの終了時刻計算に使う）
  * @returns {Array<{start_time, end_time?, pattern}>}
  * @private
  */
-function _parseSlotsFromCell(cellText, facilityId) {
+function _parseSlotsFromCell(cellText, facilityId, date) {
   // ○/〇/△ プレフィックスを除去
   var text = cellText.replace(/^[○〇△◯]+\s*/, '').trim();
 
-  if (facilityId === '420') return _parseSlotsForToya(text);
-  if (facilityId === '413') return _parseSlotsForHigashi(text);
+  if (facilityId === '420') return _parseSlotsForToya(text, date);
+  if (facilityId === '413') return _parseSlotsForHigashi(text, date);
   if (facilityId === '429') return _parseSlotsForKameda(text);
   return [];
 }
@@ -414,13 +415,15 @@ function _parseSlotsFromCell(cellText, facilityId) {
  * 鳥屋野（420）セルパーサー
  *
  * セル例: "9-13大体育室 A / 13‐21中体育室 B"
+ * 時間なし例: "A"  "終日A"（終日開放）
  * ハイフン 2 種対応: U+002D（半角）/ U+2010（Unicode）（D-020 警告）
  *
  * @param {string} text
+ * @param {string} [date] - 'YYYY-MM-DD'（終日スロットの終了時刻計算に使う）
  * @returns {Array<{start_time, end_time, pattern}>}
  * @private
  */
-function _parseSlotsForToya(text) {
+function _parseSlotsForToya(text, date) {
   var slots = [];
   var parts = text.split('/');
   for (var i = 0; i < parts.length; i++) {
@@ -435,6 +438,14 @@ function _parseSlotsForToya(text) {
       });
     }
   }
+  // フォールバック: 時間指定なしのパターン文字のみ（例: "A", "B", "終日A"）
+  if (slots.length === 0) {
+    var single = text.match(/([A-D])/i);
+    if (single) {
+      var endTime = (date && _isHolidayOrSunday(date)) ? '17:00' : '21:00';
+      slots.push({ start_time: '09:00', end_time: endTime, pattern: single[1].toUpperCase() });
+    }
+  }
   return slots;
 }
 
@@ -442,12 +453,14 @@ function _parseSlotsForToya(text) {
  * 東総合（413）セルパーサー
  *
  * セル例: "9-17時 A / 17-21時 B"
+ * 時間なし例: "B"  "終日B"（終日開放）
  *
  * @param {string} text
+ * @param {string} [date] - 'YYYY-MM-DD'（終日スロットの終了時刻計算に使う）
  * @returns {Array<{start_time, end_time, pattern}>}
  * @private
  */
-function _parseSlotsForHigashi(text) {
+function _parseSlotsForHigashi(text, date) {
   var slots = [];
   var parts = text.split('/');
   for (var i = 0; i < parts.length; i++) {
@@ -462,6 +475,14 @@ function _parseSlotsForHigashi(text) {
       });
     }
   }
+  // フォールバック: 時間指定なしのパターン文字のみ（例: "B", "終日B"）
+  if (slots.length === 0) {
+    var single = text.match(/([A-D])/i);
+    if (single) {
+      var endTime = (date && _isHolidayOrSunday(date)) ? '17:00' : '21:00';
+      slots.push({ start_time: '09:00', end_time: endTime, pattern: single[1].toUpperCase() });
+    }
+  }
   return slots;
 }
 
@@ -469,6 +490,7 @@ function _parseSlotsForHigashi(text) {
  * 亀田（429）セルパーサー
  *
  * セル例: "9時～Aパターン 19時～Cパターン"
+ * 時間なし例: "A"  "終日A"  "Aパターン"（終日開放）
  * end_time はこの関数では返さない（_calcKamedaEndTimes で後から計算する）。
  * 波ダッシュ 3 種対応: U+301C / U+FF5E / U+007E（D-020）
  *
@@ -486,6 +508,14 @@ function _parseSlotsForKameda(text) {
       start_time: _padHour(parseInt(m[1], 10)),
       pattern: m[2]
     });
+  }
+  // フォールバック: 時間指定なしのパターン文字のみ（例: "A", "終日A", "Aパターン"）
+  // end_time は _calcKamedaEndTimes で計算するため不要
+  if (slots.length === 0) {
+    var single = text.match(/([A-D])/i);
+    if (single) {
+      slots.push({ start_time: '09:00', pattern: single[1].toUpperCase() });
+    }
   }
   return slots;
 }
