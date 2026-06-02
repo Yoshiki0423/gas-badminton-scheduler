@@ -331,31 +331,39 @@ function _parseTableToRows(values, facilityId, facilityName, monthOffset, scrape
 
   var badmintonCol = _findBadmintonCol(values);
   var prevDay = null;
+  var fullDate = null; // 直近の日付を保持（rowspan 継続行で再利用する）
 
   for (var i = 0; i < values.length; i++) {
     var row = values[i];
     var col0 = String(row[0] || '').trim();
 
-    // "X日" 形式の行だけ処理する（ヘッダー行・空行をスキップ）
     var dayMatch = col0.match(/^(\d{1,2})日/);
-    if (!dayMatch) continue;
 
-    var dayNum = parseInt(dayMatch[1], 10);
+    if (dayMatch) {
+      // 通常の日付行: fullDate を更新する
+      var dayNum = parseInt(dayMatch[1], 10);
 
-    // 月またぎ検知: 前日より 15 日以上小さくなったら翌月に繰り上げる
-    if (prevDay !== null && (prevDay - dayNum) > 15) {
-      month++;
-      if (month > 12) { month = 1; year++; }
-      console.log('[INFO] _parseTableToRows: ' + facilityName +
-        ' 月またぎ検知（' + prevDay + '日→' + dayNum + '日）。' +
-        year + '-' + ('0' + month).slice(-2) + ' へ移行。');
+      // 月またぎ検知: 前日より 15 日以上小さくなったら翌月に繰り上げる
+      if (prevDay !== null && (prevDay - dayNum) > 15) {
+        month++;
+        if (month > 12) { month = 1; year++; }
+        console.log('[INFO] _parseTableToRows: ' + facilityName +
+          ' 月またぎ検知（' + prevDay + '日→' + dayNum + '日）。' +
+          year + '-' + ('0' + month).slice(-2) + ' へ移行。');
+      }
+      prevDay = dayNum;
+      fullDate = _buildDateStr(year, month, dayNum);
+    } else if (col0 === '' && fullDate !== null) {
+      // col0 が空 かつ fullDate 設定済み → rowspan による継続行（同じ日の別時間帯）
+      // fullDate をそのまま引き継いでセル処理を続ける
+    } else {
+      // ヘッダー行・非日付行はスキップ
+      continue;
     }
-    prevDay = dayNum;
 
-    var fullDate = _buildDateStr(year, month, dayNum);
     var cellText = (badmintonCol < row.length) ? String(row[badmintonCol] || '').trim() : '';
 
-    if (_isUnavailable(cellText)) continue;
+    if (!cellText || _isUnavailable(cellText)) continue;
 
     var slots = _parseSlotsFromCell(cellText, facilityId, fullDate);
 
