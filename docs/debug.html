@@ -181,14 +181,21 @@
   }
 
   function renderResult(data) {
-    var rows = data.rows || [];
-    var errors = data.errors || [];
+    // GAS の応答は { ok, facilities:[{facilityName, rows:[...]}, ...], errors:[{facilityName, error}, ...] }
+    var rows = [];
+    (data.facilities || []).forEach(function(f) {
+      if (f.rows) rows = rows.concat(f.rows);
+    });
+
+    // errors は {facilityId, facilityName, error} オブジェクト or 文字列の混在に対応
+    var errors = (data.errors || []).map(function(e) {
+      return typeof e === 'string' ? e : (e.facilityName + ': ' + e.error);
+    });
 
     // --- サマリー ---
     var byFacility = {};
-    rows.forEach(function(r) {
-      var f = r.facility_name || '不明';
-      byFacility[f] = (byFacility[f] || 0) + 1;
+    (data.facilities || []).forEach(function(f) {
+      byFacility[f.facilityName] = f.rowCount || 0;
     });
 
     var summaryHtml = '';
