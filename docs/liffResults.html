@@ -70,6 +70,7 @@
       color: #666;
       margin-bottom: 10px;
       line-height: 1.4;
+      white-space: pre-line;
     }
 
     /* スロット一覧 */
@@ -214,7 +215,7 @@
         html += '<div class="date-block">';
         html += '<div class="date-label">' + esc(dateInfo.dateLabel) + '</div>';
         if (dateInfo.facilityInfo) {
-          html += '<div class="facility-info">' + esc(dateInfo.facilityInfo) + '</div>';
+          html += '<div class="facility-info">' + esc(dateInfo.facilityInfo).replace(/\n/g, '<br>') + '</div>';
         }
         html += '<div class="slot-list">';
 

@@ -511,15 +511,16 @@ function getSchedules() {
   var values = dataRange.getValues();
 
   // 2 次元配列 → オブジェクト配列に変換
+  // 新スキーマ: A=date / B=start_time / C=end_time / D=facility_name / E=pattern / F=scraped_at / G=floor_map_url
   return values.map(function (row) {
     return {
-      scheduleId:    row[SCOL_SCHEDULE_ID   - 1],
-      date:          row[SCOL_DATE          - 1],
-      startTime:     row[SCOL_START_TIME    - 1],
-      endTime:       row[SCOL_END_TIME      - 1],
-      facilityName:  row[SCOL_FACILITY_NAME - 1],
-      note:          row[SCOL_NOTE          - 1],
-      lastUpdatedAt: row[SCOL_LAST_UPDATED  - 1]
+      scheduleId:    '',
+      date:          String(row[0]),
+      startTime:     String(row[1]),
+      endTime:       String(row[2]),
+      facilityName:  String(row[3]),
+      note:          String(row[4]),
+      lastUpdatedAt: String(row[5])
     };
   });
 }

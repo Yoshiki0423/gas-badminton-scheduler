@@ -266,6 +266,12 @@ function handleMemberJoined(event) {
 var SURVEY_SCHEDULE_DAYS = 14;
 
 /**
+ * LIFF 回答フォームに表示するスケジュールの対象期間(今日から N 日以内)
+ * 公開済みスケジュールをすべて表示するため SURVEY_SCHEDULE_DAYS より長く設定
+ */
+var LIFF_FORM_SCHEDULE_DAYS = 60;
+
+/**
  * 質問配信 — F-1-3 / F-3-6 / F-5 の本体
  *
  * F-5 変更点:
@@ -536,7 +542,7 @@ function handleSendReminders() {
 // ─────────────────────────────────────────────
 
 /** 「成立」と見なす最小参加人数(REQUIREMENTS.md §2 より) */
-var MIN_ATTENDEES = 4;
+var MIN_ATTENDEES = 1; // TEST: 検証用に1人に変更中。本番は4に戻すこと
 
 /**
  * 集計・結果通知 — F-1-6 / F-1-7 の本体(F-4 スロット単位 / F-5 グループ送信対応版)
@@ -785,7 +791,20 @@ function handleTextMessage(event) {
 
   try {
     if (cmd === '/配信') {
-      handleDistributeSurvey();
+      var distResult = checkAndDistributeForm(true);
+      if (distResult.sent) {
+        replyText(replyToken, '日程フォームを送信しました ✅ (' + (distResult.type || '') + ')');
+      } else {
+        var reasonMessages = {
+          'already_distributed': '今月分は配信済みです',
+          'no_group_id':         'LINE_GROUP_ID が未設定です',
+          'no_data_at_all':      '翌月データが全施設ともまだありません',
+          'send_failed':         '送信に失敗しました（GAS ログを確認してください）',
+          'not_ready':           '20日未満かつデータが揃っていません'
+        };
+        var reasonMsg = reasonMessages[distResult.reason] || distResult.reason || '不明';
+        replyText(replyToken, 'スキップしました: ' + reasonMsg);
+      }
 
     } else if (cmd === '/リマインド') {
       var remResult = handleSendReminders();
@@ -893,7 +912,7 @@ function _buildStatusMessage() {
  */
 function handleLiffGetData(userId) {
   var allSchedules = getSchedules();
-  var schedules = _filterUpcomingSchedules(allSchedules, SURVEY_SCHEDULE_DAYS);
+  var schedules = _filterUpcomingSchedules(allSchedules, LIFF_FORM_SCHEDULE_DAYS);
 
   // 日付ごとにスケジュールをグループ化
   var dateMap = {};       // { 'YYYY-MM-DD': [schedule, ...] }
@@ -1003,27 +1022,48 @@ function _isSlotAvailable(slotStart, daySchedules) {
 function _buildFacilityInfo(daySchedules) {
   if (!daySchedules || daySchedules.length === 0) return '';
 
-  var parts = [];
-  for (var i = 0; i < daySchedules.length; i++) {
-    var sch = daySchedules[i];
-    var name = String(sch.facilityName || '');
-    var note = String(sch.note || '');
-    var startTime = String(sch.startTime || '');
-    var endTime   = String(sch.endTime   || '');
+  // 施設名でグループ化（登場順を保持）
+  var facilityMap   = {};
+  var facilityOrder = [];
 
-    var timeStr;
-    if (note.indexOf('終日') !== -1 || startTime.indexOf('終日') !== -1 || endTime.indexOf('終日') !== -1) {
-      timeStr = '終日';
-    } else if (startTime && endTime) {
-      // "HH:mm" → "H〜H" 形式(先頭ゼロを除去して時間部分のみ)
-      var startH = startTime.split(':')[0].replace(/^0/, '');
-      var endH   = endTime.split(':')[0].replace(/^0/, '');
-      timeStr = startH + '〜' + endH;
-    } else {
-      timeStr = '';
+  for (var i = 0; i < daySchedules.length; i++) {
+    var sch  = daySchedules[i];
+    var name = String(sch.facilityName || '');
+    if (!name) continue;
+    if (!facilityMap[name]) {
+      facilityMap[name] = [];
+      facilityOrder.push(name);
+    }
+    facilityMap[name].push({
+      startTime: String(sch.startTime || ''),
+      endTime:   String(sch.endTime   || ''),
+      pattern:   String(sch.note      || '')
+    });
+  }
+
+  var parts = [];
+  for (var j = 0; j < facilityOrder.length; j++) {
+    var facilityName = facilityOrder[j];
+    var slots = facilityMap[facilityName];
+    var timeSlots = [];
+
+    for (var k = 0; k < slots.length; k++) {
+      var s = slots[k];
+      var timeStr;
+      if (s.startTime.indexOf('終日') !== -1 || s.endTime.indexOf('終日') !== -1) {
+        timeStr = '終日';
+      } else if (s.startTime && s.endTime) {
+        var startH = s.startTime.split(':')[0].replace(/^0/, '');
+        var endH   = s.endTime.split(':')[0].replace(/^0/, '');
+        timeStr = startH + '〜' + endH + '時';
+        if (s.pattern) timeStr += ' ' + s.pattern;
+      } else {
+        timeStr = '';
+      }
+      if (timeStr) timeSlots.push(timeStr);
     }
 
-    parts.push(name + (timeStr ? ' ' + timeStr : ''));
+    parts.push(facilityName + (timeSlots.length > 0 ? ' ' + timeSlots.join('、') : ''));
   }
 
   return parts.join('\n');
@@ -1163,29 +1203,64 @@ function handleLiffGetAllResponses() {
 }
 
 // ─────────────────────────────────────────────
-// F-5: 4人以上即通知 / F-6: 予約ボタン付き Flex メッセージ
+// F3: 4人揃い通知（MSG-F3-01 / MSG-F3-02）
 // ─────────────────────────────────────────────
 
 /**
- * LIFF 回答送信後に「4人以上即通知」チェックを実行する(F-5 / F-6 対応版)
+ * schedules シートから 'YYYY-MM-DD|HH:mm' → 施設名リスト のマップを返す
  *
- * F-6 変更点:
- *   テキスト通知から「予約する」ボタン付き Flex メッセージに変更。
- *   スロットが1件なら bubble 1枚、複数なら carousel(最大 10件)で送信する。
+ * scraper.js が書き込む新スキーマ（A=date / B=start_time / D=facility_name）を前提とする。
+ * シートが空または読み込み失敗の場合は空オブジェクトを返す。
  *
- * 処理フロー:
- *   1. getAllSlotResponses() で全回答を取得
- *   2. スロットごとに can 票数を集計
- *   3. MIN_ATTENDEES(4) 以上のスロットを抽出
- *   4. 各スロットについて ScriptProperties の VIABLE_NOTIFIED_SLOT_<date>|<slotStart> を確認
- *   5. まだ通知していないスロットがあればグループに Flex メッセージで通知
- *   6. 通知したスロットに VIABLE_NOTIFIED_SLOT_* = 'true' を保存
+ * @returns {Object} { 'YYYY-MM-DD|HH:mm': ['施設名A', '施設名B', ...] }
+ * @private
+ */
+function _buildSlotFacilityMap() {
+  try {
+    var sheet = getSchedulesSheet();
+    var lastRow = sheet.getLastRow();
+    if (lastRow < 2) return {};
+
+    var values = sheet.getRange(2, 1, lastRow - 1, 4).getValues();
+    var map = {};
+
+    for (var i = 0; i < values.length; i++) {
+      var date         = String(values[i][0]);  // A: date
+      var startTime    = String(values[i][1]);  // B: start_time
+      var facilityName = String(values[i][3]);  // D: facility_name
+
+      if (!date || !startTime || !facilityName) continue;
+
+      var key = date + '|' + startTime;
+      if (!map[key]) map[key] = [];
+      if (map[key].indexOf(facilityName) < 0) map[key].push(facilityName);
+    }
+
+    return map;
+  } catch (e) {
+    console.warn('[WARN] _buildSlotFacilityMap: schedules 読み込み失敗: ' + e.message);
+    return {};
+  }
+}
+
+/**
+ * LIFF 回答送信後に「4人揃い通知（F3）」チェックを実行する
+ *
+ * 処理フロー（SPECIFICATION.md セクション 5-3 に準拠）:
+ *   1. 全回答を取得して can 票数・投票ユーザーをスロットごとに集計
+ *   2. MIN_ATTENDEES(4) 以上かつ未通知のスロットを抽出
+ *      （通知済み判定: ScriptProperties の VIABLE_NOTIFIED_SLOT_<slotKey> が空かどうか）
+ *   3. reserver-master から予約者 lineUserId セットを構築
+ *   4. schedules シートからスロット→施設名マップを構築
+ *   5. スロットごとにメッセージを組み立ててグループに送信
+ *      - 予約者が1人以上いる → MSG-F3-01（予約URL + 参加状況URL 付き）
+ *      - 予約者が0人     → MSG-F3-02（参加状況URL のみ）
+ *   6. 通知済みフラグを ISO タイムスタンプで保存
  *
  * 設計上の注意:
- *   - グループ ID が未設定の場合はログのみ・処理をスキップ(エラーにしない)
- *   - 複数スロットが同時に条件を満たした場合は carousel にまとめて 1 通送る
- *   - このチェックは「can 票数のみ」で判定する(undecided は含めない)
- *   - 例外が発生しても呼び出し元の回答送信処理には影響しないよう try-catch で囲む
+ *   - 5人目以降の追加通知はしない（D-033: 参加状況は liffResults.html で確認）
+ *   - グループ ID が未設定の場合は処理をスキップ（エラーにしない）
+ *   - 例外が発生しても呼び出し元の回答送信処理を止めないよう try-catch で囲む
  *
  * @private
  */
@@ -1197,81 +1272,157 @@ function _checkAndNotifyViableSlots() {
       return;
     }
 
-    // (1) 全回答を取得して can 票数をスロットごとに集計
-    var responses = getAllSlotResponses();
-    var canCounts = {};  // key: 'YYYY-MM-DD|HH:mm' → can 票数
+    // (1) 全回答を取得して can 票数・投票ユーザーをスロットごとに集計
+    var responses  = getAllSlotResponses();
+    var canCounts  = {};  // 'YYYY-MM-DD|HH:mm' → can 票数
+    var canUserMap = {};  // 'YYYY-MM-DD|HH:mm' → { userId: true, ... }
 
     for (var i = 0; i < responses.length; i++) {
       var r = responses[i];
       if (r.answer === 'can') {
         var key = r.date + '|' + r.slotStart;
         canCounts[key] = (canCounts[key] || 0) + 1;
+        if (!canUserMap[key]) canUserMap[key] = {};
+        canUserMap[key][r.userId] = true;
       }
     }
 
     // (2) MIN_ATTENDEES 以上かつ未通知のスロットを抽出
+    var propKeyPrefix = 'VIABLE_NOTIFIED_SLOT_';
     var newlyViableSlots = [];
     var slotKeys = Object.keys(canCounts);
-    var propKeyPrefix = 'VIABLE_NOTIFIED_SLOT_';
 
     for (var j = 0; j < slotKeys.length; j++) {
-      var slotKey = slotKeys[j];
-      if (canCounts[slotKey] >= MIN_ATTENDEES) {
-        var notifiedKey = propKeyPrefix + slotKey;
-        var alreadyNotified = getProperty(notifiedKey);
-        if (alreadyNotified !== 'true') {
-          newlyViableSlots.push(slotKey);
-        }
+      var sk = slotKeys[j];
+      if (canCounts[sk] >= MIN_ATTENDEES && !getProperty(propKeyPrefix + sk)) {
+        newlyViableSlots.push(sk);
       }
     }
 
-    if (newlyViableSlots.length === 0) {
-      return;  // 新たに条件を満たしたスロットなし
+    if (newlyViableSlots.length === 0) return;
+
+    newlyViableSlots.sort();
+
+    // (3) reserver-master から予約者 lineUserId セットを構築
+    var reserverIdSet = {};
+    try {
+      var reservers = getReserverMasterEntries();
+      for (var rv = 0; rv < reservers.length; rv++) {
+        if (reservers[rv].lineUserId) reserverIdSet[reservers[rv].lineUserId] = true;
+      }
+    } catch (e) {
+      console.warn('[WARN] _checkAndNotifyViableSlots: reserver-master 読み込み失敗: ' + e.message);
     }
 
-    newlyViableSlots.sort();  // 日付・時刻順
+    // (4) schedules シートからスロット→施設名マップを構築
+    var slotFacilityMap = _buildSlotFacilityMap();
 
-    // (3) スロットごとに「予約する」ボタン付き Flex Bubble を作り、carousel にまとめる
-    // facilityId は LIFF 方式では不要（LIFF ページが slotKey から動的に判定）
-    var bubbles = [];
+    // (5) LIFF URL
+    var liffResultsId = getProperty('LIFF_RESULTS_ID');
+    var liffReserveId = getProperty('LIFF_RESERVE_ID');
+    var statusUrl = liffResultsId ? 'https://liff.line.me/' + liffResultsId : '';
+
+    // (6) スロットごとに通知を送る
     for (var n = 0; n < newlyViableSlots.length; n++) {
-      bubbles.push(_buildReserveBubble(newlyViableSlots[n], canCounts[newlyViableSlots[n]]));
-    }
+      var slotKey  = newlyViableSlots[n];
+      var pipeIdx  = slotKey.indexOf('|');
+      var slotDate = slotKey.substring(0, pipeIdx);
+      var slotTime = slotKey.substring(pipeIdx + 1);
+      var count    = canCounts[slotKey];
 
-    // LINE Carousel の上限（10件）に制限
-    if (bubbles.length > 10) {
-      bubbles = bubbles.slice(0, 10);
-    }
+      // 日付ラベル（例: 7月5日(土)）
+      var d = new Date(slotDate + 'T00:00:00+09:00');
+      var dateLabel = (d.getMonth() + 1) + '月' + d.getDate() + '日(' + _WEEKDAYS[d.getDay()] + ')';
 
-    var flexContents;
-    var altText = '4人以上参加できる時間帯が見つかりました！予約しますか？';
-    if (bubbles.length === 1) {
-      flexContents = bubbles[0];
-    } else {
-      flexContents = {
-        type: 'carousel',
-        contents: bubbles
-      };
-    }
+      // 施設名（スロットに対応する施設を列挙）
+      var facilities = slotFacilityMap[slotKey] || [];
+      var facilityLabel = facilities.length > 0 ? facilities.join('・') : '（施設情報なし）';
 
-    // (4) グループに通知
-    withRetry(function () {
-      return pushFlexMessage(groupId, altText, flexContents);
-    }, { maxAttempts: DEFAULT_MAX_ATTEMPTS, baseDelayMs: 1000, label: 'pushViableSlotsFlex' });
+      // 予約者の有無チェック（参加者の中に reserver-master 登録者がいるか）
+      var canUsers = canUserMap[slotKey] || {};
+      var canUserIds = Object.keys(canUsers);
+      var hasReserver = false;
+      for (var cu = 0; cu < canUserIds.length; cu++) {
+        if (reserverIdSet[canUserIds[cu]]) { hasReserver = true; break; }
+      }
 
-    console.log('[INFO] _checkAndNotifyViableSlots: ' + newlyViableSlots.length +
-                ' スロットをグループに Flex メッセージで通知しました');
+      // Flex Message 組み立て（MSG-F3-01 or MSG-F3-02）
+      var reserveUrl = (hasReserver && liffReserveId)
+        ? 'https://liff.line.me/' + liffReserveId + '?slotKey=' + encodeURIComponent(slotKey)
+        : '';
+      var bubble  = _buildF3NotifyBubble(slotKey, count, facilityLabel, statusUrl, reserveUrl);
+      var altText = dateLabel + ' ' + slotTime + '〜 ' + count + '人揃いました！';
 
-    // (5) 通知済みフラグを保存
-    for (var f = 0; f < newlyViableSlots.length; f++) {
+      // GAS は同期実行なので var は即時評価される（クロージャ問題なし）
+      withRetry(function () {
+        return pushFlexMessage(groupId, altText, bubble);
+      }, { maxAttempts: DEFAULT_MAX_ATTEMPTS, baseDelayMs: 1000, label: 'pushF3Notify' });
+
+      // 通知済みフラグを ISO タイムスタンプで保存（重複通知防止）
       PropertiesService.getScriptProperties()
-        .setProperty(propKeyPrefix + newlyViableSlots[f], 'true');
+        .setProperty(propKeyPrefix + slotKey, _toIsoTokyo(new Date()));
+
+      console.log('[INFO] _checkAndNotifyViableSlots: F3通知送信 slotKey=' + slotKey +
+                  ' count=' + count + ' hasReserver=' + hasReserver);
     }
 
   } catch (err) {
     logError(err, { phase: '_checkAndNotifyViableSlots' });
     // 呼び出し元(回答送信)の処理を止めないため、例外は再 throw しない
   }
+}
+
+/**
+ * F3「N人揃い通知」用の Flex Bubble を組み立てる(内部用)
+ *
+ * @param {string} slotKey      - 'YYYY-MM-DD|HH:mm'
+ * @param {number} count        - can 票数
+ * @param {string} facilityLabel - 施設名（複数は「・」区切り）
+ * @param {string} statusUrl    - 参加状況 LIFF URL
+ * @param {string} reserveUrl   - 予約 LIFF URL（空文字なら予約者なしフロー）
+ * @returns {Object} LINE Flex Message の bubble オブジェクト
+ * @private
+ */
+function _buildF3NotifyBubble(slotKey, count, facilityLabel, statusUrl, reserveUrl) {
+  var parts     = slotKey.split('|');
+  var slotDate  = parts[0];
+  var slotStart = parts[1];
+  var slotEnd   = _SLOT_ENDS[slotStart] || '';
+
+  var d         = new Date(slotDate + 'T00:00:00+09:00');
+  var dateLabel = (d.getMonth() + 1) + '月' + d.getDate() + '日(' + _WEEKDAYS[d.getDay()] + ')';
+
+  var bodyContents = [
+    { type: 'text', text: dateLabel,                   weight: 'bold', size: 'lg' },
+    { type: 'text', text: slotStart + '〜' + slotEnd, size: 'md',  color: '#333333' },
+    { type: 'text', text: '参加確定: ' + count + '人', size: 'sm',  color: '#06C755' }
+  ];
+
+  if (facilityLabel) {
+    bodyContents.push({ type: 'text', text: '📍 ' + facilityLabel, size: 'sm', color: '#666666', wrap: true });
+  }
+
+  if (!reserveUrl) {
+    bodyContents.push({ type: 'text', text: '⚠️ 予約者が未登録です。参加者の方が直接予約してください。', size: 'sm', color: '#e74c3c', wrap: true });
+  }
+
+  var footerContents = [];
+  if (statusUrl) {
+    footerContents.push({ type: 'button', style: 'primary', color: '#06C755', action: { type: 'uri', label: '参加状況を見る', uri: statusUrl } });
+  }
+  if (reserveUrl) {
+    footerContents.push({ type: 'button', style: 'secondary', action: { type: 'uri', label: '予約する', uri: reserveUrl } });
+  }
+
+  return {
+    type: 'bubble',
+    header: {
+      type: 'box', layout: 'vertical', backgroundColor: '#06C755',
+      contents: [{ type: 'text', text: '🎉 ' + count + '人揃いました！', weight: 'bold', size: 'lg', color: '#FFFFFF' }]
+    },
+    body: { type: 'box', layout: 'vertical', spacing: 'sm', contents: bodyContents },
+    footer: footerContents.length > 0 ? { type: 'box', layout: 'vertical', spacing: 'sm', contents: footerContents } : undefined
+  };
 }
 
 /**
@@ -2290,4 +2441,220 @@ function handleLiffReserveQueueSubmit(params, userId) {
     reservableDate:     reservableDate,
     reservableDateLabel: reservableDateLabel
   };
+}
+
+// ─────────────────────────────────────────────
+// F2: アンケート配信（新システム）
+// ─────────────────────────────────────────────
+
+/**
+ * F2 自動配信トリガー — GAS タイムトリガーから毎日 9〜10 時に呼ばれる
+ *
+ * checkAndDistributeForm() を isForced=false で呼ぶ。
+ * 配信済みフラグが立っていればスキップする。
+ *
+ * @returns {void}
+ */
+function autoDistributeFormTrigger() {
+  try {
+    var result = checkAndDistributeForm(false);
+    console.log('[INFO] autoDistributeFormTrigger 完了: ' + JSON.stringify(result));
+  } catch (err) {
+    logError(err, { phase: 'autoDistributeFormTrigger' });
+  }
+}
+
+/**
+ * F2 フォーム配信メインロジック
+ *
+ * 処理の流れ:
+ *   1. 配信対象月（翌月 YYYYMM）を決定
+ *   2. 配信済みフラグを確認（isForced=true なら無視）
+ *   3. schedules シートから翌月分のデータを確認
+ *   4. アクティブ施設すべてのデータが揃っていれば MSG-F2-01 を送信
+ *   5. 未公開施設あり + 今日が20日以降（または isForced）なら MSG-F2-02 を送信
+ *   6. 送信後に配信済みフラグを立てる（当月内の重複配信防止）
+ *
+ * @param {boolean} isForced - true なら配信済みフラグ・日付条件を無視して強制送信
+ * @returns {{ sent: boolean, skipped: boolean, type?: string, reason?: string, missing?: string[] }}
+ */
+function checkAndDistributeForm(isForced) {
+  var targetYYYYMM  = _getTargetMonth();
+  var distribFlagKey = 'SURVEY_DISTRIBUTED_' + targetYYYYMM;
+
+  if (!isForced && getProperty(distribFlagKey)) {
+    console.log('[INFO] checkAndDistributeForm: ' + targetYYYYMM + ' 分は配信済みです。スキップします。' +
+                ' flagValue=' + getProperty(distribFlagKey));
+    return { sent: false, skipped: true, reason: 'already_distributed' };
+  }
+
+  var groupId = getProperty('LINE_GROUP_ID');
+  if (!groupId) {
+    console.warn('[WARN] checkAndDistributeForm: LINE_GROUP_ID が未設定です。スキップします。');
+    return { sent: false, skipped: true, reason: 'no_group_id' };
+  }
+
+  var schedules          = _readNewSchedules();
+  var targetMonthPrefix  = targetYYYYMM.substring(0, 4) + '-' + targetYYYYMM.substring(4, 6);
+  var activeFacilityNames = _getActiveFacilityNames();
+
+  var facilitiesWithData = {};
+  for (var i = 0; i < schedules.length; i++) {
+    var s = schedules[i];
+    if (s.date && s.date.indexOf(targetMonthPrefix) === 0) {
+      facilitiesWithData[s.facility_name] = true;
+    }
+  }
+
+  var missingFacilities = activeFacilityNames.filter(function (name) {
+    return !facilitiesWithData[name];
+  });
+  var allPresent     = missingFacilities.length === 0;
+  var liffFormId     = getProperty('LIFF_FORM_ID');
+  var liffUrl        = liffFormId ? 'https://liff.line.me/' + liffFormId : '#';
+  var targetMonthNum = parseInt(targetYYYYMM.substring(4, 6), 10);
+
+  if (allPresent) {
+    var msg01 = targetMonthNum + '月のバドミントン日程が揃いました！\n回答はこちら → ' + liffUrl;
+    try {
+      withRetry(function () { return pushText(groupId, msg01); },
+                { maxAttempts: DEFAULT_MAX_ATTEMPTS, baseDelayMs: 1000, label: 'distributeForm01' });
+      var sentAt01 = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM-dd HH:mm:ss');
+      PropertiesService.getScriptProperties().setProperty(distribFlagKey, sentAt01);
+      console.log('[INFO] checkAndDistributeForm: MSG-F2-01 送信完了。targetYYYYMM=' + targetYYYYMM);
+      return { sent: true, skipped: false, type: 'F2-01' };
+    } catch (e) {
+      logError(e, { phase: 'checkAndDistributeForm.send01' });
+      return { sent: false, skipped: false, type: 'F2-01', reason: 'send_failed' };
+    }
+  }
+
+  var todayStr    = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM-dd');
+  var dayOfMonth  = parseInt(todayStr.substring(8, 10), 10);
+
+  if (isForced || dayOfMonth >= 20) {
+    if (missingFacilities.length === activeFacilityNames.length) {
+      console.log('[INFO] checkAndDistributeForm: 全施設データなし。送信スキップ。');
+      return { sent: false, skipped: true, reason: 'no_data_at_all' };
+    }
+    var missingNames = missingFacilities.join('、');
+    var msg02 = targetMonthNum + '月のバドミントン日程です（' + missingNames + 'は未公開のため除外）\n回答はこちら → ' + liffUrl;
+    try {
+      withRetry(function () { return pushText(groupId, msg02); },
+                { maxAttempts: DEFAULT_MAX_ATTEMPTS, baseDelayMs: 1000, label: 'distributeForm02' });
+      var sentAt02 = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM-dd HH:mm:ss');
+      PropertiesService.getScriptProperties().setProperty(distribFlagKey, sentAt02);
+      console.log('[INFO] checkAndDistributeForm: MSG-F2-02 送信完了。' +
+                  'targetYYYYMM=' + targetYYYYMM + ' missing=' + missingNames);
+      return { sent: true, skipped: false, type: 'F2-02', missing: missingFacilities };
+    } catch (e) {
+      logError(e, { phase: 'checkAndDistributeForm.send02' });
+      return { sent: false, skipped: false, type: 'F2-02', reason: 'send_failed' };
+    }
+  }
+
+  console.log('[INFO] checkAndDistributeForm: ' + missingFacilities.length +
+              '施設が未公開 かつ今日が20日未満。スキップします。' +
+              ' missing=' + missingFacilities.join(',') + ' dayOfMonth=' + dayOfMonth);
+  return { sent: false, skipped: true, reason: 'not_ready', missing: missingFacilities };
+}
+
+/**
+ * F2 自動配信タイムトリガーをセットアップする（1 回だけ手動実行）
+ *
+ * GAS エディタから手動実行してください。
+ * 毎日 9〜10 時（Asia/Tokyo）に autoDistributeFormTrigger() を実行するトリガーを設定します。
+ *
+ * @returns {void}
+ */
+function setupF2Trigger() {
+  var F2_FUNCTION = 'autoDistributeFormTrigger';
+  var triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === F2_FUNCTION) {
+      ScriptApp.deleteTrigger(triggers[i]);
+      console.log('[INFO] setupF2Trigger: 既存の F2 トリガーを削除しました。');
+    }
+  }
+  ScriptApp.newTrigger(F2_FUNCTION)
+    .timeBased()
+    .atHour(9)
+    .everyDays(1)
+    .inTimezone('Asia/Tokyo')
+    .create();
+  console.log('[INFO] setupF2Trigger: autoDistributeFormTrigger の毎日9時トリガーを設定しました。');
+}
+
+/**
+ * 配信対象月（翌月）を YYYYMM 形式で返す（内部用）
+ *
+ * @returns {string} 例: '202607'（今が 2026-06 なら）
+ * @private
+ */
+function _getTargetMonth() {
+  var todayStr = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM-dd');
+  var year  = parseInt(todayStr.substring(0, 4), 10);
+  var month = parseInt(todayStr.substring(5, 7), 10);
+  month += 1;
+  if (month > 12) { month = 1; year += 1; }
+  return String(year) + ('0' + month).slice(-2);
+}
+
+/**
+ * schedules シートを新スキーマで読み込む（内部用・F2 専用）
+ *
+ * scraper.js が書き込む新スキーマ（SPECIFICATION.md §1-1）で読む。
+ * 列順: A=date / B=start_time / C=end_time / D=facility_name / E=pattern / F=scraped_at / G=floor_map_url
+ *
+ * @returns {Array<{date: string, start_time: string, end_time: string, facility_name: string, pattern: string}>}
+ * @private
+ */
+function _readNewSchedules() {
+  var spreadsheetId = getProperty('MEMBERS_SPREADSHEET_ID');
+  if (!spreadsheetId) return [];
+  var ss    = SpreadsheetApp.openById(spreadsheetId);
+  var sheet = ss.getSheetByName('schedules');
+  if (!sheet || sheet.getLastRow() < 2) return [];
+  var values = sheet.getRange(2, 1, sheet.getLastRow() - 1, 7).getValues();
+  return values
+    .map(function (row) {
+      return {
+        date:          String(row[0]),
+        start_time:    String(row[1]),
+        end_time:      String(row[2]),
+        facility_name: String(row[3]),
+        pattern:       String(row[4]),
+        scraped_at:    String(row[5]),
+        floor_map_url: String(row[6])
+      };
+    })
+    .filter(function (r) { return r.date && /^\d{4}-\d{2}-\d{2}/.test(r.date); });
+}
+
+/**
+ * settings シートからアクティブ（status='active'）な施設名リストを返す（内部用）
+ *
+ * settings シートが存在しない・読み取れない場合はハードコードされたデフォルトを返す。
+ * 列順: A=facility_id / B=facility_name / C=status
+ *
+ * @returns {string[]}
+ * @private
+ */
+function _getActiveFacilityNames() {
+  var defaultNames = ['東総合スポーツセンター', '鳥屋野総合体育館', '亀田総合体育館'];
+  try {
+    var spreadsheetId = getProperty('MEMBERS_SPREADSHEET_ID');
+    if (!spreadsheetId) return defaultNames;
+    var ss    = SpreadsheetApp.openById(spreadsheetId);
+    var sheet = ss.getSheetByName('settings');
+    if (!sheet || sheet.getLastRow() < 2) return defaultNames;
+    var values = sheet.getRange(2, 1, sheet.getLastRow() - 1, 3).getValues();
+    var activeNames = values
+      .filter(function (row) { return String(row[2]) === 'active'; })
+      .map(function (row) { return String(row[1]); });
+    return activeNames.length > 0 ? activeNames : defaultNames;
+  } catch (err) {
+    logError(err, { phase: '_getActiveFacilityNames' });
+    return defaultNames;
+  }
 }
