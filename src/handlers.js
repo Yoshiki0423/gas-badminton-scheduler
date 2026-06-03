@@ -1402,10 +1402,10 @@ function _buildF3NotifyBubble(slotKey, count, facilityLabel, facilityButtons) {
     var btn = facilityButtons[bi];
     var buttonObj = {
       type: 'button',
-      style: bi === 0 ? 'primary' : 'secondary',
+      style: 'primary',
+      color: '#06C755',
       action: { type: 'uri', label: btn.name + ' →', uri: btn.url }
     };
-    if (bi === 0) buttonObj.color = '#06C755';
     footerContents.push(buttonObj);
   }
   if (facilityButtons.length === 0) {
