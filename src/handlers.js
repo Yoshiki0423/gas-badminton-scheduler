@@ -1207,15 +1207,20 @@ function handleLiffGetAllResponses() {
 // ─────────────────────────────────────────────
 
 /**
- * schedules シートから 'YYYY-MM-DD|HH:mm' → 施設名リスト のマップを返す
+ * schedules シートから 'YYYY-MM-DD|HH:mm' → 施設情報リスト のマップを返す
  *
  * scraper.js が書き込む新スキーマ（A=date / B=start_time / D=facility_name）を前提とする。
  * シートが空または読み込み失敗の場合は空オブジェクトを返す。
  *
- * @returns {Object} { 'YYYY-MM-DD|HH:mm': ['施設名A', '施設名B', ...] }
+ * @returns {Object} { 'YYYY-MM-DD|HH:mm': [{ name: '施設名', facilityId: '413' }, ...] }
  * @private
  */
 function _buildSlotFacilityMap() {
+  var NAME_TO_ID = {
+    '東総合スポーツセンター': '413',
+    '鳥屋野総合体育館':       '420',
+    '亀田総合体育館':         '429'
+  };
   try {
     var sheet = getSchedulesSheet();
     var lastRow = sheet.getLastRow();
@@ -1233,7 +1238,11 @@ function _buildSlotFacilityMap() {
 
       var key = date + '|' + startTime;
       if (!map[key]) map[key] = [];
-      if (map[key].indexOf(facilityName) < 0) map[key].push(facilityName);
+      var exists = false;
+      for (var j = 0; j < map[key].length; j++) {
+        if (map[key][j].name === facilityName) { exists = true; break; }
+      }
+      if (!exists) map[key].push({ name: facilityName, facilityId: NAME_TO_ID[facilityName] || '' });
     }
 
     return map;
@@ -1272,18 +1281,15 @@ function _checkAndNotifyViableSlots() {
       return;
     }
 
-    // (1) 全回答を取得して can 票数・投票ユーザーをスロットごとに集計
-    var responses  = getAllSlotResponses();
-    var canCounts  = {};  // 'YYYY-MM-DD|HH:mm' → can 票数
-    var canUserMap = {};  // 'YYYY-MM-DD|HH:mm' → { userId: true, ... }
+    // (1) 全回答を取得して can 票数をスロットごとに集計
+    var responses = getAllSlotResponses();
+    var canCounts = {};  // 'YYYY-MM-DD|HH:mm' → can 票数
 
     for (var i = 0; i < responses.length; i++) {
       var r = responses[i];
       if (r.answer === 'can') {
         var key = r.date + '|' + r.slotStart;
         canCounts[key] = (canCounts[key] || 0) + 1;
-        if (!canUserMap[key]) canUserMap[key] = {};
-        canUserMap[key][r.userId] = true;
       }
     }
 
@@ -1303,26 +1309,13 @@ function _checkAndNotifyViableSlots() {
 
     newlyViableSlots.sort();
 
-    // (3) reserver-master から予約者 lineUserId セットを構築
-    var reserverIdSet = {};
-    try {
-      var reservers = getReserverMasterEntries();
-      for (var rv = 0; rv < reservers.length; rv++) {
-        if (reservers[rv].lineUserId) reserverIdSet[reservers[rv].lineUserId] = true;
-      }
-    } catch (e) {
-      console.warn('[WARN] _checkAndNotifyViableSlots: reserver-master 読み込み失敗: ' + e.message);
-    }
-
-    // (4) schedules シートからスロット→施設名マップを構築
+    // (3) schedules シートからスロット→施設マップを構築
     var slotFacilityMap = _buildSlotFacilityMap();
 
-    // (5) LIFF URL
-    var liffResultsId = getProperty('LIFF_RESULTS_ID');
+    // (4) LIFF URL
     var liffReserveId = getProperty('LIFF_RESERVE_ID');
-    var statusUrl = liffResultsId ? 'https://liff.line.me/' + liffResultsId : '';
 
-    // (6) スロットごとに通知を送る
+    // (5) スロットごとに通知を送る
     for (var n = 0; n < newlyViableSlots.length; n++) {
       var slotKey  = newlyViableSlots[n];
       var pipeIdx  = slotKey.indexOf('|');
@@ -1334,23 +1327,26 @@ function _checkAndNotifyViableSlots() {
       var d = new Date(slotDate + 'T00:00:00+09:00');
       var dateLabel = (d.getMonth() + 1) + '月' + d.getDate() + '日(' + _WEEKDAYS[d.getDay()] + ')';
 
-      // 施設名（スロットに対応する施設を列挙）
+      // 施設リスト（{name, facilityId} の配列）
       var facilities = slotFacilityMap[slotKey] || [];
-      var facilityLabel = facilities.length > 0 ? facilities.join('・') : '（施設情報なし）';
+      var facilityLabel = facilities.length > 0
+        ? facilities.map(function(f) { return f.name; }).join('・')
+        : '（施設情報なし）';
 
-      // 予約者の有無チェック（参加者の中に reserver-master 登録者がいるか）
-      var canUsers = canUserMap[slotKey] || {};
-      var canUserIds = Object.keys(canUsers);
-      var hasReserver = false;
-      for (var cu = 0; cu < canUserIds.length; cu++) {
-        if (reserverIdSet[canUserIds[cu]]) { hasReserver = true; break; }
+      // 施設ごとの予約ボタン情報を生成
+      var facilityButtons = [];
+      if (liffReserveId) {
+        for (var fb = 0; fb < facilities.length; fb++) {
+          var fac = facilities[fb];
+          var reserveUrl = 'https://liff.line.me/' + liffReserveId
+            + '?slotKey=' + encodeURIComponent(slotKey)
+            + (fac.facilityId ? '&facilityId=' + encodeURIComponent(fac.facilityId) : '');
+          facilityButtons.push({ name: fac.name, url: reserveUrl });
+        }
       }
 
-      // Flex Message 組み立て（MSG-F3-01 or MSG-F3-02）
-      var reserveUrl = (hasReserver && liffReserveId)
-        ? 'https://liff.line.me/' + liffReserveId + '?slotKey=' + encodeURIComponent(slotKey)
-        : '';
-      var bubble  = _buildF3NotifyBubble(slotKey, count, facilityLabel, statusUrl, reserveUrl);
+      // Flex Message 組み立て（MSG-F3）
+      var bubble  = _buildF3NotifyBubble(slotKey, count, facilityLabel, facilityButtons);
       var altText = dateLabel + ' ' + slotTime + '〜 ' + count + '人揃いました！';
 
       // GAS は同期実行なので var は即時評価される（クロージャ問題なし）
@@ -1363,7 +1359,7 @@ function _checkAndNotifyViableSlots() {
         .setProperty(propKeyPrefix + slotKey, _toIsoTokyo(new Date()));
 
       console.log('[INFO] _checkAndNotifyViableSlots: F3通知送信 slotKey=' + slotKey +
-                  ' count=' + count + ' hasReserver=' + hasReserver);
+                  ' count=' + count + ' buttons=' + facilityButtons.length);
     }
 
   } catch (err) {
@@ -1375,15 +1371,14 @@ function _checkAndNotifyViableSlots() {
 /**
  * F3「N人揃い通知」用の Flex Bubble を組み立てる(内部用)
  *
- * @param {string} slotKey      - 'YYYY-MM-DD|HH:mm'
- * @param {number} count        - can 票数
- * @param {string} facilityLabel - 施設名（複数は「・」区切り）
- * @param {string} statusUrl    - 参加状況 LIFF URL
- * @param {string} reserveUrl   - 予約 LIFF URL（空文字なら予約者なしフロー）
+ * @param {string} slotKey        - 'YYYY-MM-DD|HH:mm'
+ * @param {number} count          - can 票数
+ * @param {string} facilityLabel  - 施設名（複数は「・」区切り、body 表示用）
+ * @param {Array}  facilityButtons - [{ name: '施設名', url: 'LIFF URL' }, ...] （footer ボタン用）
  * @returns {Object} LINE Flex Message の bubble オブジェクト
  * @private
  */
-function _buildF3NotifyBubble(slotKey, count, facilityLabel, statusUrl, reserveUrl) {
+function _buildF3NotifyBubble(slotKey, count, facilityLabel, facilityButtons) {
   var parts     = slotKey.split('|');
   var slotDate  = parts[0];
   var slotStart = parts[1];
@@ -1399,19 +1394,22 @@ function _buildF3NotifyBubble(slotKey, count, facilityLabel, statusUrl, reserveU
   ];
 
   if (facilityLabel) {
-    bodyContents.push({ type: 'text', text: '📍 ' + facilityLabel, size: 'sm', color: '#666666', wrap: true });
-  }
-
-  if (!reserveUrl) {
-    bodyContents.push({ type: 'text', text: '⚠️ 予約者が未登録です。参加者の方が直接予約してください。', size: 'sm', color: '#e74c3c', wrap: true });
+    bodyContents.push({ type: 'text', text: '予約先: 以下から選択してください', size: 'sm', color: '#666666', wrap: true });
   }
 
   var footerContents = [];
-  if (statusUrl) {
-    footerContents.push({ type: 'button', style: 'primary', color: '#06C755', action: { type: 'uri', label: '参加状況を見る', uri: statusUrl } });
+  for (var bi = 0; bi < facilityButtons.length; bi++) {
+    var btn = facilityButtons[bi];
+    var buttonObj = {
+      type: 'button',
+      style: bi === 0 ? 'primary' : 'secondary',
+      action: { type: 'uri', label: btn.name + ' →', uri: btn.url }
+    };
+    if (bi === 0) buttonObj.color = '#06C755';
+    footerContents.push(buttonObj);
   }
-  if (reserveUrl) {
-    footerContents.push({ type: 'button', style: 'secondary', action: { type: 'uri', label: '予約する', uri: reserveUrl } });
+  if (facilityButtons.length === 0) {
+    footerContents.push({ type: 'text', text: '参加者の中から直接予約をしてください。', size: 'sm', color: '#e74c3c', wrap: true });
   }
 
   return {

@@ -233,13 +233,14 @@
     // アプリ状態
     // ──────────────────────────────────────────
     const state = {
-      slotKey:        '',   // 'YYYY-MM-DD|HH:mm'
-      isUnlocked:     false, // true=解禁済み / false=未解禁
-      dateLabel:      '',
-      slotStart:      '',
-      slotEnd:        '',
-      courseGroups:   [],
-      reserverInfo:   null, // { index, name } — サーバー側で lineUserId 照合済み(§14-11)
+      slotKey:          '',   // 'YYYY-MM-DD|HH:mm'
+      filterFacilityId: '',   // LINEボタンから指定された施設ID（空文字=全施設表示）
+      isUnlocked:       false, // true=解禁済み / false=未解禁
+      dateLabel:        '',
+      slotStart:        '',
+      slotEnd:          '',
+      courseGroups:     [],
+      reserverInfo:     null, // { index, name } — サーバー側で lineUserId 照合済み(§14-11)
 
       selectedCourseGroup: null, // { facilityId, facilityName, courseGroupId, courseGroupLabel }
       selectedCourts:      [],   // 解禁済み: 1件 / 未解禁: 最大3件(優先順位)
@@ -299,9 +300,10 @@
         return;
       }
 
-      // slotKey を URL パラメータから取得
+      // slotKey・facilityId を URL パラメータから取得
       const urlParams = new URLSearchParams(liff.state || window.location.search);
       state.slotKey = urlParams.get('slotKey') || '';
+      state.filterFacilityId = urlParams.get('facilityId') || '';
       if (!state.slotKey) {
         showError('予約情報（slotKey）が見つかりません。LINEの予約ボタンから開き直してください。');
         return;
@@ -325,9 +327,13 @@
       state.dateLabel      = initData.dateLabel      || '';
       state.slotStart      = initData.slotStart      || '';
       state.slotEnd        = initData.slotEnd        || '';
-      state.courseGroups   = initData.courseGroups   || [];
       state.reserverInfo   = initData.reserverInfo   || null;
       state.savedPriority  = initData.savedPriority  || [];
+      // facilityId が指定されている場合はその施設のみ表示
+      const allGroups = initData.courseGroups || [];
+      state.courseGroups = state.filterFacilityId
+        ? allGroups.filter(function(cg) { return String(cg.facilityId) === String(state.filterFacilityId); })
+        : allGroups;
 
       // 解禁チェック: GAS サーバー側（Asia/Tokyo 時刻）で計算した値をそのまま使う
       // クライアント端末の new Date() で判定すると端末の時刻を変更することで
